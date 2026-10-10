@@ -10,6 +10,13 @@ protocol and the KrakenKey API the connector uses.
 
 ### Added
 
+- `aws-acm` target plugin (`plugins/aws-acm`, its own Go module): re-imports
+  certificates into an existing imported ACM certificate, so load balancers,
+  CloudFront and API Gateway keep using the same ARN. It checks the
+  replacement before changing anything (key type, key usages, names), and
+  rolls back by re-importing the previous certificate and key the connector
+  hands back. Needs `acm:DescribeCertificate` and `acm:ImportCertificate`.
+
 - Rollback material for targets that cannot keep the previous certificate
   and key themselves, such as a cloud service that never returns an
   imported private key. A target sets `rollback_needs_material`, and the
