@@ -222,6 +222,30 @@ current key, then the new one, and keeps whichever KrakenKey accepts.
 `validate` shows whether the connector is enrolled, its id, and whether a
 token exchange works.
 
+### Status reporting
+
+After every pass, failed ones included, an enrolled connector tells
+KrakenKey what is deployed where, so the dashboard can show it and alert on
+failures. For each configured certificate and target it sends:
+
+- the state: `pending` (nothing deployed yet, or a newer certificate is
+  waiting to be deployed), `staged`, `activated` (not verified yet),
+  `verified`, `activated_unverifiable` (no `verify` block, or a target that
+  propagates on its own schedule), `failed` or `rolled_back`;
+- the serial number of the certificate the target has;
+- for failures, a short error message: private keys, API keys and
+  enrolment tokens removed, paths under the data directory shortened, at
+  most 200 characters;
+- when that state was recorded.
+
+The report comes from the connector's state files. It carries no key
+material and nothing about your systems beyond target labels. A report that
+cannot be sent is logged as a warning; it never changes the outcome or exit
+code of a pass. When the pass stopped because KrakenKey refused the
+credentials or asked the connector to back off, no report is sent.
+
+Connectors that use an API key instead of enrolment do not report.
+
 ## Configuration
 
 | Key | Default | Meaning |

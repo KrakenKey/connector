@@ -56,6 +56,15 @@ const (
 	PhaseActivated  = "activated"  // Activate returned PreviousRef; not verified yet
 )
 
+// Outcomes of the last finished deployment to a target, as reported to
+// KrakenKey.
+const (
+	OutcomeVerified     = "verified"               // verified with a TLS handshake
+	OutcomeUnverifiable = "activated_unverifiable" // activated, not verified (no verify block, or the target propagates on its own schedule and verification failed)
+	OutcomeFailed       = "failed"                 // failed, not rolled back (nothing changed, or the new certificate stayed)
+	OutcomeRolledBack   = "rolled_back"            // failed and rolled back to the previous certificate
+)
+
 // TargetState is what the connector knows about one target.
 type TargetState struct {
 	// Serial is the certificate last deployed to the target successfully,
@@ -73,7 +82,10 @@ type TargetState struct {
 	Failures    int       `json:"failures,omitempty"`
 	NextAttempt time.Time `json:"next_attempt,omitzero"`
 	LastError   string    `json:"last_error,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	// Outcome is how the last finished deployment ended (Outcome*). Empty
+	// for state written before it was recorded.
+	Outcome   string    `json:"outcome,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // StateStore keeps State files under <data_dir>/state, mode 0600.

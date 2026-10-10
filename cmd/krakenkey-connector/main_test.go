@@ -413,3 +413,57 @@ func TestRotateIdentityCommand(t *testing.T) {
 		t.Errorf("after rotation: exit %d\n%s", code, out.String())
 	}
 }
+
+func TestRunReportsStatusWhenEnrolled(t *testing.T) {
+	srv := fakekk.New(t)
+	srv.Fallback = certsNeedConnectorKey(srv)
+	enrolEnv(t, srv)
+	cfg := writeConfig(t)
+
+	// With a plain API key, nothing is reported.
+	srv.Fallback = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	t.Setenv("KK_API_KEY", "kk_plain_key_for_test")
+	var out, errOut bytes.Buffer
+	_ = run([]string{"run", "--once", "--log-level", "debug", "--config", cfg}, &out, &errOut)
+	if len(srv.Reports()) != 0 || !strings.Contains(errOut.String(), "not enrolled") {
+		t.Errorf("reported without enrolment\n%s", errOut.String())
+	}
+
+	srv.Fallback = certsNeedConnectorKey(srv)
+	t.Setenv("KK_API_KEY", "")
+	enrolOK(t, srv, cfg)
+	errOut.Reset()
+	// Certificate 7 does not exist, so the pass fails; the report still goes out.
+	if code := run([]string{"run", "--once", "--config", cfg}, &out, &errOut); code != exitFailed {
+		t.Fatalf("exit %d\n%s", code, errOut.String())
+	}
+	reports := srv.Reports()
+	if len(reports) != 1 {
+		t.Fatalf("%d reports\n%s", len(reports), errOut.String())
+	}
+	var rep struct {
+		Version, OS, Arch string
+		Certificates      []struct {
+			CertificateID int
+			Targets       []struct{ Label, State, Error string }
+		}
+	}
+	_ = json.Unmarshal(reports[0], &rep)
+	if rep.Version != "dev" || len(rep.Certificates) != 1 || rep.Certificates[0].CertificateID != 7 {
+		t.Fatalf("report %s", reports[0])
+	}
+	tg := rep.Certificates[0].Targets
+	if len(tg) != 1 || tg[0].Label != "hook" || tg[0].State != "pending" || !strings.Contains(tg[0].Error, "not found") {
+		t.Errorf("targets %+v", tg)
+	}
+
+	// A report KrakenKey refuses does not change the exit code.
+	srv.ReportStatus = http.StatusInternalServerError
+	errOut.Reset()
+	if code := run([]string{"run", "--once", "--config", cfg}, &out, &errOut); code != exitFailed {
+		t.Errorf("exit %d after a failed report\n%s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "could not report deployment status") {
+		t.Errorf("no warning\n%s", errOut.String())
+	}
+}

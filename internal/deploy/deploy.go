@@ -594,9 +594,11 @@ func (t *targetRun) failStep(step string, err error) {
 }
 
 // recordFailure ends a failed deployment and schedules the next attempt.
-func (t *targetRun) recordFailure(err error) error {
+// outcome is OutcomeFailed or OutcomeRolledBack.
+func (t *targetRun) recordFailure(err error, outcome string) error {
 	ts := t.ts()
 	ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+	ts.Outcome = outcome
 	ts.Failures++
 	base := t.e.RetryBase
 	if base == 0 {
@@ -611,9 +613,10 @@ func (t *targetRun) recordFailure(err error) error {
 	return err
 }
 
-func (t *targetRun) recordSuccess(serial string, notAfter time.Time) {
+func (t *targetRun) recordSuccess(serial string, notAfter time.Time, outcome string) {
 	ts := t.ts()
 	ts.Serial, ts.NotAfter = serial, notAfter
+	ts.Outcome = outcome
 	ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
 	ts.Failures, ts.NextAttempt, ts.LastError = 0, time.Time{}, ""
 	t.setTS(ts)
@@ -715,7 +718,7 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	key, err := t.job.KeyStore.Export(ctx, plugin.ExportRequest{Config: t.job.KeyStoreConfig, KeyRef: st.KeyRef, Format: tj.Format})
 	if err != nil {
 		t.failStep(audit.StepExport, err)
-		return t.recordFailure(err)
+		return t.recordFailure(err, OutcomeFailed)
 	}
 	stagedRef, err := tj.Plugin.Stage(ctx, plugin.StageRequest{
 		Config:        tj.Settings,
@@ -729,7 +732,7 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	})
 	if err != nil {
 		t.failStep(audit.StepStage, err)
-		return t.recordFailure(err)
+		return t.recordFailure(err, OutcomeFailed)
 	}
 	ts := t.ts()
 	ts.Phase, ts.StagedRef, ts.DeployingSerial = PhaseStaged, stagedRef, st.Serial
@@ -752,7 +755,7 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	if err != nil {
 		t.failStep(audit.StepActivate, err)
 		t.discard(ctx, stagedRef)
-		return t.recordFailure(err)
+		return t.recordFailure(err, OutcomeFailed)
 	}
 	ts.Phase, ts.StagedRef, ts.PreviousRef = PhaseActivated, "", prevRef
 	t.setTS(ts)
@@ -787,7 +790,7 @@ func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recover
 		a := t.entry(audit.StepVerify, audit.ResultSkipped)
 		a.Detail = "no verify block in config"
 		_ = t.e.audit(a)
-		t.recordSuccess(st.Serial, st.NotAfter)
+		t.recordSuccess(st.Serial, st.NotAfter, OutcomeUnverifiable)
 		return nil
 	}
 	leaf, err := certutil.ParseLeaf(st.CertPEM)
@@ -813,7 +816,7 @@ func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recover
 			a.Detail = "target propagates on its own schedule; not rolled back"
 			_ = t.e.audit(a)
 			t.log.Error("verification failed; not rolling back because this target propagates on its own schedule", "error", err)
-			t.recordSuccess(st.Serial, st.NotAfter)
+			t.recordSuccess(st.Serial, st.NotAfter, OutcomeUnverifiable)
 			ts := t.ts()
 			ts.LastError = err.Error()
 			t.setTS(ts)
@@ -832,7 +835,7 @@ func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recover
 	}
 	_ = t.e.audit(a)
 	t.log.Info("deployed and verified", "serial", st.Serial)
-	t.recordSuccess(st.Serial, st.NotAfter)
+	t.recordSuccess(st.Serial, st.NotAfter, OutcomeVerified)
 	return nil
 }
 
@@ -844,9 +847,9 @@ func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recover
 // countFailure is false when undoing an interrupted run's deployment, which
 // is not a failure of this target.
 func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, countFailure bool) error {
-	done := func(err error) error {
+	done := func(err error, outcome string) error {
 		if countFailure {
-			return t.recordFailure(err)
+			return t.recordFailure(err, outcome)
 		}
 		ts := t.ts()
 		ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
@@ -865,6 +868,7 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 		ts.Serial, ts.NotAfter = ts.DeployingSerial, t.st.NotAfter
 		ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
 		ts.LastError = cause.Error()
+		ts.Outcome = OutcomeFailed
 		t.setTS(ts)
 		_ = t.save()
 		return fmt.Errorf("%w (not rolled back: %s)", cause, why)
@@ -895,7 +899,7 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 		a.Result, a.Error = audit.ResultFailed, err.Error()
 		_ = t.e.audit(a)
 		t.log.Error("rollback failed", "error", err)
-		return done(errors.Join(cause, fmt.Errorf("rollback failed: %w", err)))
+		return done(errors.Join(cause, fmt.Errorf("rollback failed: %w", err)), OutcomeFailed)
 	}
 	if t.tj.Config.Then != nil {
 		if err := t.runThen(rctx, "", "rollback"); err != nil {
@@ -903,12 +907,12 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 			a.Detail = "files rolled back; then.exec failed afterwards"
 			_ = t.e.audit(a)
 			t.log.Error("rolled back, but then.exec failed afterwards", "error", err)
-			return done(errors.Join(cause, fmt.Errorf("files rolled back, but then.exec failed afterwards: %w", err)))
+			return done(errors.Join(cause, fmt.Errorf("files rolled back, but then.exec failed afterwards: %w", err)), OutcomeRolledBack)
 		}
 	}
 	_ = t.e.audit(a)
 	t.log.Warn("rolled back to the previous certificate", "cause", cause)
-	return done(fmt.Errorf("%w (rolled back)", cause))
+	return done(fmt.Errorf("%w (rolled back)", cause), OutcomeRolledBack)
 }
 
 func (t *targetRun) runThen(ctx context.Context, serial, action string) error {

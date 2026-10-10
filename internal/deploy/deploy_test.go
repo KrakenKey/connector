@@ -1003,3 +1003,41 @@ func TestCrashDuringActivate(t *testing.T) {
 		})
 	}
 }
+
+func TestOutcomesAreRecorded(t *testing.T) {
+	cases := map[string]struct {
+		prepare func(e *env)
+		want    string
+	}{
+		"verified":      {func(*env) {}, OutcomeVerified},
+		"no verify":     {func(e *env) { e.job.Targets[0].Config.Verify = nil }, OutcomeUnverifiable},
+		"rolled back":   {func(e *env) { e.targets["a"].broken = true }, OutcomeRolledBack},
+		"activate fail": {func(e *env) { e.targets["a"].failActivate = errors.New("denied") }, OutcomeFailed},
+		"no rollback": {func(e *env) {
+			e.targets["a"].broken = true
+			e.targets["a"].caps.SupportsRollback = false
+		}, OutcomeFailed},
+		"async": {func(e *env) {
+			e.targets["a"].broken = true
+			e.targets["a"].caps.PropagatesAsync = true
+		}, OutcomeUnverifiable},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t, "a")
+			// A first, healthy deployment, so a rollback has somewhere to go.
+			if err := e.process(t, false); err != nil {
+				t.Fatal(err)
+			}
+			c.prepare(e)
+			_ = e.process(t, true)
+			ts := e.state(t).Targets["a"]
+			if ts.Outcome != c.want {
+				t.Errorf("outcome %q, want %q (%+v)", ts.Outcome, c.want, ts)
+			}
+			if c.want != OutcomeVerified && name != "no verify" && ts.LastError == "" {
+				t.Error("no error recorded")
+			}
+		})
+	}
+}

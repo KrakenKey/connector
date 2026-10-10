@@ -298,6 +298,12 @@ func cmdRun(args []string, stderr io.Writer) int {
 			Log:      log,
 		},
 	}
+	if ident != nil {
+		c.Reporter = &connector.Reporter{
+			API: client, State: state, Config: cfg, Log: log,
+			Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH,
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 )
 
 // Connector is a connector KrakenKey knows.
@@ -45,6 +46,9 @@ type Server struct {
 	// RotateStatus, if set, is returned by /connectors/rotate instead of
 	// rotating.
 	RotateStatus int
+	// ReportStatus, if set, is returned by /connectors/report instead of
+	// storing the report.
+	ReportStatus int
 
 	mu          sync.Mutex
 	tokens      map[string]string // enrolment token -> connector name
@@ -54,6 +58,7 @@ type Server struct {
 	requests    []string
 	tokenCalls  int
 	rotateCalls int
+	reports     []json.RawMessage
 }
 
 // New starts a fake.
@@ -163,6 +168,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		case "/connectors/rotate":
 			s.rotate(w, r)
+			return
+		case "/connectors/report":
+			s.report(w, r)
 			return
 		}
 	}
@@ -295,6 +303,100 @@ func (s *Server) rotate(w http.ResponseWriter, r *http.Request) {
 	}
 	c.PublicKey = newPub
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Reports returns the raw bodies of the reports accepted so far.
+func (s *Server) Reports() []json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]json.RawMessage(nil), s.reports...)
+}
+
+var (
+	labelRe  = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	serialRe = regexp.MustCompile(`^[0-9a-fA-F]{1,64}$`)
+	states   = map[string]bool{"pending": true, "staged": true, "activated": true, "verified": true,
+		"activated_unverifiable": true, "failed": true, "rolled_back": true}
+)
+
+// report checks a status report against the contract, field by field, and
+// stores it.
+func (s *Server) report(w http.ResponseWriter, r *http.Request) {
+	if s.Authorized(r) == "" {
+		writeJSON(w, http.StatusForbidden, map[string]any{"statusCode": 403, "message": "Reports need a connector key"})
+		return
+	}
+	var raw json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		s.t.Errorf("report: bad body: %v", err)
+	}
+	var body map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &body)
+	allowed(s.t, "report", body, "version", "os", "arch", "certificates")
+	for _, k := range []string{"version", "os", "arch"} {
+		var v string
+		if json.Unmarshal(body[k], &v) != nil || v == "" {
+			s.t.Errorf("report: %s missing", k)
+		}
+	}
+	var certs []map[string]json.RawMessage
+	if err := json.Unmarshal(body["certificates"], &certs); err != nil || len(certs) > 500 {
+		s.t.Errorf("report: certificates: %v (%d)", err, len(certs))
+	}
+	for _, c := range certs {
+		allowed(s.t, "report certificate", c, "certificateId", "targets")
+		var id int
+		if json.Unmarshal(c["certificateId"], &id) != nil || id <= 0 {
+			s.t.Errorf("report: certificateId %s", c["certificateId"])
+		}
+		var targets []map[string]json.RawMessage
+		if err := json.Unmarshal(c["targets"], &targets); err != nil || targets == nil || len(targets) > 50 {
+			s.t.Errorf("report: targets of %d: %v (%d)", id, err, len(targets))
+		}
+		for _, t := range targets {
+			allowed(s.t, "report target", t, "label", "state", "serial", "error", "updatedAt")
+			var label, state, serial, errText, updated string
+			_ = json.Unmarshal(t["label"], &label)
+			_ = json.Unmarshal(t["state"], &state)
+			_ = json.Unmarshal(t["updatedAt"], &updated)
+			if !labelRe.MatchString(label) || !states[state] {
+				s.t.Errorf("report: target %q state %q", label, state)
+			}
+			if _, err := time.Parse(time.RFC3339, updated); err != nil || !strings.HasSuffix(updated, "Z") {
+				s.t.Errorf("report: updatedAt %q", updated)
+			}
+			if v, ok := t["serial"]; ok {
+				if json.Unmarshal(v, &serial) != nil || !serialRe.MatchString(serial) {
+					s.t.Errorf("report: serial %s", v)
+				}
+			}
+			if v, ok := t["error"]; ok {
+				if json.Unmarshal(v, &errText) != nil || errText == "" || len(utf16.Encode([]rune(errText))) > 200 {
+					s.t.Errorf("report: error %s", v)
+				}
+			}
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ReportStatus != 0 {
+		writeJSON(w, s.ReportStatus, map[string]any{"statusCode": s.ReportStatus, "message": "report refused"})
+		return
+	}
+	s.reports = append(s.reports, raw)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func allowed(t *testing.T, what string, m map[string]json.RawMessage, keys ...string) {
+	for k := range m {
+		ok := false
+		for _, a := range keys {
+			ok = ok || k == a
+		}
+		if !ok {
+			t.Errorf("%s: unexpected field %q", what, k)
+		}
+	}
 }
 
 func randHex(n int) string {

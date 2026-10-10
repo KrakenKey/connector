@@ -116,3 +116,56 @@ func unauthorized(err error) (*APIError, bool) {
 	}
 	return nil, false
 }
+
+// Deployment states for POST /connectors/report.
+const (
+	DeployPending               = "pending"
+	DeployStaged                = "staged"
+	DeployActivated             = "activated"
+	DeployVerified              = "verified"
+	DeployActivatedUnverifiable = "activated_unverifiable"
+	DeployFailed                = "failed"
+	DeployRolledBack            = "rolled_back"
+)
+
+// Report limits from the API contract.
+const (
+	MaxReportCertificates = 500
+	MaxReportTargets      = 50
+	MaxReportError        = 200
+	MaxReportSerial       = 64
+)
+
+// Report is the body of POST /connectors/report.
+type Report struct {
+	Version      string              `json:"version"`
+	OS           string              `json:"os"`
+	Arch         string              `json:"arch"`
+	Certificates []ReportCertificate `json:"certificates"`
+}
+
+// ReportCertificate is one certificate in a Report. Targets of the
+// certificate that a report leaves out are deleted on KrakenKey's side.
+type ReportCertificate struct {
+	CertificateID int            `json:"certificateId"`
+	Targets       []ReportTarget `json:"targets"`
+}
+
+// ReportTarget is the state of one target.
+type ReportTarget struct {
+	Label  string `json:"label"`
+	State  string `json:"state"`
+	Serial string `json:"serial,omitempty"`
+	Error  string `json:"error,omitempty"`
+	// UpdatedAt is an ISO 8601 UTC time.
+	UpdatedAt string `json:"updatedAt"`
+}
+
+// ReportTime formats t for ReportTarget.UpdatedAt.
+func ReportTime(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
+
+// Report sends the connector's deployment status. KrakenKey accepts it
+// only with a key issued to a connector.
+func (c *Client) Report(ctx context.Context, r Report) error {
+	return c.do(ctx, http.MethodPost, "/connectors/report", r, nil)
+}
