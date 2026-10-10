@@ -58,6 +58,72 @@ plugins, places such as key vaults and cloud load balancers.
   install plugins you trust. Plugins installed by version must have their
   `sha256` pinned in the config.
 
+## Install
+
+### Release binaries
+
+Each [release](https://github.com/KrakenKey/connector/releases) has archives
+for Linux, macOS and Windows (amd64 and arm64), a `checksums.txt` covering
+them, and `checksums.txt.sigstore.json`, a [Sigstore](https://www.sigstore.dev/)
+signature for the checksums made by this repository's release workflow. There
+is no long-lived signing key: the signature is tied to the workflow and the
+tag it ran for. Verifying needs [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
+v3 or later.
+
+```sh
+VERSION=0.1.0   # the release, without the leading v
+OS=linux        # linux or darwin
+ARCH=amd64      # amd64 or arm64
+ARCHIVE="krakenkey-connector_${VERSION}_${OS}_${ARCH}.tar.gz"
+BASE="https://github.com/KrakenKey/connector/releases/download/v${VERSION}"
+curl -fsSLO "${BASE}/${ARCHIVE}"
+curl -fsSLO "${BASE}/checksums.txt"
+curl -fsSLO "${BASE}/checksums.txt.sigstore.json"
+
+# 1. checksums.txt was signed by the release workflow for this tag
+cosign verify-blob checksums.txt \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity "https://github.com/KrakenKey/connector/.github/workflows/release.yaml@refs/tags/v${VERSION}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# 2. the archive matches checksums.txt (on macOS use: shasum -a 256 -c)
+grep " ${ARCHIVE}\$" checksums.txt | sha256sum -c
+
+tar -xzf "${ARCHIVE}" krakenkey-connector
+sudo install -m 0755 krakenkey-connector /usr/local/bin/krakenkey-connector
+krakenkey-connector version
+```
+
+Windows archives are `.zip` files with `krakenkey-connector.exe`; verify them
+the same way. The connector's file safety checks are Unix only, so on Windows
+it does not check the ownership or permissions of the data directory, key
+files, the API key file or plugin binaries, the data directory lock does not
+stop a second connector, and the `file` target cannot set `owner`. Restrict
+the data directory with NTFS permissions yourself and run one connector per
+data directory.
+
+Packages for Homebrew, apt and dnf are planned for later releases.
+
+### Container image
+
+`ghcr.io/krakenkey/connector`, for `linux/amd64` and `linux/arm64`:
+
+| Tag | Points to |
+|-----|-----------|
+| `vX.Y.Z` | That release, prereleases included. |
+| `X.Y` | The latest patch release of `X.Y`. |
+| `latest` | The latest release that is not a prerelease. |
+
+Images are signed the same way. To check one before running it:
+
+```sh
+cosign verify ghcr.io/krakenkey/connector:v${VERSION} \
+  --certificate-identity "https://github.com/KrakenKey/connector/.github/workflows/release.yaml@refs/tags/v${VERSION}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+See [Docker](#docker) for how to run it.
+
 ## Quick start
 
 1. Create an API key in the KrakenKey dashboard.
@@ -319,15 +385,19 @@ file owned by the connector's user with mode `0600`.
 ## Docker
 
 ```sh
-docker build -t krakenkey-connector .
 docker run -d --name krakenkey-connector \
   -e KK_API_KEY_FILE=/run/secrets/kk_api_key \
   -v /etc/krakenkey-connector/api-key:/run/secrets/kk_api_key:ro \
   -v /etc/krakenkey-connector/config.yaml:/etc/krakenkey-connector/config.yaml:ro \
   -v krakenkey-connector-data:/var/lib/krakenkey-connector \
   -v /srv/tls/api:/srv/tls/api \
-  krakenkey-connector
+  ghcr.io/krakenkey/connector:v${VERSION}
 ```
+
+Pin a version tag (or `X.Y`) rather than `latest`, so an upgrade happens when
+you choose. To build the image from source instead, run
+`docker build -t krakenkey-connector .` and use `krakenkey-connector` as the
+image name.
 
 The image runs as a non-root user (uid 10001). Give that user write access to
 the target directories you mount, and make the key file readable by it (and
