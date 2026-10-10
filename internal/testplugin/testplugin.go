@@ -14,7 +14,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"sync"
 
@@ -47,13 +46,32 @@ func (k *KeyStore) Describe(context.Context) (plugin.KeyStoreCapabilities, error
 	}, nil
 }
 
+// Validate accepts an empty settings object only.
+func (k *KeyStore) Validate(_ context.Context, req plugin.KeyStoreValidateRequest) ([]string, error) {
+	if len(req.Config) > 0 && string(req.Config) != "{}" {
+		return []string{"the in-memory key store has no settings"}, nil
+	}
+	return nil, nil
+}
+
+// PublicKey returns the key's SubjectPublicKeyInfo.
+func (k *KeyStore) PublicKey(_ context.Context, req plugin.PublicKeyRequest) ([]byte, error) {
+	k.mu.Lock()
+	key, ok := k.keys[req.KeyRef]
+	k.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: key %q", plugin.ErrNotFound, req.KeyRef)
+	}
+	return x509.MarshalPKIXPublicKey(key.Public())
+}
+
 // CreateCSR generates a key and CSR.
 func (k *KeyStore) CreateCSR(_ context.Context, req plugin.CSRRequest) (plugin.CSR, error) {
 	if req.KeyType != plugin.KeyTypeECDSAP256 {
-		return plugin.CSR{}, fmt.Errorf("unsupported key type %q", req.KeyType)
+		return plugin.CSR{}, fmt.Errorf("%w: unsupported key type %q", plugin.ErrPermanent, req.KeyType)
 	}
 	if len(req.Names) == 0 {
-		return plugin.CSR{}, errors.New("no names")
+		return plugin.CSR{}, fmt.Errorf("%w: no names", plugin.ErrInvalid)
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -81,7 +99,7 @@ func (k *KeyStore) Complete(_ context.Context, req plugin.CompleteRequest) (stri
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if _, ok := k.keys[req.KeyRef]; !ok {
-		return "", fmt.Errorf("unknown key %q", req.KeyRef)
+		return "", fmt.Errorf("%w: key %q", plugin.ErrNotFound, req.KeyRef)
 	}
 	k.Completed[req.KeyRef] = req.CertPEM
 	return req.KeyRef, nil
@@ -90,13 +108,13 @@ func (k *KeyStore) Complete(_ context.Context, req plugin.CompleteRequest) (stri
 // Export returns the key as PKCS#8 PEM.
 func (k *KeyStore) Export(_ context.Context, req plugin.ExportRequest) (plugin.KeyMaterial, error) {
 	if req.Format != plugin.KeyFormatPEM {
-		return plugin.KeyMaterial{}, fmt.Errorf("unsupported format %q", req.Format)
+		return plugin.KeyMaterial{}, fmt.Errorf("%w: unsupported format %q", plugin.ErrPermanent, req.Format)
 	}
 	k.mu.Lock()
 	key, ok := k.keys[req.KeyRef]
 	k.mu.Unlock()
 	if !ok {
-		return plugin.KeyMaterial{}, fmt.Errorf("unknown key %q", req.KeyRef)
+		return plugin.KeyMaterial{}, fmt.Errorf("%w: key %q", plugin.ErrNotFound, req.KeyRef)
 	}
 	der, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
@@ -148,9 +166,9 @@ func (t *Target) Describe(context.Context) (plugin.TargetCapabilities, error) {
 }
 
 // Validate requires a non-empty name.
-func (t *Target) Validate(_ context.Context, config json.RawMessage) ([]string, error) {
+func (t *Target) Validate(_ context.Context, req plugin.TargetValidateRequest) ([]string, error) {
 	var c TargetConfig
-	if err := json.Unmarshal(config, &c); err != nil {
+	if err := json.Unmarshal(req.Config, &c); err != nil {
 		return []string{"config is not a JSON object: " + err.Error()}, nil
 	}
 	if c.Name == "" {
@@ -160,7 +178,7 @@ func (t *Target) Validate(_ context.Context, config json.RawMessage) ([]string, 
 }
 
 // Current returns the live serial.
-func (t *Target) Current(context.Context, json.RawMessage) (string, error) {
+func (t *Target) Current(context.Context, plugin.CurrentRequest) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.live == nil {
@@ -172,7 +190,7 @@ func (t *Target) Current(context.Context, json.RawMessage) (string, error) {
 // Stage keeps the request in memory.
 func (t *Target) Stage(_ context.Context, req plugin.StageRequest) (string, error) {
 	if req.Key.Format != plugin.KeyFormatPEM || len(req.Key.Data) == 0 {
-		return "", errors.New("PEM key material required")
+		return "", fmt.Errorf("%w: PEM key material required", plugin.ErrPermanent)
 	}
 	ref := randomID()
 	t.mu.Lock()
@@ -182,14 +200,14 @@ func (t *Target) Stage(_ context.Context, req plugin.StageRequest) (string, erro
 }
 
 // Activate makes a staged request live.
-func (t *Target) Activate(_ context.Context, _ json.RawMessage, stagedRef string) (string, error) {
+func (t *Target) Activate(_ context.Context, r plugin.ActivateRequest) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	req, ok := t.staged[stagedRef]
+	req, ok := t.staged[r.StagedRef]
 	if !ok {
-		return "", fmt.Errorf("unknown staged ref %q", stagedRef)
+		return "", fmt.Errorf("%w: staged ref %q", plugin.ErrNotFound, r.StagedRef)
 	}
-	delete(t.staged, stagedRef)
+	delete(t.staged, r.StagedRef)
 	prevRef := randomID()
 	t.prev[prevRef] = t.live
 	t.live = &req
@@ -197,15 +215,30 @@ func (t *Target) Activate(_ context.Context, _ json.RawMessage, stagedRef string
 }
 
 // Rollback restores the request live before Activate.
-func (t *Target) Rollback(_ context.Context, _ json.RawMessage, previousRef string) error {
+func (t *Target) Rollback(_ context.Context, r plugin.RollbackRequest) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	prev, ok := t.prev[previousRef]
+	prev, ok := t.prev[r.PreviousRef]
 	if !ok {
-		return fmt.Errorf("unknown previous ref %q", previousRef)
+		return fmt.Errorf("%w: previous ref %q", plugin.ErrNotFound, r.PreviousRef)
 	}
 	t.live = prev
 	return nil
+}
+
+// Discard drops a staged request. Unknown refs are ignored.
+func (t *Target) Discard(_ context.Context, r plugin.DiscardRequest) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.staged, r.StagedRef)
+	return nil
+}
+
+// Staged reports how many staged requests are waiting.
+func (t *Target) Staged() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.staged)
 }
 
 func randomID() string {

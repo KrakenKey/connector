@@ -20,6 +20,14 @@ func (s *keyStoreGRPCServer) Describe(ctx context.Context, _ *pb.KeyStoreService
 	return &pb.KeyStoreServiceDescribeResponse{Capabilities: pbKeyStoreCaps(caps)}, nil
 }
 
+func (s *keyStoreGRPCServer) Validate(ctx context.Context, req *pb.KeyStoreServiceValidateRequest) (*pb.KeyStoreServiceValidateResponse, error) {
+	problems, err := s.impl.Validate(ctx, KeyStoreValidateRequest{Config: req.GetConfigJson(), CertificateID: req.GetCertificateId()})
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &pb.KeyStoreServiceValidateResponse{Problems: problems}, nil
+}
+
 func (s *keyStoreGRPCServer) CreateCSR(ctx context.Context, req *pb.CreateCSRRequest) (*pb.CreateCSRResponse, error) {
 	csr, err := s.impl.CreateCSR(ctx, CSRRequest{
 		Config:        req.GetConfigJson(),
@@ -31,6 +39,14 @@ func (s *keyStoreGRPCServer) CreateCSR(ctx context.Context, req *pb.CreateCSRReq
 		return nil, toStatus(err)
 	}
 	return &pb.CreateCSRResponse{CsrPem: csr.PEM, KeyRef: csr.KeyRef}, nil
+}
+
+func (s *keyStoreGRPCServer) PublicKey(ctx context.Context, req *pb.PublicKeyRequest) (*pb.PublicKeyResponse, error) {
+	der, err := s.impl.PublicKey(ctx, PublicKeyRequest{Config: req.GetConfigJson(), KeyRef: req.GetKeyRef()})
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &pb.PublicKeyResponse{SpkiDer: der}, nil
 }
 
 func (s *keyStoreGRPCServer) Complete(ctx context.Context, req *pb.CompleteRequest) (*pb.CompleteResponse, error) {
@@ -80,6 +96,14 @@ func (c *keyStoreGRPCClient) Describe(ctx context.Context) (KeyStoreCapabilities
 	return goKeyStoreCaps(resp.GetCapabilities()), nil
 }
 
+func (c *keyStoreGRPCClient) Validate(ctx context.Context, req KeyStoreValidateRequest) ([]string, error) {
+	resp, err := c.client.Validate(ctx, &pb.KeyStoreServiceValidateRequest{ConfigJson: req.Config, CertificateId: req.CertificateID})
+	if err != nil {
+		return nil, fromStatus("key store validate", err)
+	}
+	return resp.GetProblems(), nil
+}
+
 func (c *keyStoreGRPCClient) CreateCSR(ctx context.Context, req CSRRequest) (CSR, error) {
 	resp, err := c.client.CreateCSR(ctx, &pb.CreateCSRRequest{
 		ConfigJson:    req.Config,
@@ -91,6 +115,14 @@ func (c *keyStoreGRPCClient) CreateCSR(ctx context.Context, req CSRRequest) (CSR
 		return CSR{}, fromStatus("key store create CSR", err)
 	}
 	return CSR{PEM: resp.GetCsrPem(), KeyRef: resp.GetKeyRef()}, nil
+}
+
+func (c *keyStoreGRPCClient) PublicKey(ctx context.Context, req PublicKeyRequest) ([]byte, error) {
+	resp, err := c.client.PublicKey(ctx, &pb.PublicKeyRequest{ConfigJson: req.Config, KeyRef: req.KeyRef})
+	if err != nil {
+		return nil, fromStatus("key store public key", err)
+	}
+	return resp.GetSpkiDer(), nil
 }
 
 func (c *keyStoreGRPCClient) Complete(ctx context.Context, req CompleteRequest) (string, error) {
