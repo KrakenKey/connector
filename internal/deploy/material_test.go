@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -497,5 +498,87 @@ func TestAdoptionRefusedByKeyStoreRenews(t *testing.T) {
 	// The next pass has nothing to do.
 	if err := e.process(t, false); err != nil || e.api.renews != 2 {
 		t.Errorf("second pass: %v, renews %d", err, e.api.renews)
+	}
+}
+
+// pendingAwareKeyStore refuses to complete a certificate for a key it has
+// completed before while a key of its own is still waiting for its first
+// certificate, like a vault with one open certificate request.
+type pendingAwareKeyStore struct {
+	*testplugin.KeyStore
+	mu        sync.Mutex
+	open      map[string]bool
+	completed map[string]bool
+}
+
+func (k *pendingAwareKeyStore) CreateCSR(ctx context.Context, req plugin.CSRRequest) (plugin.CSR, error) {
+	csr, err := k.KeyStore.CreateCSR(ctx, req)
+	if err == nil {
+		k.mu.Lock()
+		k.open[csr.KeyRef] = true
+		k.mu.Unlock()
+	}
+	return csr, err
+}
+
+func (k *pendingAwareKeyStore) Complete(ctx context.Context, req plugin.CompleteRequest) (string, error) {
+	k.mu.Lock()
+	if k.completed[req.KeyRef] && len(k.open) > 0 {
+		k.mu.Unlock()
+		return "", fmt.Errorf("%w: a certificate request is pending", plugin.ErrUnavailable)
+	}
+	k.mu.Unlock()
+	ref, err := k.KeyStore.Complete(ctx, req)
+	if err == nil {
+		k.mu.Lock()
+		delete(k.open, req.KeyRef)
+		k.completed[req.KeyRef] = true
+		k.mu.Unlock()
+	}
+	return ref, err
+}
+
+func (k *pendingAwareKeyStore) Release(ctx context.Context, req plugin.ReleaseRequest) error {
+	k.mu.Lock()
+	delete(k.open, req.KeyRef)
+	k.mu.Unlock()
+	return k.KeyStore.Release(ctx, req)
+}
+
+func TestPendingKeyIsResolvedBeforeAdoptingSameKeyRenewal(t *testing.T) {
+	e := setup(t, "a")
+	ks := &pendingAwareKeyStore{KeyStore: e.ks, open: map[string]bool{}, completed: map[string]bool{}}
+	e.job.KeyStore = ks
+	firstDeploy(t, e)
+	first := e.state(t)
+	leaf, err := certutil.ParseLeaf(first.CertPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A renewal is requested but the connector stops waiting: its key
+	// stays pending.
+	e.api.hang = true
+	_ = e.process(t, true)
+	e.api.hang = false
+	pending := e.state(t).Pending
+	if pending == nil {
+		t.Fatal("setup: no pending key")
+	}
+
+	// KrakenKey then renews on its own with the connector's current key.
+	e.api.mu.Lock()
+	e.api.issue(leaf.PublicKey, names)
+	e.api.mu.Unlock()
+
+	if err := e.process(t, false); err != nil {
+		t.Fatalf("pass stalled: %v", err)
+	}
+	st := e.state(t)
+	if st.Pending != nil || st.Serial != e.api.serial() || st.KeyRef != first.KeyRef || st.Targets["a"].Serial != st.Serial {
+		t.Errorf("state = pending %v serial %s (want %s) key %s", st.Pending, st.Serial, e.api.serial(), st.KeyRef)
+	}
+	if !slices.Contains(e.ks.Released, pending.KeyRef) {
+		t.Errorf("superseded pending key %s not released", pending.KeyRef)
 	}
 }

@@ -43,3 +43,24 @@ func CoreFeaturesFrom(ctx context.Context) []string {
 func HasCoreFeature(ctx context.Context, feature string) bool {
 	return slices.Contains(CoreFeaturesFrom(ctx), feature)
 }
+
+type installIDKey struct{}
+
+// WithInstallID returns a context carrying the connector's install id. The
+// connector sets it once for a run; the SDK sends it with every request
+// that has an install_id field, and the plugin side puts it back into the
+// context of the call.
+func WithInstallID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, installIDKey{}, id)
+}
+
+// InstallIDFrom returns the install id of the connector making the call:
+// an opaque, stable identifier of the installation (the connector's id in
+// KrakenKey once it is enrolled, before that a random id kept in its data
+// directory). Plugins may use it to tag resources they create. It is ""
+// for connectors that predate it, and for calls that do not carry it
+// (PublicKey, Export, Current).
+func InstallIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(installIDKey{}).(string)
+	return id
+}

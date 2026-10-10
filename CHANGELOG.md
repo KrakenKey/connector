@@ -31,6 +31,9 @@ protocol and the KrakenKey API the connector uses.
 - Core features: the connector sends the optional protocol features it
   supports (`core_features`) with every `Describe` call, so plugins can
   refuse to run with a connector that lacks one they need.
+- Install id: requests that create, change or check resources carry an
+  opaque, stable `install_id` (the enrolled connector's id, or a random id
+  kept in `<data_dir>/install_id`) so plugins can tag resources they own.
 - Key stores can return capabilities for a certificate's settings from
   `Validate` (`KeyStoreCapabilityValidator`), and the connector matches
   targets against those.
@@ -46,6 +49,10 @@ protocol and the KrakenKey API the connector uses.
 - A certificate the connector keeps after a failed check records that
   certificate's expiry, not the newest one's.
 - A rollback gets the longer of the plugin's `call_timeout` and 5 minutes.
+- A pending key from an earlier renewal is resolved before adopting a
+  certificate KrakenKey renewed with the current key, so key stores that
+  refuse to complete one while a request of their own is open no longer
+  stall every pass.
 - When the key store permanently refuses a certificate KrakenKey renewed
   with the connector's key, the connector renews with a new key instead of
   retrying the same step on every pass.
