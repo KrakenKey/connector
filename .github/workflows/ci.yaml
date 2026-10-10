@@ -30,7 +30,7 @@ jobs:
         run: go test ./... -race -coverprofile=coverage.out
 
       - name: Build
-        run: CGO_ENABLED=0 go build ./...
+        run: CGO_ENABLED=0 go build -o /dev/null ./cmd/krakenkey-connector
 
   proto:
     name: Generated code is current
