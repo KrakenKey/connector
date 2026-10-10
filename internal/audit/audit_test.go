@@ -1,0 +1,112 @@
+package audit
+
+import (
+	"bufio"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestLogAppendsJSONLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sub", "audit.jsonl")
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed := time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)
+	l.now = func() time.Time { return fixed }
+	if err := l.Write(Entry{RunID: "r1", CertificateID: 1043, Target: "nginx", Step: StepActivate, Result: ResultOK,
+		OldSerial: "01", NewSerial: "02", PreviousRef: `{"id":"x"}`}); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+
+	// Reopening appends.
+	l, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Write(Entry{RunID: "r2", CertificateID: 1043, Step: StepVerify, Result: ResultFailed, Error: "boom"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+
+	f, _ := os.Open(path)
+	defer func() { _ = f.Close() }()
+	var entries []map[string]any
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var m map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
+			t.Fatalf("line is not JSON: %s", sc.Text())
+		}
+		entries = append(entries, m)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("%d entries", len(entries))
+	}
+	first := entries[0]
+	if first["time"] != "2026-10-10T09:00:00Z" || first["run_id"] != "r1" || first["certificate_id"] != float64(1043) ||
+		first["target"] != "nginx" || first["step"] != "activate" || first["result"] != "ok" ||
+		first["old_serial"] != "01" || first["new_serial"] != "02" || first["previous_ref"] != `{"id":"x"}` {
+		t.Errorf("first entry = %v", first)
+	}
+	if _, ok := first["error"]; ok {
+		t.Error("empty error field written")
+	}
+	if entries[1]["error"] != "boom" {
+		t.Errorf("second entry = %v", entries[1])
+	}
+	if runtime.GOOS != "windows" {
+		info, _ := os.Stat(path)
+		if info.Mode().Perm() != 0o600 {
+			t.Errorf("mode %o, want 600", info.Mode().Perm())
+		}
+	}
+}
+
+func TestLogScrubsSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := make([]byte, 5000)
+	for i := range long {
+		long[i] = 'x'
+	}
+	_ = l.Write(Entry{Step: StepThen, Result: ResultFailed,
+		Error:  "hook printed -----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMG\n-----END PRIVATE KEY----- and kk_live_abcdefghijkl",
+		Detail: string(long)})
+	_ = l.Close()
+	data, _ := os.ReadFile(path)
+	if strings.Contains(string(data), "MIGHAgEAMBMG") || strings.Contains(string(data), "abcdefghijkl") {
+		t.Errorf("secret reached the audit log: %s", data)
+	}
+	if len(data) > 3000 {
+		t.Errorf("entry not capped: %d bytes", len(data))
+	}
+}
+
+func TestOpenRefusesLoosePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits")
+	}
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chmod(path, 0o644)
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+		t.Errorf("err = %v", err)
+	}
+	link := filepath.Join(t.TempDir(), "link.jsonl")
+	_ = os.Symlink(path, link)
+	if _, err := Open(link); err == nil {
+		t.Error("Open followed a symlink")
+	}
+}

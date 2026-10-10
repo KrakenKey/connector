@@ -1,7 +1,7 @@
 .PHONY: build test lint proto
 
 build:
-	CGO_ENABLED=0 go build ./...
+	CGO_ENABLED=0 go build -o krakenkey-connector ./cmd/krakenkey-connector
 
 test:
 	go test ./... -race
