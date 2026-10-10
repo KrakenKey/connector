@@ -27,11 +27,28 @@ func TestMain(m *testing.M) {
 	case "1":
 		plugin.Serve(plugin.ServeOpts{KeyStore: testplugin.NewKeyStore(), Target: testplugin.NewTarget()})
 		os.Exit(0)
+	case "env":
+		plugin.Serve(plugin.ServeOpts{Target: envTarget{Target: testplugin.NewTarget()}})
+		os.Exit(0)
 	case "slow":
 		plugin.Serve(plugin.ServeOpts{Target: slowTarget{Target: testplugin.NewTarget()}})
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
+}
+
+// envTarget reports, as Validate problems, which environment variables it
+// can see from a fixed list.
+type envTarget struct{ *testplugin.Target }
+
+func (envTarget) Validate(context.Context, plugin.TargetValidateRequest) ([]string, error) {
+	var seen []string
+	for _, k := range []string{"KK_API_KEY", "KK_API_KEY_FILE", "CREDENTIALS_DIRECTORY", "KK_ENROLLMENT_TOKEN", "KK_ENROLLMENT_TOKEN_FILE", "AWS_REGION", "KK_PLUGIN_TEST_KEEP"} {
+		if _, ok := os.LookupEnv(k); ok {
+			seen = append(seen, k)
+		}
+	}
+	return seen, nil
 }
 
 type slowTarget struct{ *testplugin.Target }
@@ -218,5 +235,44 @@ func TestExternalPluginBinaryChecks(t *testing.T) {
 		_ = os.Chown(want, 4242, 4242)
 		check("binary owned by another user", "owned by uid 4242")
 		_ = os.Chown(want, 0, 0)
+	}
+}
+
+func TestPluginEnv(t *testing.T) {
+	got := PluginEnv([]string{
+		"PATH=/bin", "KK_API_KEY=kk_secret", "KK_API_KEY_FILE=/run/k", "CREDENTIALS_DIRECTORY=/run/credentials/x",
+		"KK_ENROLLMENT_TOKEN=tok", "KK_ENROLLMENT_TOKEN_FILE=/run/t", "AWS_REGION=eu-west-1", "KK_API_URL=https://api",
+	})
+	want := []string{"PATH=/bin", "AWS_REGION=eu-west-1", "KK_API_URL=https://api"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("PluginEnv = %v, want %v", got, want)
+	}
+}
+
+func TestExternalPluginDoesNotSeeConnectorSecrets(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a subprocess")
+	}
+	exe, sum := selfBinary(t)
+	for _, k := range []string{"KK_API_KEY", "KK_API_KEY_FILE", "CREDENTIALS_DIRECTORY", "KK_ENROLLMENT_TOKEN", "KK_ENROLLMENT_TOKEN_FILE"} {
+		t.Setenv(k, "secret")
+	}
+	t.Setenv("AWS_REGION", "eu-west-1")
+	t.Setenv("KK_PLUGIN_TEST_KEEP", "1")
+	t.Setenv(servePluginEnv, "env")
+	h := New(&config.Config{DataDir: t.TempDir(), Plugins: map[string]config.PluginSpec{
+		"envcheck": {Path: exe, SHA256: sum, CallTimeout: time.Minute},
+	}}, quiet())
+	defer h.Close()
+	tg, err := h.Target("envcheck")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen, err := tg.Validate(context.Background(), plugin.TargetValidateRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(seen, ",") != "AWS_REGION,KK_PLUGIN_TEST_KEEP" {
+		t.Errorf("plugin sees %v, want only AWS_REGION and KK_PLUGIN_TEST_KEEP", seen)
 	}
 }

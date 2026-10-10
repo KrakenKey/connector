@@ -140,6 +140,34 @@ type KeyStoreValidateRequest struct {
 	CertificateID string
 }
 
+// KeyStoreValidation is a key store's answer to ValidateCapabilities.
+type KeyStoreValidation struct {
+	// Problems are human readable; empty means the settings are usable.
+	Problems []string
+	// Capabilities, when set, replace what Describe reports for these
+	// settings (for example keys that are exportable or not depending on
+	// a setting). Nil means use Describe's.
+	Capabilities *KeyStoreCapabilities
+}
+
+// KeyStoreCapabilityValidator is implemented by key stores whose
+// capabilities depend on their settings. The SDK calls ValidateCapabilities
+// instead of Validate when it is implemented, so the connector matches
+// targets against the capabilities for each certificate's settings.
+type KeyStoreCapabilityValidator interface {
+	ValidateCapabilities(ctx context.Context, req KeyStoreValidateRequest) (KeyStoreValidation, error)
+}
+
+// ValidateKeyStore validates ks's settings, with per-settings capabilities
+// when ks implements KeyStoreCapabilityValidator.
+func ValidateKeyStore(ctx context.Context, ks KeyStore, req KeyStoreValidateRequest) (KeyStoreValidation, error) {
+	if v, ok := ks.(KeyStoreCapabilityValidator); ok {
+		return v.ValidateCapabilities(ctx, req)
+	}
+	problems, err := ks.Validate(ctx, req)
+	return KeyStoreValidation{Problems: problems}, err
+}
+
 // CSRRequest asks a key store for a new key and CSR.
 type CSRRequest struct {
 	Config json.RawMessage

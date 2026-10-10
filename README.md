@@ -65,6 +65,20 @@ plugins, places such as key vaults and cloud load balancers.
 - Plugins and deployment commands run with the connector's permissions. Only
   install plugins you trust. Plugins installed by version must have their
   `sha256` pinned in the config.
+- Plugins get the connector's environment without `KK_API_KEY`,
+  `KK_API_KEY_FILE`, `CREDENTIALS_DIRECTORY` and `KK_ENROLLMENT_TOKEN*`.
+  Everything else is passed on, because cloud SDKs read their credentials and
+  settings from it. Some of those settings decide where a plugin sends
+  private keys and cloud tokens, so whoever can set the connector's
+  environment or the cloud SDK config files is inside the trust boundary:
+  - AWS: `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_<SERVICE>` (for example
+    `AWS_ENDPOINT_URL_ACM`), `endpoint_url` in the shared config file
+    (`AWS_CONFIG_FILE`, `AWS_PROFILE`), `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS`
+    and `AWS_CA_BUNDLE`.
+  - Azure: `AZURE_AUTHORITY_HOST`, `IDENTITY_ENDPOINT`, `MSI_ENDPOINT`,
+    `IMDS_ENDPOINT` and `AZURE_TOKEN_CREDENTIALS`.
+  - Any plugin: `SSL_CERT_FILE`, `SSL_CERT_DIR`, `HTTPS_PROXY`, `HTTP_PROXY`
+    and `NO_PROXY`.
 
 ## Install
 
@@ -466,8 +480,9 @@ systems the binary is started by path after the check, and the ownership
 rules are what keep it from being replaced in between.
 
 Every call to a plugin has a timeout (`call_timeout`, default 5 minutes; at
-most 1 minute for quick calls such as `Describe` and `Validate`). A plugin
-that exits is started again on the next call.
+most 1 minute for quick calls such as `Describe` and `Validate`). A rollback
+gets the longer of `call_timeout` and 5 minutes. A plugin that exits is
+started again on the next call.
 
 Plugins maintained in this repository, each its own Go module under
 [`plugins/`](plugins):
@@ -569,8 +584,20 @@ rollback the connector then fills `RollbackRequest.PreviousCertPEM`,
 its key, exported in the same format as for `Stage`. They are empty when the
 connector has nothing to hand back (the first deployment to the target, an
 expired certificate, or a key the key store no longer holds); the target then
-returns `ErrPermanent`. With a key store that does not allow export, rollback
-is unavailable for such a target and `validate` warns about it.
+returns `ErrPermanent`. If the target's key format carries key bytes and the
+key store does not allow export, rollback is unavailable for such a target and
+`validate` warns about it.
+
+The connector sends the optional protocol features it supports with every
+`Describe` call (`plugin.CoreFeaturesFrom(ctx)`, for example
+`plugin.FeatureRollbackMaterial`), so a plugin that depends on one can refuse
+to run with an older connector instead of misbehaving.
+
+A key store whose capabilities depend on its settings (for example keys that
+are exportable or not per vault) implements
+`plugin.KeyStoreCapabilityValidator`. The connector then matches each
+certificate's targets against the capabilities for that certificate's
+settings, so `validate` catches a pair that cannot work.
 
 ## Development
 

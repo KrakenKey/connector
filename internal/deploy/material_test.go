@@ -6,6 +6,8 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/krakenkey/connector/internal/audit"
 	"github.com/krakenkey/connector/internal/certutil"
+	"github.com/krakenkey/connector/internal/testplugin"
 	"github.com/krakenkey/connector/internal/verify"
 	"github.com/krakenkey/connector/pkg/plugin"
 )
@@ -286,5 +289,213 @@ func TestCancelledPassKeepsStateOfTargetsNotReached(t *testing.T) {
 	}
 	if len(st.PreviousCerts) != 1 || st.PreviousCerts[0].Serial != oldSerial {
 		t.Errorf("previous certificate the other targets still serve was dropped: %+v", st.PreviousCerts)
+	}
+}
+
+func TestActivateErrorButTargetServesNewCertificate(t *testing.T) {
+	for _, broken := range []bool{false, true} {
+		t.Run(fmt.Sprintf("broken=%v", broken), func(t *testing.T) {
+			e := setup(t, "a")
+			firstDeploy(t, e)
+			tg := e.targets["a"]
+			tg.applyThenFail = errors.New("connection reset")
+			tg.broken = broken
+			err := e.process(t, true)
+			newSerial := e.api.serial()
+			ts := e.state(t).Targets["a"]
+			if !e.audit.has(audit.StepRecover, audit.ResultOK, "target serves the new certificate") {
+				t.Error("the lost activation was not noticed")
+			}
+			if ts.Serial != newSerial || ts.Phase != "" {
+				t.Errorf("state = %+v, want serial %s: the target serves it", ts, newSerial)
+			}
+			if !broken && (err != nil || ts.Outcome != OutcomeVerified) {
+				t.Errorf("healthy endpoint: err %v outcome %s", err, ts.Outcome)
+			}
+			if broken && (err == nil || ts.Outcome != OutcomeFailed || tg.rollbacks != 0) {
+				t.Errorf("broken endpoint: err %v outcome %s rollbacks %d", err, ts.Outcome, tg.rollbacks)
+			}
+		})
+	}
+}
+
+func TestActivateErrorWithoutChangeIsAFailure(t *testing.T) {
+	e := setup(t, "a")
+	firstDeploy(t, e)
+	oldSerial := e.api.serial()
+	e.targets["a"].failActivate = fmt.Errorf("%w: busy", plugin.ErrUnavailable)
+	if err := e.process(t, true); err == nil {
+		t.Fatal("want an error")
+	}
+	if ts := e.state(t).Targets["a"]; ts.Serial != oldSerial || ts.Failures != 1 {
+		t.Errorf("state = %+v", ts)
+	}
+}
+
+func TestFailedRollbackRecordsWhatTargetServes(t *testing.T) {
+	for _, current := range []bool{true, false} {
+		t.Run(fmt.Sprintf("current=%v", current), func(t *testing.T) {
+			e := setup(t, "a")
+			firstDeploy(t, e)
+			oldSerial := e.api.serial()
+			tg := e.targets["a"]
+			tg.broken = true
+			tg.failRollback = fmt.Errorf("%w: cannot", plugin.ErrPermanent)
+			tg.noCurrent = !current
+			err := e.process(t, true)
+			if err == nil || !strings.Contains(err.Error(), "rollback failed") {
+				t.Fatalf("err = %v", err)
+			}
+			ts := e.state(t).Targets["a"]
+			want := oldSerial
+			if current {
+				want = e.api.serial() // the target says it still serves the new one
+			}
+			if ts.Serial != want || ts.Outcome != OutcomeFailed || ts.Phase != "" {
+				t.Errorf("state = %+v, want serial %s", ts, want)
+			}
+		})
+	}
+}
+
+func TestRollbackMaterialFollowsWhatTargetServed(t *testing.T) {
+	e := materialSetup(t, "a")
+	firstDeploy(t, e)
+	tg := e.targets["a"]
+
+	// Renew; the deployment fails, the rollback fails, and the target
+	// cannot say what it serves, so the state still says the old serial
+	// while the target holds the new one.
+	tg.broken, tg.noCurrent, tg.failRollback = true, true, fmt.Errorf("%w: down", plugin.ErrUnavailable)
+	_ = e.process(t, true)
+	newSerial := e.api.serial()
+	if tg.installed != newSerial || e.state(t).Targets["a"].Serial == newSerial {
+		t.Fatalf("setup: installed %s, state %+v", tg.installed, e.state(t).Targets["a"])
+	}
+
+	// The retry asks the target first, so the rollback restores what it
+	// really served (the new certificate), with matching material.
+	tg.noCurrent, tg.failRollback, tg.rollbackReqs = false, nil, nil
+	e.now = e.now.Add(MaxRetryDelay + time.Minute)
+	err := e.process(t, false)
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(tg.rollbackReqs) != 1 {
+		t.Fatalf("rollback requests: %d", len(tg.rollbackReqs))
+	}
+	checkMaterial(t, tg.rollbackReqs[len(tg.rollbackReqs)-1], newSerial)
+	if ts := e.state(t).Targets["a"]; ts.Serial != newSerial || ts.LiveBefore != "" {
+		t.Errorf("state after rollback = %+v, want serial %s", ts, newSerial)
+	}
+}
+
+func TestRollbackMaterialSkippedForUnknownLiveCertificate(t *testing.T) {
+	e := materialSetup(t, "a")
+	firstDeploy(t, e)
+	tg := e.targets["a"]
+	tg.installed, tg.live = "abc", "abc" // changed by hand outside the connector
+	tg.broken = true
+	exports := 0
+	e.job.KeyStore = countingKeyStore{KeyStore: e.ks, exports: &exports}
+	_ = e.process(t, true)
+	if !e.audit.has(audit.StepRollback, audit.ResultFailed, "no longer holds certificate abc") {
+		t.Error("rollback audit does not name the unknown live certificate")
+	}
+	// One export for Stage; none for material the target would refuse.
+	if exports != 1 {
+		t.Errorf("exports = %d, want 1", exports)
+	}
+}
+
+type countingKeyStore struct {
+	*testplugin.KeyStore
+	exports *int
+	// refuseComplete makes Complete fail permanently for this key ref.
+	refuseComplete string
+}
+
+func (c countingKeyStore) Export(ctx context.Context, req plugin.ExportRequest) (plugin.KeyMaterial, error) {
+	*c.exports++
+	return c.KeyStore.Export(ctx, req)
+}
+
+func (c countingKeyStore) Complete(ctx context.Context, req plugin.CompleteRequest) (string, error) {
+	if req.KeyRef == c.refuseComplete {
+		return "", fmt.Errorf("%w: certificate does not match the stored key policy", plugin.ErrPermanent)
+	}
+	return c.KeyStore.Complete(ctx, req)
+}
+
+func TestKeepNewUsesTheDeployedCertificatesExpiry(t *testing.T) {
+	e := setup(t, "a")
+	firstDeploy(t, e)
+	st := e.state(t)
+	older := CertRecord{Serial: "b0b", NotAfter: e.now.Add(40 * 24 * time.Hour).Truncate(time.Second).UTC(), KeyRef: st.KeyRef, CertPEM: "x"}
+	st.PreviousCerts = append(st.PreviousCerts, older)
+	ts := st.Targets["a"]
+	ts.Phase, ts.DeployingSerial = PhaseActivated, older.Serial
+	st.Targets["a"] = ts
+
+	r := &run{e: e.engine, job: e.job, opts: Options{RunID: "run"}, log: e.engine.Log, st: st}
+	tj := e.job.Targets[0]
+	tj.Caps.SupportsRollback = false
+	tr := &targetRun{run: r, tj: tj, log: r.log}
+	_ = tr.rollback(context.Background(), "p1", errors.New("verify failed"), false)
+	if got := st.Targets["a"]; got.Serial != older.Serial || !got.NotAfter.Equal(older.NotAfter) {
+		t.Errorf("target state = serial %s not_after %s, want %s %s", got.Serial, got.NotAfter, older.Serial, older.NotAfter)
+	}
+}
+
+// timeoutTarget is a fake target with a plugin call timeout.
+type timeoutTarget struct {
+	*fakeTarget
+	timeout time.Duration
+}
+
+func (t timeoutTarget) CallTimeout() time.Duration { return t.timeout }
+
+func TestRollbackGetsThePluginCallTimeout(t *testing.T) {
+	for _, ct := range []time.Duration{0, 30 * time.Minute} {
+		t.Run(ct.String(), func(t *testing.T) {
+			e := setup(t, "a")
+			firstDeploy(t, e)
+			tg := e.targets["a"]
+			if ct > 0 {
+				e.job.Targets[0].Plugin = timeoutTarget{fakeTarget: tg, timeout: ct}
+			}
+			tg.broken = true
+			_ = e.process(t, true)
+			want := max(DefaultRollbackTimeout, ct)
+			if tg.rollbacks != 1 || tg.rollbackBudget > want || tg.rollbackBudget < want-time.Minute {
+				t.Errorf("rollback had %s, want about %s", tg.rollbackBudget, want)
+			}
+		})
+	}
+}
+
+func TestAdoptionRefusedByKeyStoreRenews(t *testing.T) {
+	e := setup(t, "a")
+	firstDeploy(t, e)
+	oldKey := e.state(t).KeyRef
+	exports := 0
+	e.job.KeyStore = countingKeyStore{KeyStore: e.ks, exports: &exports, refuseComplete: oldKey}
+
+	// KrakenKey renews on its own with the connector's key, and the key
+	// store refuses that certificate for good.
+	e.api.serverRenew()
+	if err := e.process(t, false); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	st := e.state(t)
+	if e.api.renews != 2 || st.KeyRef == oldKey || st.Serial != e.api.serial() || st.Targets["a"].Serial != st.Serial {
+		t.Errorf("renews %d, key %s (old %s), state %+v", e.api.renews, st.KeyRef, oldKey, st.Targets["a"])
+	}
+	if !e.audit.has(audit.StepCreateCSR, audit.ResultOK, "refused the certificate KrakenKey renewed") {
+		t.Error("renewal reason not recorded")
+	}
+	// The next pass has nothing to do.
+	if err := e.process(t, false); err != nil || e.api.renews != 2 {
+		t.Errorf("second pass: %v, renews %d", err, e.api.renews)
 	}
 }

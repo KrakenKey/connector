@@ -26,12 +26,36 @@ protocol and the KrakenKey API the connector uses.
   now records earlier certificates while a target still serves them, so
   this also works after a restart and when an interrupted deployment is
   rolled back. `validate` warns when such a target is paired with a key
-  store that does not allow export.
+  store that does not allow export. Before Activate the connector asks such
+  a target what it serves, so the material matches what was really live.
+- Core features: the connector sends the optional protocol features it
+  supports (`core_features`) with every `Describe` call, so plugins can
+  refuse to run with a connector that lacks one they need.
+- Key stores can return capabilities for a certificate's settings from
+  `Validate` (`KeyStoreCapabilityValidator`), and the connector matches
+  targets against those.
 
 ### Fixed
 
 - A pass cancelled partway through no longer forgets the deployment state
   of the targets it had not reached yet.
+- After an Activate that reported an error, or a Rollback that failed, the
+  connector asks the target what it serves. If the target already serves the
+  new certificate, the connector records that (and verifies it after a lost
+  Activate answer), so the next deployment's previous state is right.
+- A certificate the connector keeps after a failed check records that
+  certificate's expiry, not the newest one's.
+- A rollback gets the longer of the plugin's `call_timeout` and 5 minutes.
+- When the key store permanently refuses a certificate KrakenKey renewed
+  with the connector's key, the connector renews with a new key instead of
+  retrying the same step on every pass.
+
+### Security
+
+- Plugins no longer inherit the connector's `KK_API_KEY_FILE`,
+  `CREDENTIALS_DIRECTORY` or `KK_ENROLLMENT_TOKEN*` environment variables.
+  The README lists the cloud SDK variables that decide where plugins send
+  keys and tokens.
 
 ## [v0.1.0] - 2026-10-10
 

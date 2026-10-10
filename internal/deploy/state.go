@@ -119,6 +119,10 @@ type TargetState struct {
 	DeployingSerial string `json:"deploying_serial,omitempty"`
 	StagedRef       string `json:"staged_ref,omitempty"`
 	PreviousRef     string `json:"previous_ref,omitempty"`
+	// LiveBefore is the serial the target reported (Current) just before
+	// Activate, for targets that need the previous certificate handed back
+	// on rollback. Empty when the target could not tell.
+	LiveBefore string `json:"live_before,omitempty"`
 	// Failures counts failed deployments in a row; NextAttempt is the
 	// earliest time the next one is tried.
 	Failures    int       `json:"failures,omitempty"`
@@ -128,6 +132,11 @@ type TargetState struct {
 	// for state written before it was recorded.
 	Outcome   string    `json:"outcome,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// endDeployment clears what describes a deployment in progress.
+func (ts *TargetState) endDeployment() {
+	ts.Phase, ts.StagedRef, ts.DeployingSerial, ts.LiveBefore = "", "", "", ""
 }
 
 // StateStore keeps State files under <data_dir>/state, mode 0600.
