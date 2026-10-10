@@ -586,6 +586,13 @@ The connector sends the optional protocol features it supports with every
 `plugin.FeatureRollbackMaterial`), so a plugin that depends on one can refuse
 to run with an older connector instead of misbehaving.
 
+Calls that create, change or check resources carry the connector's install
+id (`plugin.InstallIDFrom(ctx)`): an opaque id that stays the same across
+restarts, so a plugin can tag the resources it creates and recognize its own.
+It is the connector's id in KrakenKey once enrolled, and before that a random
+id the first run stores in `<data_dir>/install_id` (mode `0600`), so it
+changes once when an installation enrolls.
+
 A key store whose capabilities depend on its settings (for example keys that
 are exportable or not per vault) implements
 `plugin.KeyStoreCapabilityValidator`. The connector then matches each

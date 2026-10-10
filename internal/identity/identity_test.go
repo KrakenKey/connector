@@ -426,3 +426,40 @@ func TestRotationCrashSafety(t *testing.T) {
 		})
 	}
 }
+
+func TestInstallID(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := ReadInstallID(dir, nil); err != nil || id != "" {
+		t.Fatalf("ReadInstallID before the first run = %q, %v", id, err)
+	}
+	id, err := InstallID(dir, nil)
+	if err != nil || !strings.HasPrefix(id, "install-") {
+		t.Fatalf("InstallID = %q, %v", id, err)
+	}
+	info, err := os.Stat(filepath.Join(dir, InstallIDFile))
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("install id file: %v %v", info, err)
+	}
+	again, err := ReadInstallID(dir, nil)
+	if err != nil || again != id {
+		t.Errorf("second InstallID = %q, %v; want the stored %q", again, err, id)
+	}
+	if got, err := InstallID(dir, &Identity{Meta: Meta{ConnectorID: "conn_123"}}); err != nil || got != "conn_123" {
+		t.Errorf("enrolled InstallID = %q, %v", got, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, InstallIDFile), []byte("bad id\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallID(dir, nil); err == nil {
+		t.Error("a corrupt install id was accepted")
+	}
+	if err := os.Chmod(filepath.Join(dir, InstallIDFile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallID(dir, nil); err == nil {
+		t.Error("a world-readable install id file was accepted")
+	}
+}

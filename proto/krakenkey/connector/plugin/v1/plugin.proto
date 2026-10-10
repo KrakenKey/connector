@@ -29,6 +29,15 @@
 //   - DEADLINE_EXCEEDED, CANCELED: the core's deadline or cancellation.
 //   - Anything else (UNKNOWN, INTERNAL, ...) is treated as transient.
 //
+// Install id. Requests that create, change or check resources carry
+// install_id: an opaque identifier of the connector installation that
+// stays the same across restarts and upgrades. It is the connector's id in
+// KrakenKey once the connector is enrolled, and before that a random id
+// created once and kept in the data directory, so it changes once when an
+// installation enrolls. Plugins may use it to tag resources they create
+// and to recognize their own. It is not a secret and not a credential.
+// Connectors that predate it send it empty.
+//
 // Secrets. KeyMaterial carries private keys and passwords. Neither side may
 // log request or response messages that contain it (CreateCSR responses do
 // not; ExportResponse, StageRequest and RollbackRequest do).
@@ -92,6 +101,9 @@ message KeyStoreServiceDescribeRequest {
   // Optional protocol features the connector supports (see
   // TargetServiceDescribeRequest.core_features).
   repeated string core_features = 1;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 2;
 }
 
 message KeyStoreServiceDescribeResponse {
@@ -101,6 +113,9 @@ message KeyStoreServiceDescribeResponse {
 message KeyStoreServiceValidateRequest {
   bytes config_json = 1;
   string certificate_id = 2;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 3;
 }
 
 message KeyStoreServiceValidateResponse {
@@ -120,6 +135,9 @@ message CreateCSRRequest {
   // DNS names for the CSR. The first is used as the subject common name.
   repeated string names = 3;
   KeyType key_type = 4;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 5;
 }
 
 message CreateCSRResponse {
@@ -146,6 +164,9 @@ message CompleteRequest {
   string cert_pem = 3;
   // Intermediate certificates, PEM.
   string chain_pem = 4;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 5;
 }
 
 message CompleteResponse {
@@ -167,6 +188,9 @@ message ExportResponse {
 message ReleaseRequest {
   bytes config_json = 1;
   string key_ref = 2;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 3;
 }
 
 message ReleaseResponse {}
@@ -243,6 +267,9 @@ message TargetServiceDescribeRequest {
   //   - "keystore_validate_capabilities": the connector uses
   //     KeyStoreServiceValidateResponse.capabilities.
   repeated string core_features = 1;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 2;
 }
 
 message TargetServiceDescribeResponse {
@@ -254,6 +281,9 @@ message TargetServiceValidateRequest {
   string certificate_id = 2;
   // Target label from the connector config.
   string label = 3;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 4;
 }
 
 message TargetServiceValidateResponse {
@@ -291,6 +321,9 @@ message StageRequest {
   KeyMaterial key = 7;
   // Serial number of the leaf, lowercase hex.
   string serial = 8;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 9;
 }
 
 message StageResponse {
@@ -303,6 +336,9 @@ message ActivateRequest {
   string staged_ref = 2;
   string certificate_id = 3;
   string label = 4;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 5;
 }
 
 message ActivateResponse {
@@ -341,6 +377,9 @@ message RollbackRequest {
   KeyMaterial previous_key = 8;
   // Serial number of the previous leaf, lowercase hex.
   string previous_serial = 9;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 10;
 }
 
 message RollbackResponse {}
@@ -350,6 +389,9 @@ message DiscardRequest {
   string staged_ref = 2;
   string certificate_id = 3;
   string label = 4;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 5;
 }
 
 message DiscardResponse {}

@@ -29,6 +29,15 @@
 //   - DEADLINE_EXCEEDED, CANCELED: the core's deadline or cancellation.
 //   - Anything else (UNKNOWN, INTERNAL, ...) is treated as transient.
 //
+// Install id. Requests that create, change or check resources carry
+// install_id: an opaque identifier of the connector installation that
+// stays the same across restarts and upgrades. It is the connector's id in
+// KrakenKey once the connector is enrolled, and before that a random id
+// created once and kept in the data directory, so it changes once when an
+// installation enrolls. Plugins may use it to tag resources they create
+// and to recognize their own. It is not a secret and not a credential.
+// Connectors that predate it send it empty.
+//
 // Secrets. KeyMaterial carries private keys and passwords. Neither side may
 // log request or response messages that contain it (CreateCSR responses do
 // not; ExportResponse, StageRequest and RollbackRequest do).

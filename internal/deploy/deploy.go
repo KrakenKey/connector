@@ -381,16 +381,27 @@ var (
 func (r *run) adopt(ctx context.Context, cert *api.Cert, leafSPKI string) error {
 	st := r.st
 	switch {
+	case st.Pending != nil && leafSPKI == st.Pending.SPKI:
+		r.log.Info("a renewal from an earlier pass has completed; deploying it", "key_ref", st.Pending.KeyRef)
+		return r.finishIssued(ctx, cert, st.Pending.KeyRef, st.Pending.SPKI, true, "renewal from an earlier pass completed")
 	case st.KeyRef != "" && leafSPKI == st.KeySPKI:
+		if st.Pending != nil {
+			// KrakenKey's current certificate is not the one the pending
+			// key was for, so that renewal will not produce it. Resolve
+			// it first: some key stores refuse to complete another
+			// certificate while a request of their own is open.
+			r.releaseKey(ctx, st.Pending.KeyRef, "pending key from a renewal superseded by KrakenKey's renewal with the current key")
+			st.Pending = nil
+			if err := r.save(); err != nil {
+				return err
+			}
+		}
 		r.log.Info("KrakenKey renewed the certificate with the connector's current key; deploying it")
 		err := r.finishIssued(ctx, cert, st.KeyRef, st.KeySPKI, false, "renewed by KrakenKey with the connector's key")
 		if errors.Is(err, errCompleteRefused) {
 			return fmt.Errorf("%w: %w", errAdoptRefused, err)
 		}
 		return err
-	case st.Pending != nil && leafSPKI == st.Pending.SPKI:
-		r.log.Info("a renewal from an earlier pass has completed; deploying it", "key_ref", st.Pending.KeyRef)
-		return r.finishIssued(ctx, cert, st.Pending.KeyRef, st.Pending.SPKI, true, "renewal from an earlier pass completed")
 	}
 	return nil
 }

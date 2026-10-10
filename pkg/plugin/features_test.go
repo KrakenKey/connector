@@ -100,3 +100,66 @@ func TestKeyStoreCapabilitiesForSettingsCrossTheWire(t *testing.T) {
 		t.Errorf("plain key store: %+v, %v", v, err)
 	}
 }
+
+// idTarget and idKeyStore record the install id their calls see.
+type idTarget struct {
+	plugin.UnimplementedTarget
+	seen chan string
+}
+
+func (i idTarget) Describe(ctx context.Context) (plugin.TargetCapabilities, error) {
+	i.seen <- "describe=" + plugin.InstallIDFrom(ctx)
+	return plugin.TargetCapabilities{}, nil
+}
+
+func (i idTarget) Stage(ctx context.Context, _ plugin.StageRequest) (string, error) {
+	i.seen <- "stage=" + plugin.InstallIDFrom(ctx)
+	return "s", nil
+}
+
+func (i idTarget) Activate(ctx context.Context, _ plugin.ActivateRequest) (string, error) {
+	i.seen <- "activate=" + plugin.InstallIDFrom(ctx)
+	return "p", nil
+}
+
+type idKeyStore struct {
+	*testplugin.KeyStore
+	seen chan string
+}
+
+func (i idKeyStore) CreateCSR(ctx context.Context, req plugin.CSRRequest) (plugin.CSR, error) {
+	i.seen <- "csr=" + plugin.InstallIDFrom(ctx)
+	return i.KeyStore.CreateCSR(ctx, req)
+}
+
+func (i idKeyStore) Complete(ctx context.Context, req plugin.CompleteRequest) (string, error) {
+	i.seen <- "complete=" + plugin.InstallIDFrom(ctx)
+	return req.KeyRef, nil
+}
+
+func TestInstallIDCrossesTheWire(t *testing.T) {
+	seen := make(chan string, 10)
+	client, _ := goplugin.TestPluginGRPCConn(t, false, plugin.ServeOpts{
+		Target: idTarget{seen: seen}, KeyStore: idKeyStore{KeyStore: testplugin.NewKeyStore(), seen: seen},
+	}.PluginSet())
+	defer func() { _ = client.Close() }()
+	tg, _ := plugin.DispenseTarget(client)
+	ks, _ := plugin.DispenseKeyStore(client)
+	ctx := plugin.WithInstallID(context.Background(), "install-abc")
+
+	_, _ = tg.Describe(ctx)
+	_, _ = tg.Stage(ctx, plugin.StageRequest{})
+	_, _ = tg.Activate(ctx, plugin.ActivateRequest{})
+	csr, err := ks.CreateCSR(ctx, plugin.CSRRequest{CertificateID: "1", Names: []string{"a.example.com"}, KeyType: plugin.KeyTypeECDSAP256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = ks.Complete(ctx, plugin.CompleteRequest{KeyRef: csr.KeyRef})
+	_, _ = tg.Stage(context.Background(), plugin.StageRequest{}) // no id set
+	want := []string{"describe=install-abc", "stage=install-abc", "activate=install-abc", "csr=install-abc", "complete=install-abc", "stage="}
+	for _, w := range want {
+		if got := <-seen; got != w {
+			t.Errorf("got %q, want %q", got, w)
+		}
+	}
+}

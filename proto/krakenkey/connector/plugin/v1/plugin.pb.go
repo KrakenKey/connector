@@ -29,6 +29,15 @@
 //   - DEADLINE_EXCEEDED, CANCELED: the core's deadline or cancellation.
 //   - Anything else (UNKNOWN, INTERNAL, ...) is treated as transient.
 //
+// Install id. Requests that create, change or check resources carry
+// install_id: an opaque identifier of the connector installation that
+// stays the same across restarts and upgrades. It is the connector's id in
+// KrakenKey once the connector is enrolled, and before that a random id
+// created once and kept in the data directory, so it changes once when an
+// installation enrolls. Plugins may use it to tag resources they create
+// and to recognize their own. It is not a secret and not a credential.
+// Connectors that predate it send it empty.
+//
 // Secrets. KeyMaterial carries private keys and passwords. Neither side may
 // log request or response messages that contain it (CreateCSR responses do
 // not; ExportResponse, StageRequest and RollbackRequest do).
@@ -315,7 +324,10 @@ type KeyStoreServiceDescribeRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Optional protocol features the connector supports (see
 	// TargetServiceDescribeRequest.core_features).
-	CoreFeatures  []string `protobuf:"bytes,1,rep,name=core_features,json=coreFeatures,proto3" json:"core_features,omitempty"`
+	CoreFeatures []string `protobuf:"bytes,1,rep,name=core_features,json=coreFeatures,proto3" json:"core_features,omitempty"`
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,2,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -355,6 +367,13 @@ func (x *KeyStoreServiceDescribeRequest) GetCoreFeatures() []string {
 		return x.CoreFeatures
 	}
 	return nil
+}
+
+func (x *KeyStoreServiceDescribeRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
+	}
+	return ""
 }
 
 type KeyStoreServiceDescribeResponse struct {
@@ -405,6 +424,9 @@ type KeyStoreServiceValidateRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ConfigJson    []byte                 `protobuf:"bytes,1,opt,name=config_json,json=configJson,proto3" json:"config_json,omitempty"`
 	CertificateId string                 `protobuf:"bytes,2,opt,name=certificate_id,json=certificateId,proto3" json:"certificate_id,omitempty"`
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,3,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -449,6 +471,13 @@ func (x *KeyStoreServiceValidateRequest) GetConfigJson() []byte {
 func (x *KeyStoreServiceValidateRequest) GetCertificateId() string {
 	if x != nil {
 		return x.CertificateId
+	}
+	return ""
+}
+
+func (x *KeyStoreServiceValidateRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
 	}
 	return ""
 }
@@ -516,8 +545,11 @@ type CreateCSRRequest struct {
 	// KrakenKey certificate id, for naming keys.
 	CertificateId string `protobuf:"bytes,2,opt,name=certificate_id,json=certificateId,proto3" json:"certificate_id,omitempty"`
 	// DNS names for the CSR. The first is used as the subject common name.
-	Names         []string `protobuf:"bytes,3,rep,name=names,proto3" json:"names,omitempty"`
-	KeyType       KeyType  `protobuf:"varint,4,opt,name=key_type,json=keyType,proto3,enum=krakenkey.connector.plugin.v1.KeyType" json:"key_type,omitempty"`
+	Names   []string `protobuf:"bytes,3,rep,name=names,proto3" json:"names,omitempty"`
+	KeyType KeyType  `protobuf:"varint,4,opt,name=key_type,json=keyType,proto3,enum=krakenkey.connector.plugin.v1.KeyType" json:"key_type,omitempty"`
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,5,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -578,6 +610,13 @@ func (x *CreateCSRRequest) GetKeyType() KeyType {
 		return x.KeyType
 	}
 	return KeyType_KEY_TYPE_UNSPECIFIED
+}
+
+func (x *CreateCSRRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
+	}
+	return ""
 }
 
 type CreateCSRResponse struct {
@@ -738,7 +777,10 @@ type CompleteRequest struct {
 	// Issued leaf certificate, PEM.
 	CertPem string `protobuf:"bytes,3,opt,name=cert_pem,json=certPem,proto3" json:"cert_pem,omitempty"`
 	// Intermediate certificates, PEM.
-	ChainPem      string `protobuf:"bytes,4,opt,name=chain_pem,json=chainPem,proto3" json:"chain_pem,omitempty"`
+	ChainPem string `protobuf:"bytes,4,opt,name=chain_pem,json=chainPem,proto3" json:"chain_pem,omitempty"`
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,5,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -797,6 +839,13 @@ func (x *CompleteRequest) GetCertPem() string {
 func (x *CompleteRequest) GetChainPem() string {
 	if x != nil {
 		return x.ChainPem
+	}
+	return ""
+}
+
+func (x *CompleteRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
 	}
 	return ""
 }
@@ -952,9 +1001,12 @@ func (x *ExportResponse) GetKey() *KeyMaterial {
 }
 
 type ReleaseRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ConfigJson    []byte                 `protobuf:"bytes,1,opt,name=config_json,json=configJson,proto3" json:"config_json,omitempty"`
-	KeyRef        string                 `protobuf:"bytes,2,opt,name=key_ref,json=keyRef,proto3" json:"key_ref,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	ConfigJson []byte                 `protobuf:"bytes,1,opt,name=config_json,json=configJson,proto3" json:"config_json,omitempty"`
+	KeyRef     string                 `protobuf:"bytes,2,opt,name=key_ref,json=keyRef,proto3" json:"key_ref,omitempty"`
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,3,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -999,6 +1051,13 @@ func (x *ReleaseRequest) GetConfigJson() []byte {
 func (x *ReleaseRequest) GetKeyRef() string {
 	if x != nil {
 		return x.KeyRef
+	}
+	return ""
+}
+
+func (x *ReleaseRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
 	}
 	return ""
 }
@@ -1159,7 +1218,10 @@ type TargetServiceDescribeRequest struct {
 	//     previous_* fields for targets with rollback_needs_material.
 	//   - "keystore_validate_capabilities": the connector uses
 	//     KeyStoreServiceValidateResponse.capabilities.
-	CoreFeatures  []string `protobuf:"bytes,1,rep,name=core_features,json=coreFeatures,proto3" json:"core_features,omitempty"`
+	CoreFeatures []string `protobuf:"bytes,1,rep,name=core_features,json=coreFeatures,proto3" json:"core_features,omitempty"`
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,2,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1199,6 +1261,13 @@ func (x *TargetServiceDescribeRequest) GetCoreFeatures() []string {
 		return x.CoreFeatures
 	}
 	return nil
+}
+
+func (x *TargetServiceDescribeRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
+	}
+	return ""
 }
 
 type TargetServiceDescribeResponse struct {
@@ -1250,7 +1319,10 @@ type TargetServiceValidateRequest struct {
 	ConfigJson    []byte                 `protobuf:"bytes,1,opt,name=config_json,json=configJson,proto3" json:"config_json,omitempty"`
 	CertificateId string                 `protobuf:"bytes,2,opt,name=certificate_id,json=certificateId,proto3" json:"certificate_id,omitempty"`
 	// Target label from the connector config.
-	Label         string `protobuf:"bytes,3,opt,name=label,proto3" json:"label,omitempty"`
+	Label string `protobuf:"bytes,3,opt,name=label,proto3" json:"label,omitempty"`
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,4,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1302,6 +1374,13 @@ func (x *TargetServiceValidateRequest) GetCertificateId() string {
 func (x *TargetServiceValidateRequest) GetLabel() string {
 	if x != nil {
 		return x.Label
+	}
+	return ""
+}
+
+func (x *TargetServiceValidateRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
 	}
 	return ""
 }
@@ -1475,7 +1554,10 @@ type StageRequest struct {
 	// Never log this message: it carries the key.
 	Key *KeyMaterial `protobuf:"bytes,7,opt,name=key,proto3" json:"key,omitempty"`
 	// Serial number of the leaf, lowercase hex.
-	Serial        string `protobuf:"bytes,8,opt,name=serial,proto3" json:"serial,omitempty"`
+	Serial string `protobuf:"bytes,8,opt,name=serial,proto3" json:"serial,omitempty"`
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,9,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1566,6 +1648,13 @@ func (x *StageRequest) GetSerial() string {
 	return ""
 }
 
+func (x *StageRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
+	}
+	return ""
+}
+
 type StageResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Opaque reference passed to Activate or Discard.
@@ -1617,6 +1706,9 @@ type ActivateRequest struct {
 	StagedRef     string                 `protobuf:"bytes,2,opt,name=staged_ref,json=stagedRef,proto3" json:"staged_ref,omitempty"`
 	CertificateId string                 `protobuf:"bytes,3,opt,name=certificate_id,json=certificateId,proto3" json:"certificate_id,omitempty"`
 	Label         string                 `protobuf:"bytes,4,opt,name=label,proto3" json:"label,omitempty"`
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,5,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1675,6 +1767,13 @@ func (x *ActivateRequest) GetCertificateId() string {
 func (x *ActivateRequest) GetLabel() string {
 	if x != nil {
 		return x.Label
+	}
+	return ""
+}
+
+func (x *ActivateRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
 	}
 	return ""
 }
@@ -1756,8 +1855,11 @@ type RollbackRequest struct {
 	PreviousKey *KeyMaterial `protobuf:"bytes,8,opt,name=previous_key,json=previousKey,proto3" json:"previous_key,omitempty"`
 	// Serial number of the previous leaf, lowercase hex.
 	PreviousSerial string `protobuf:"bytes,9,opt,name=previous_serial,json=previousSerial,proto3" json:"previous_serial,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,10,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RollbackRequest) Reset() {
@@ -1853,6 +1955,13 @@ func (x *RollbackRequest) GetPreviousSerial() string {
 	return ""
 }
 
+func (x *RollbackRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
+	}
+	return ""
+}
+
 type RollbackResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -1895,6 +2004,9 @@ type DiscardRequest struct {
 	StagedRef     string                 `protobuf:"bytes,2,opt,name=staged_ref,json=stagedRef,proto3" json:"staged_ref,omitempty"`
 	CertificateId string                 `protobuf:"bytes,3,opt,name=certificate_id,json=certificateId,proto3" json:"certificate_id,omitempty"`
 	Label         string                 `protobuf:"bytes,4,opt,name=label,proto3" json:"label,omitempty"`
+	// Opaque, stable id of the connector installation (see "Install id"
+	// above).
+	InstallId     string `protobuf:"bytes,5,opt,name=install_id,json=installId,proto3" json:"install_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1957,6 +2069,13 @@ func (x *DiscardRequest) GetLabel() string {
 	return ""
 }
 
+func (x *DiscardRequest) GetInstallId() string {
+	if x != nil {
+		return x.InstallId
+	}
+	return ""
+}
+
 type DiscardResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -2008,24 +2127,30 @@ const file_krakenkey_connector_plugin_v1_plugin_proto_rawDesc = "" +
 	"\n" +
 	"exportable\x18\x02 \x01(\bR\n" +
 	"exportable\x12C\n" +
-	"\tkey_types\x18\x03 \x03(\x0e2&.krakenkey.connector.plugin.v1.KeyTypeR\bkeyTypes\"E\n" +
+	"\tkey_types\x18\x03 \x03(\x0e2&.krakenkey.connector.plugin.v1.KeyTypeR\bkeyTypes\"d\n" +
 	"\x1eKeyStoreServiceDescribeRequest\x12#\n" +
-	"\rcore_features\x18\x01 \x03(\tR\fcoreFeatures\"z\n" +
+	"\rcore_features\x18\x01 \x03(\tR\fcoreFeatures\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\x02 \x01(\tR\tinstallId\"z\n" +
 	"\x1fKeyStoreServiceDescribeResponse\x12W\n" +
-	"\fcapabilities\x18\x01 \x01(\v23.krakenkey.connector.plugin.v1.KeyStoreCapabilitiesR\fcapabilities\"h\n" +
+	"\fcapabilities\x18\x01 \x01(\v23.krakenkey.connector.plugin.v1.KeyStoreCapabilitiesR\fcapabilities\"\x87\x01\n" +
 	"\x1eKeyStoreServiceValidateRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12%\n" +
-	"\x0ecertificate_id\x18\x02 \x01(\tR\rcertificateId\"\x96\x01\n" +
+	"\x0ecertificate_id\x18\x02 \x01(\tR\rcertificateId\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\x03 \x01(\tR\tinstallId\"\x96\x01\n" +
 	"\x1fKeyStoreServiceValidateResponse\x12\x1a\n" +
 	"\bproblems\x18\x01 \x03(\tR\bproblems\x12W\n" +
-	"\fcapabilities\x18\x02 \x01(\v23.krakenkey.connector.plugin.v1.KeyStoreCapabilitiesR\fcapabilities\"\xb3\x01\n" +
+	"\fcapabilities\x18\x02 \x01(\v23.krakenkey.connector.plugin.v1.KeyStoreCapabilitiesR\fcapabilities\"\xd2\x01\n" +
 	"\x10CreateCSRRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12%\n" +
 	"\x0ecertificate_id\x18\x02 \x01(\tR\rcertificateId\x12\x14\n" +
 	"\x05names\x18\x03 \x03(\tR\x05names\x12A\n" +
-	"\bkey_type\x18\x04 \x01(\x0e2&.krakenkey.connector.plugin.v1.KeyTypeR\akeyType\"E\n" +
+	"\bkey_type\x18\x04 \x01(\x0e2&.krakenkey.connector.plugin.v1.KeyTypeR\akeyType\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\x05 \x01(\tR\tinstallId\"E\n" +
 	"\x11CreateCSRResponse\x12\x17\n" +
 	"\acsr_pem\x18\x01 \x01(\tR\x06csrPem\x12\x17\n" +
 	"\akey_ref\x18\x02 \x01(\tR\x06keyRef\"L\n" +
@@ -2034,13 +2159,15 @@ const file_krakenkey_connector_plugin_v1_plugin_proto_rawDesc = "" +
 	"configJson\x12\x17\n" +
 	"\akey_ref\x18\x02 \x01(\tR\x06keyRef\".\n" +
 	"\x11PublicKeyResponse\x12\x19\n" +
-	"\bspki_der\x18\x01 \x01(\fR\aspkiDer\"\x83\x01\n" +
+	"\bspki_der\x18\x01 \x01(\fR\aspkiDer\"\xa2\x01\n" +
 	"\x0fCompleteRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12\x17\n" +
 	"\akey_ref\x18\x02 \x01(\tR\x06keyRef\x12\x19\n" +
 	"\bcert_pem\x18\x03 \x01(\tR\acertPem\x12\x1b\n" +
-	"\tchain_pem\x18\x04 \x01(\tR\bchainPem\"+\n" +
+	"\tchain_pem\x18\x04 \x01(\tR\bchainPem\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\x05 \x01(\tR\tinstallId\"+\n" +
 	"\x10CompleteResponse\x12\x17\n" +
 	"\akey_ref\x18\x01 \x01(\tR\x06keyRef\"\x8b\x01\n" +
 	"\rExportRequest\x12\x1f\n" +
@@ -2049,11 +2176,13 @@ const file_krakenkey_connector_plugin_v1_plugin_proto_rawDesc = "" +
 	"\akey_ref\x18\x02 \x01(\tR\x06keyRef\x12@\n" +
 	"\x06format\x18\x03 \x01(\x0e2(.krakenkey.connector.plugin.v1.KeyFormatR\x06format\"N\n" +
 	"\x0eExportResponse\x12<\n" +
-	"\x03key\x18\x01 \x01(\v2*.krakenkey.connector.plugin.v1.KeyMaterialR\x03key\"J\n" +
+	"\x03key\x18\x01 \x01(\v2*.krakenkey.connector.plugin.v1.KeyMaterialR\x03key\"i\n" +
 	"\x0eReleaseRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12\x17\n" +
-	"\akey_ref\x18\x02 \x01(\tR\x06keyRef\"\x11\n" +
+	"\akey_ref\x18\x02 \x01(\tR\x06keyRef\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\x03 \x01(\tR\tinstallId\"\x11\n" +
 	"\x0fReleaseResponse\"\xa2\x03\n" +
 	"\x12TargetCapabilities\x12B\n" +
 	"\aaccepts\x18\x01 \x03(\x0e2(.krakenkey.connector.plugin.v1.KeyFormatR\aaccepts\x120\n" +
@@ -2062,16 +2191,20 @@ const file_krakenkey_connector_plugin_v1_plugin_proto_rawDesc = "" +
 	"\tkey_types\x18\x04 \x03(\x0e2&.krakenkey.connector.plugin.v1.KeyTypeR\bkeyTypes\x12A\n" +
 	"\x1ddefault_verify_window_seconds\x18\x05 \x01(\x03R\x1adefaultVerifyWindowSeconds\x12)\n" +
 	"\x10propagates_async\x18\x06 \x01(\bR\x0fpropagatesAsync\x126\n" +
-	"\x17rollback_needs_material\x18\a \x01(\bR\x15rollbackNeedsMaterial\"C\n" +
+	"\x17rollback_needs_material\x18\a \x01(\bR\x15rollbackNeedsMaterial\"b\n" +
 	"\x1cTargetServiceDescribeRequest\x12#\n" +
-	"\rcore_features\x18\x01 \x03(\tR\fcoreFeatures\"v\n" +
+	"\rcore_features\x18\x01 \x03(\tR\fcoreFeatures\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\x02 \x01(\tR\tinstallId\"v\n" +
 	"\x1dTargetServiceDescribeResponse\x12U\n" +
-	"\fcapabilities\x18\x01 \x01(\v21.krakenkey.connector.plugin.v1.TargetCapabilitiesR\fcapabilities\"|\n" +
+	"\fcapabilities\x18\x01 \x01(\v21.krakenkey.connector.plugin.v1.TargetCapabilitiesR\fcapabilities\"\x9b\x01\n" +
 	"\x1cTargetServiceValidateRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12%\n" +
 	"\x0ecertificate_id\x18\x02 \x01(\tR\rcertificateId\x12\x14\n" +
-	"\x05label\x18\x03 \x01(\tR\x05label\";\n" +
+	"\x05label\x18\x03 \x01(\tR\x05label\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\x04 \x01(\tR\tinstallId\";\n" +
 	"\x1dTargetServiceValidateResponse\x12\x1a\n" +
 	"\bproblems\x18\x01 \x03(\tR\bproblems\"n\n" +
 	"\x0eCurrentRequest\x12\x1f\n" +
@@ -2080,7 +2213,7 @@ const file_krakenkey_connector_plugin_v1_plugin_proto_rawDesc = "" +
 	"\x0ecertificate_id\x18\x02 \x01(\tR\rcertificateId\x12\x14\n" +
 	"\x05label\x18\x03 \x01(\tR\x05label\")\n" +
 	"\x0fCurrentResponse\x12\x16\n" +
-	"\x06serial\x18\x01 \x01(\tR\x06serial\"\x9f\x02\n" +
+	"\x06serial\x18\x01 \x01(\tR\x06serial\"\xbe\x02\n" +
 	"\fStageRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12%\n" +
@@ -2090,19 +2223,23 @@ const file_krakenkey_connector_plugin_v1_plugin_proto_rawDesc = "" +
 	"\tchain_pem\x18\x05 \x01(\tR\bchainPem\x12#\n" +
 	"\rfullchain_pem\x18\x06 \x01(\tR\ffullchainPem\x12<\n" +
 	"\x03key\x18\a \x01(\v2*.krakenkey.connector.plugin.v1.KeyMaterialR\x03key\x12\x16\n" +
-	"\x06serial\x18\b \x01(\tR\x06serial\".\n" +
+	"\x06serial\x18\b \x01(\tR\x06serial\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\t \x01(\tR\tinstallId\".\n" +
 	"\rStageResponse\x12\x1d\n" +
 	"\n" +
-	"staged_ref\x18\x01 \x01(\tR\tstagedRef\"\x8e\x01\n" +
+	"staged_ref\x18\x01 \x01(\tR\tstagedRef\"\xad\x01\n" +
 	"\x0fActivateRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12\x1d\n" +
 	"\n" +
 	"staged_ref\x18\x02 \x01(\tR\tstagedRef\x12%\n" +
 	"\x0ecertificate_id\x18\x03 \x01(\tR\rcertificateId\x12\x14\n" +
-	"\x05label\x18\x04 \x01(\tR\x05label\"5\n" +
+	"\x05label\x18\x04 \x01(\tR\x05label\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\x05 \x01(\tR\tinstallId\"5\n" +
 	"\x10ActivateResponse\x12!\n" +
-	"\fprevious_ref\x18\x01 \x01(\tR\vpreviousRef\"\x9a\x03\n" +
+	"\fprevious_ref\x18\x01 \x01(\tR\vpreviousRef\"\xb9\x03\n" +
 	"\x0fRollbackRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12!\n" +
@@ -2113,15 +2250,20 @@ const file_krakenkey_connector_plugin_v1_plugin_proto_rawDesc = "" +
 	"\x12previous_chain_pem\x18\x06 \x01(\tR\x10previousChainPem\x124\n" +
 	"\x16previous_fullchain_pem\x18\a \x01(\tR\x14previousFullchainPem\x12M\n" +
 	"\fprevious_key\x18\b \x01(\v2*.krakenkey.connector.plugin.v1.KeyMaterialR\vpreviousKey\x12'\n" +
-	"\x0fprevious_serial\x18\t \x01(\tR\x0epreviousSerial\"\x12\n" +
-	"\x10RollbackResponse\"\x8d\x01\n" +
+	"\x0fprevious_serial\x18\t \x01(\tR\x0epreviousSerial\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\n" +
+	" \x01(\tR\tinstallId\"\x12\n" +
+	"\x10RollbackResponse\"\xac\x01\n" +
 	"\x0eDiscardRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12\x1d\n" +
 	"\n" +
 	"staged_ref\x18\x02 \x01(\tR\tstagedRef\x12%\n" +
 	"\x0ecertificate_id\x18\x03 \x01(\tR\rcertificateId\x12\x14\n" +
-	"\x05label\x18\x04 \x01(\tR\x05label\"\x11\n" +
+	"\x05label\x18\x04 \x01(\tR\x05label\x12\x1d\n" +
+	"\n" +
+	"install_id\x18\x05 \x01(\tR\tinstallId\"\x11\n" +
 	"\x0fDiscardResponse*\x9a\x01\n" +
 	"\aKeyType\x12\x18\n" +
 	"\x14KEY_TYPE_UNSPECIFIED\x10\x00\x12\x17\n" +
