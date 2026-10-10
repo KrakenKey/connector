@@ -29,9 +29,18 @@
 //   - DEADLINE_EXCEEDED, CANCELED: the core's deadline or cancellation.
 //   - Anything else (UNKNOWN, INTERNAL, ...) is treated as transient.
 //
+// Install id. Requests that create, change or check resources carry
+// install_id: an opaque identifier of the connector installation that
+// stays the same across restarts and upgrades. It is the connector's id in
+// KrakenKey once the connector is enrolled, and before that a random id
+// created once and kept in the data directory, so it changes once when an
+// installation enrolls. Plugins may use it to tag resources they create
+// and to recognize their own. It is not a secret and not a credential.
+// Connectors that predate it send it empty.
+//
 // Secrets. KeyMaterial carries private keys and passwords. Neither side may
 // log request or response messages that contain it (CreateCSR responses do
-// not; ExportResponse and StageRequest do).
+// not; ExportResponse, StageRequest and RollbackRequest do).
 syntax = "proto3";
 
 package krakenkey.connector.plugin.v1;
@@ -88,7 +97,14 @@ message KeyStoreCapabilities {
   repeated KeyType key_types = 3;
 }
 
-message KeyStoreServiceDescribeRequest {}
+message KeyStoreServiceDescribeRequest {
+  // Optional protocol features the connector supports (see
+  // TargetServiceDescribeRequest.core_features).
+  repeated string core_features = 1;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 2;
+}
 
 message KeyStoreServiceDescribeResponse {
   KeyStoreCapabilities capabilities = 1;
@@ -97,11 +113,19 @@ message KeyStoreServiceDescribeResponse {
 message KeyStoreServiceValidateRequest {
   bytes config_json = 1;
   string certificate_id = 2;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 3;
 }
 
 message KeyStoreServiceValidateResponse {
   // Human readable problems. Empty means the settings are usable.
   repeated string problems = 1;
+  // Capabilities for these settings, when they differ from what Describe
+  // reports (for example a vault whose keys are exportable or not
+  // depending on a setting). The connector matches key store and targets
+  // with these. Unset means use Describe's.
+  KeyStoreCapabilities capabilities = 2;
 }
 
 message CreateCSRRequest {
@@ -111,6 +135,9 @@ message CreateCSRRequest {
   // DNS names for the CSR. The first is used as the subject common name.
   repeated string names = 3;
   KeyType key_type = 4;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 5;
 }
 
 message CreateCSRResponse {
@@ -137,6 +164,9 @@ message CompleteRequest {
   string cert_pem = 3;
   // Intermediate certificates, PEM.
   string chain_pem = 4;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 5;
 }
 
 message CompleteResponse {
@@ -158,6 +188,9 @@ message ExportResponse {
 message ReleaseRequest {
   bytes config_json = 1;
   string key_ref = 2;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 3;
 }
 
 message ReleaseResponse {}
@@ -213,9 +246,31 @@ message TargetCapabilities {
   // service that polls a vault). The core reports verification failures for
   // such targets but does not roll them back.
   bool propagates_async = 6;
+  // Rollback needs the previous certificate and its private key handed
+  // back, because the target cannot keep them itself (for example a cloud
+  // service that never returns an imported private key). The core then
+  // fills the previous_* fields of RollbackRequest when it still holds that
+  // material. Only meaningful together with supports_rollback. A connector
+  // without the "rollback_material" core feature ignores this and never
+  // sends the material; such a target should refuse to run with it (fail
+  // Describe with FAILED_PRECONDITION).
+  bool rollback_needs_material = 7;
 }
 
-message TargetServiceDescribeRequest {}
+message TargetServiceDescribeRequest {
+  // Optional protocol features the connector supports, so a plugin can
+  // refuse to run with a connector that lacks one it needs. Connectors that
+  // predate this field send none. Known values:
+  //
+  //   - "rollback_material": the connector fills RollbackRequest's
+  //     previous_* fields for targets with rollback_needs_material.
+  //   - "keystore_validate_capabilities": the connector uses
+  //     KeyStoreServiceValidateResponse.capabilities.
+  repeated string core_features = 1;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 2;
+}
 
 message TargetServiceDescribeResponse {
   TargetCapabilities capabilities = 1;
@@ -226,6 +281,9 @@ message TargetServiceValidateRequest {
   string certificate_id = 2;
   // Target label from the connector config.
   string label = 3;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 4;
 }
 
 message TargetServiceValidateResponse {
@@ -263,6 +321,9 @@ message StageRequest {
   KeyMaterial key = 7;
   // Serial number of the leaf, lowercase hex.
   string serial = 8;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 9;
 }
 
 message StageResponse {
@@ -275,6 +336,9 @@ message ActivateRequest {
   string staged_ref = 2;
   string certificate_id = 3;
   string label = 4;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 5;
 }
 
 message ActivateResponse {
@@ -287,6 +351,35 @@ message RollbackRequest {
   string previous_ref = 2;
   string certificate_id = 3;
   string label = 4;
+  // The fields below are filled only for targets that set
+  // rollback_needs_material, and only when the core still holds the
+  // certificate it last deployed to this target successfully and can
+  // export its key. They are empty when there is no such certificate (the
+  // first deployment to the target), when it has expired, or when the key
+  // store no longer holds or will not export its key. A target that needs
+  // them and gets none returns FAILED_PRECONDITION. A target should also
+  // return FAILED_PRECONDITION when previous_serial is not the serial its
+  // previous_ref recorded, since restoring it would not restore exactly
+  // what was live before.
+  //
+  // Never log this message: previous_key carries the key.
+  //
+  // Leaf certificate that was live before, PEM.
+  string previous_cert_pem = 5;
+  // Its intermediates, PEM.
+  string previous_chain_pem = 6;
+  // Leaf followed by intermediates, PEM.
+  string previous_fullchain_pem = 7;
+  // Its private key, in the same format as StageRequest.key. A PFX bundle
+  // holds the certificates the key store last completed for that key,
+  // which may be newer than previous_cert_pem when KrakenKey renewed with
+  // the same key; use the previous_*_pem fields for the certificates.
+  KeyMaterial previous_key = 8;
+  // Serial number of the previous leaf, lowercase hex.
+  string previous_serial = 9;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 10;
 }
 
 message RollbackResponse {}
@@ -296,6 +389,9 @@ message DiscardRequest {
   string staged_ref = 2;
   string certificate_id = 3;
   string label = 4;
+  // Opaque, stable id of the connector installation (see "Install id"
+  // above).
+  string install_id = 5;
 }
 
 message DiscardResponse {}
@@ -325,7 +421,9 @@ service TargetService {
   // Rollback restores exactly what was live before the Activate that
   // returned previous_ref. If nothing was installed before, it removes what
   // that Activate installed. A target that cannot do this returns
-  // FAILED_PRECONDITION. NOT_FOUND if previous_ref is unknown.
+  // FAILED_PRECONDITION. NOT_FOUND if previous_ref is unknown. Targets that
+  // set rollback_needs_material get the previous certificate and key in the
+  // request when the core has them (see RollbackRequest).
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
   // Discard deletes staged material that will not be activated. It must be
   // idempotent: an unknown or already consumed staged_ref is not an error.

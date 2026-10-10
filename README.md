@@ -32,7 +32,9 @@ plugins, places such as key vaults and cloud load balancers.
   back to the recorded previous certificate on the next run.
 - **Old keys are kept until they are no longer needed.** The previous key is
   deleted only after every target serves the new certificate, so a rollback
-  always has something to go back to.
+  always has something to go back to. Targets that cannot keep the previous
+  certificate and key themselves (for example a cloud service that never
+  returns an imported private key) are handed them back on rollback.
 - **Plugins.** Key stores and targets are plugins: separate executables that
   the connector runs and talks to over gRPC, using
   [hashicorp/go-plugin](https://github.com/hashicorp/go-plugin), the same model
@@ -63,6 +65,20 @@ plugins, places such as key vaults and cloud load balancers.
 - Plugins and deployment commands run with the connector's permissions. Only
   install plugins you trust. Plugins installed by version must have their
   `sha256` pinned in the config.
+- Plugins get the connector's environment without `KK_API_KEY`,
+  `KK_API_KEY_FILE`, `CREDENTIALS_DIRECTORY` and `KK_ENROLLMENT_TOKEN*`.
+  Everything else is passed on, because cloud SDKs read their credentials and
+  settings from it. Some of those settings decide where a plugin sends
+  private keys and cloud tokens, so whoever can set the connector's
+  environment or the cloud SDK config files is inside the trust boundary:
+  - AWS: `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_<SERVICE>` (for example
+    `AWS_ENDPOINT_URL_ACM`), `endpoint_url` in the shared config file
+    (`AWS_CONFIG_FILE`, `AWS_PROFILE`), `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS`
+    and `AWS_CA_BUNDLE`.
+  - Azure: `AZURE_AUTHORITY_HOST`, `IDENTITY_ENDPOINT`, `MSI_ENDPOINT`,
+    `IMDS_ENDPOINT` and `AZURE_TOKEN_CREDENTIALS`.
+  - Any plugin: `SSL_CERT_FILE`, `SSL_CERT_DIR`, `HTTPS_PROXY`, `HTTP_PROXY`
+    and `NO_PROXY`.
 
 ## Install
 
@@ -464,8 +480,16 @@ systems the binary is started by path after the check, and the ownership
 rules are what keep it from being replaced in between.
 
 Every call to a plugin has a timeout (`call_timeout`, default 5 minutes; at
-most 1 minute for quick calls such as `Describe` and `Validate`). A plugin
-that exits is started again on the next call.
+most 1 minute for quick calls such as `Describe` and `Validate`). A rollback
+gets the longer of `call_timeout` and 5 minutes. A plugin that exits is
+started again on the next call.
+
+Plugins maintained in this repository, each its own Go module under
+[`plugins/`](plugins):
+
+| Plugin | Kind | What it does |
+|--------|------|--------------|
+| [`aws-acm`](plugins/aws-acm) | target | Re-imports certificates into an existing AWS Certificate Manager certificate, keeping its ARN. |
 
 ### Audit log
 
@@ -551,6 +575,36 @@ Each plugin reports its capabilities, and the connector checks every key
 store and target pair before deploying (`plugin.Match`). For example, a key
 store that keeps keys non-exportable cannot feed a target that needs the key
 as a PEM file, and an ECDSA key cannot go to a target that only serves RSA.
+
+A target that cannot keep what was live before (for example a service that
+never returns an imported private key) sets `RollbackNeedsMaterial`. On
+rollback the connector then fills `RollbackRequest.PreviousCertPEM`,
+`PreviousChainPEM`, `PreviousFullChainPEM`, `PreviousKey` and
+`PreviousSerial` with the certificate it last deployed to that target and
+its key, exported in the same format as for `Stage`. They are empty when the
+connector has nothing to hand back (the first deployment to the target, an
+expired certificate, or a key the key store no longer holds); the target then
+returns `ErrPermanent`. If the target's key format carries key bytes and the
+key store does not allow export, rollback is unavailable for such a target and
+`validate` warns about it.
+
+The connector sends the optional protocol features it supports with every
+`Describe` call (`plugin.CoreFeaturesFrom(ctx)`, for example
+`plugin.FeatureRollbackMaterial`), so a plugin that depends on one can refuse
+to run with an older connector instead of misbehaving.
+
+Calls that create, change or check resources carry the connector's install
+id (`plugin.InstallIDFrom(ctx)`): an opaque id that stays the same across
+restarts, so a plugin can tag the resources it creates and recognize its own.
+It is the connector's id in KrakenKey once enrolled, and before that a random
+id the first run stores in `<data_dir>/install_id` (mode `0600`), so it
+changes once when an installation enrolls.
+
+A key store whose capabilities depend on its settings (for example keys that
+are exportable or not per vault) implements
+`plugin.KeyStoreCapabilityValidator`. The connector then matches each
+certificate's targets against the capabilities for that certificate's
+settings, so `validate` catches a pair that cannot work.
 
 ## Development
 

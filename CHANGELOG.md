@@ -8,6 +8,74 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+### Added
+
+- `azure-keyvault` key store plugin (`plugins/azure-keyvault`): Azure Key
+  Vault creates the key and the CSR and keeps the issued certificate, so the
+  key leaves the vault only for exportable certificates whose targets need
+  PEM or PFX. Targets such as Application Gateway get the versioned secret id.
+- `azure-appgateway` target plugin (`plugins/azure-appgateway`): points an
+  Application Gateway v2 SSL certificate at a specific Key Vault secret
+  version, so the gateway serves the new certificate as soon as the update
+  finishes, and rolls back by restoring the previous version. Updates use
+  ETag checks so a concurrent change is never overwritten, and rollback
+  refuses when it could not truly restore the earlier state (a versionless
+  secret on the same name, a replaced uploaded certificate, or an entry
+  someone changed since).
+- `aws-acm` target plugin (`plugins/aws-acm`, its own Go module): re-imports
+  certificates into an existing imported ACM certificate, so load balancers,
+  CloudFront and API Gateway keep using the same ARN. It checks the
+  replacement before changing anything (key type, key usages, names), and
+  rolls back by re-importing the previous certificate and key the connector
+  hands back. Needs `acm:DescribeCertificate` and `acm:ImportCertificate`,
+  and a connector with the `rollback_material` core feature.
+- Rollback material for targets that cannot keep the previous certificate
+  and key themselves, such as a cloud service that never returns an
+  imported private key. A target sets `rollback_needs_material`, and the
+  connector hands back the certificate it last deployed there and its key
+  in `RollbackRequest` (`previous_cert_pem`, `previous_chain_pem`,
+  `previous_fullchain_pem`, `previous_key`, `previous_serial`). The state
+  now records earlier certificates while a target still serves them, so
+  this also works after a restart and when an interrupted deployment is
+  rolled back. `validate` warns when such a target is paired with a key
+  store that does not allow export. Before Activate the connector asks such
+  a target what it serves, so the material matches what was really live.
+- Core features: the connector sends the optional protocol features it
+  supports (`core_features`) with every `Describe` call, so plugins can
+  refuse to run with a connector that lacks one they need.
+- Install id: requests that create, change or check resources carry an
+  opaque, stable `install_id` (the enrolled connector's id, or a random id
+  kept in `<data_dir>/install_id`) so plugins can tag resources they own.
+- Key stores can return capabilities for a certificate's settings from
+  `Validate` (`KeyStoreCapabilityValidator`), and the connector matches
+  targets against those.
+
+### Fixed
+
+- A pass cancelled partway through no longer forgets the deployment state
+  of the targets it had not reached yet.
+- After an Activate that reported an error, or a Rollback that failed, the
+  connector asks the target what it serves. If the target already serves the
+  new certificate, the connector records that (and verifies it after a lost
+  Activate answer), so the next deployment's previous state is right.
+- A certificate the connector keeps after a failed check records that
+  certificate's expiry, not the newest one's.
+- A rollback gets the longer of the plugin's `call_timeout` and 5 minutes.
+- A pending key from an earlier renewal is resolved before adopting a
+  certificate KrakenKey renewed with the current key, so key stores that
+  refuse to complete one while a request of their own is open no longer
+  stall every pass.
+- When the key store permanently refuses a certificate KrakenKey renewed
+  with the connector's key, the connector renews with a new key instead of
+  retrying the same step on every pass.
+
+### Security
+
+- Plugins no longer inherit the connector's `KK_API_KEY_FILE`,
+  `CREDENTIALS_DIRECTORY` or `KK_ENROLLMENT_TOKEN*` environment variables.
+  The README lists the cloud SDK variables that decide where plugins send
+  keys and tokens.
+
 ## [v0.1.0] - 2026-10-10
 
 First release.

@@ -17,9 +17,15 @@
 // ErrUnsupported (see errors.go) so the core knows whether to retry. Embed
 // UnimplementedKeyStore or UnimplementedTarget for calls you do not support.
 //
-// Secrets: KeyMaterial and StageRequest redact the private key when
-// formatted, logged or JSON encoded. The generated protobuf messages do
-// not, so never log them.
+// Secrets: KeyMaterial, StageRequest and RollbackRequest redact the
+// private key when formatted, logged or JSON encoded. The generated
+// protobuf messages do not, so never log them.
+//
+// Rollback material: a target that cannot keep the previous certificate
+// and key itself sets TargetCapabilities.RollbackNeedsMaterial, and the
+// core hands them back in RollbackRequest when it still holds them (see
+// RollbackRequest.HasPreviousMaterial). Without them, such a target
+// returns an error wrapping ErrPermanent.
 package plugin
 
 import (

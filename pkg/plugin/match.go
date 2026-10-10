@@ -86,3 +86,21 @@ func orNone(s string) string {
 	}
 	return s
 }
+
+// RollbackUnavailable returns why the core cannot roll back target t when
+// its keys come from key store ks and are handed over in format (the one
+// Match agreed), or "" when it can. Unlike Match, this does not make the
+// pair unusable: deployments still work, but a failed one cannot be undone.
+//
+// A target with RollbackNeedsMaterial gets the previous key exported in
+// format. A vault reference can always be exported; key bytes need an
+// exportable key store.
+func RollbackUnavailable(ks KeyStoreCapabilities, t TargetCapabilities, format KeyFormat) string {
+	switch {
+	case !t.SupportsRollback:
+		return "target does not support rollback"
+	case t.RollbackNeedsMaterial && format != KeyFormatVaultRef && !ks.Exportable:
+		return "target needs the previous private key to roll back, and the key store does not allow export"
+	}
+	return ""
+}

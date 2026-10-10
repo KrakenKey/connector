@@ -16,6 +16,11 @@ go test ./... -race
 golangci-lint run
 ```
 
+Plugins under `plugins/` are separate Go modules, listed in `go.work` so
+they build against the SDK in this checkout. Run the same checks inside each
+plugin directory you change. The core module must not import cloud SDKs;
+those belong in the plugin modules.
+
 ## Commit messages
 
 Commits and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org/):

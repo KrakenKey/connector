@@ -12,8 +12,9 @@ type targetGRPCServer struct {
 	impl Target
 }
 
-func (s *targetGRPCServer) Describe(ctx context.Context, _ *pb.TargetServiceDescribeRequest) (*pb.TargetServiceDescribeResponse, error) {
-	caps, err := s.impl.Describe(ctx)
+func (s *targetGRPCServer) Describe(ctx context.Context, req *pb.TargetServiceDescribeRequest) (*pb.TargetServiceDescribeResponse, error) {
+	ctx = WithInstallID(ctx, req.GetInstallId())
+	caps, err := s.impl.Describe(WithCoreFeatures(ctx, req.GetCoreFeatures()...))
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -21,6 +22,7 @@ func (s *targetGRPCServer) Describe(ctx context.Context, _ *pb.TargetServiceDesc
 }
 
 func (s *targetGRPCServer) Validate(ctx context.Context, req *pb.TargetServiceValidateRequest) (*pb.TargetServiceValidateResponse, error) {
+	ctx = WithInstallID(ctx, req.GetInstallId())
 	problems, err := s.impl.Validate(ctx, TargetValidateRequest{
 		Config: req.GetConfigJson(), CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
 	})
@@ -41,6 +43,7 @@ func (s *targetGRPCServer) Current(ctx context.Context, req *pb.CurrentRequest) 
 }
 
 func (s *targetGRPCServer) Stage(ctx context.Context, req *pb.StageRequest) (*pb.StageResponse, error) {
+	ctx = WithInstallID(ctx, req.GetInstallId())
 	ref, err := s.impl.Stage(ctx, StageRequest{
 		Config:        req.GetConfigJson(),
 		CertificateID: req.GetCertificateId(),
@@ -58,6 +61,7 @@ func (s *targetGRPCServer) Stage(ctx context.Context, req *pb.StageRequest) (*pb
 }
 
 func (s *targetGRPCServer) Activate(ctx context.Context, req *pb.ActivateRequest) (*pb.ActivateResponse, error) {
+	ctx = WithInstallID(ctx, req.GetInstallId())
 	prev, err := s.impl.Activate(ctx, ActivateRequest{
 		Config: req.GetConfigJson(), StagedRef: req.GetStagedRef(),
 		CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
@@ -69,9 +73,15 @@ func (s *targetGRPCServer) Activate(ctx context.Context, req *pb.ActivateRequest
 }
 
 func (s *targetGRPCServer) Rollback(ctx context.Context, req *pb.RollbackRequest) (*pb.RollbackResponse, error) {
+	ctx = WithInstallID(ctx, req.GetInstallId())
 	err := s.impl.Rollback(ctx, RollbackRequest{
 		Config: req.GetConfigJson(), PreviousRef: req.GetPreviousRef(),
 		CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
+		PreviousCertPEM:      req.GetPreviousCertPem(),
+		PreviousChainPEM:     req.GetPreviousChainPem(),
+		PreviousFullChainPEM: req.GetPreviousFullchainPem(),
+		PreviousKey:          goKeyMaterial(req.GetPreviousKey()),
+		PreviousSerial:       req.GetPreviousSerial(),
 	})
 	if err != nil {
 		return nil, toStatus(err)
@@ -80,6 +90,7 @@ func (s *targetGRPCServer) Rollback(ctx context.Context, req *pb.RollbackRequest
 }
 
 func (s *targetGRPCServer) Discard(ctx context.Context, req *pb.DiscardRequest) (*pb.DiscardResponse, error) {
+	ctx = WithInstallID(ctx, req.GetInstallId())
 	err := s.impl.Discard(ctx, DiscardRequest{
 		Config: req.GetConfigJson(), StagedRef: req.GetStagedRef(),
 		CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
@@ -98,7 +109,7 @@ type targetGRPCClient struct {
 var _ Target = (*targetGRPCClient)(nil)
 
 func (c *targetGRPCClient) Describe(ctx context.Context) (TargetCapabilities, error) {
-	resp, err := c.client.Describe(ctx, &pb.TargetServiceDescribeRequest{})
+	resp, err := c.client.Describe(ctx, &pb.TargetServiceDescribeRequest{InstallId: InstallIDFrom(ctx), CoreFeatures: CoreFeatures})
 	if err != nil {
 		return TargetCapabilities{}, fromStatus("target describe", err)
 	}
@@ -106,7 +117,7 @@ func (c *targetGRPCClient) Describe(ctx context.Context) (TargetCapabilities, er
 }
 
 func (c *targetGRPCClient) Validate(ctx context.Context, req TargetValidateRequest) ([]string, error) {
-	resp, err := c.client.Validate(ctx, &pb.TargetServiceValidateRequest{
+	resp, err := c.client.Validate(ctx, &pb.TargetServiceValidateRequest{InstallId: InstallIDFrom(ctx),
 		ConfigJson: req.Config, CertificateId: req.CertificateID, Label: req.Label,
 	})
 	if err != nil {
@@ -126,7 +137,7 @@ func (c *targetGRPCClient) Current(ctx context.Context, req CurrentRequest) (str
 }
 
 func (c *targetGRPCClient) Stage(ctx context.Context, req StageRequest) (string, error) {
-	resp, err := c.client.Stage(ctx, &pb.StageRequest{
+	resp, err := c.client.Stage(ctx, &pb.StageRequest{InstallId: InstallIDFrom(ctx),
 		ConfigJson:    req.Config,
 		CertificateId: req.CertificateID,
 		Label:         req.Label,
@@ -143,7 +154,7 @@ func (c *targetGRPCClient) Stage(ctx context.Context, req StageRequest) (string,
 }
 
 func (c *targetGRPCClient) Activate(ctx context.Context, req ActivateRequest) (string, error) {
-	resp, err := c.client.Activate(ctx, &pb.ActivateRequest{
+	resp, err := c.client.Activate(ctx, &pb.ActivateRequest{InstallId: InstallIDFrom(ctx),
 		ConfigJson: req.Config, StagedRef: req.StagedRef, CertificateId: req.CertificateID, Label: req.Label,
 	})
 	if err != nil {
@@ -153,14 +164,19 @@ func (c *targetGRPCClient) Activate(ctx context.Context, req ActivateRequest) (s
 }
 
 func (c *targetGRPCClient) Rollback(ctx context.Context, req RollbackRequest) error {
-	_, err := c.client.Rollback(ctx, &pb.RollbackRequest{
+	_, err := c.client.Rollback(ctx, &pb.RollbackRequest{InstallId: InstallIDFrom(ctx),
 		ConfigJson: req.Config, PreviousRef: req.PreviousRef, CertificateId: req.CertificateID, Label: req.Label,
+		PreviousCertPem:      req.PreviousCertPEM,
+		PreviousChainPem:     req.PreviousChainPEM,
+		PreviousFullchainPem: req.PreviousFullChainPEM,
+		PreviousKey:          pbKeyMaterial(req.PreviousKey),
+		PreviousSerial:       req.PreviousSerial,
 	})
 	return fromStatus("target rollback", err)
 }
 
 func (c *targetGRPCClient) Discard(ctx context.Context, req DiscardRequest) error {
-	_, err := c.client.Discard(ctx, &pb.DiscardRequest{
+	_, err := c.client.Discard(ctx, &pb.DiscardRequest{InstallId: InstallIDFrom(ctx),
 		ConfigJson: req.Config, StagedRef: req.StagedRef, CertificateId: req.CertificateID, Label: req.Label,
 	})
 	return fromStatus("target discard", err)
