@@ -107,8 +107,13 @@ together under one version.
   API Gateway keep using the same ARN. It checks the replacement before
   changing anything (key type, key usages, names), and rolls back by
   re-importing the previous certificate and key the connector hands back.
-  Needs `acm:DescribeCertificate` and `acm:ImportCertificate`, and a
-  connector with the `rollback_material` core feature. (#11)
+  It accepts both spellings ACM uses for EC key algorithms
+  (`EC-prime256v1` and `EC_prime256v1`), and explains when ACM would refuse
+  a reimport because the existing certificate allows any key usage (`ANY`);
+  the README's placeholder recipe sets `keyUsage` and `extendedKeyUsage` to
+  match KrakenKey certificates so that does not happen. Needs
+  `acm:DescribeCertificate` and `acm:ImportCertificate`, and a connector
+  with the `rollback_material` core feature. (#11, #12)
 - `azure-keyvault` key store plugin (`plugins/azure-keyvault`): Azure Key
   Vault creates the key and the CSR and keeps the issued certificate, so the
   key leaves the vault only for exportable certificates whose targets need
