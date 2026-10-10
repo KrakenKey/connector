@@ -1,0 +1,234 @@
+// Plugin protocol for the KrakenKey connector.
+//
+// The connector core talks to plugins over gRPC using hashicorp/go-plugin.
+// A plugin binary serves one or both of the services below:
+//
+//   - KeyStoreService decides where a private key lives and produces CSRs.
+//   - TargetService installs an issued certificate somewhere.
+//
+// Plugin-specific settings travel as a JSON object in config_json. The core
+// fills it from the plugin's block in the connector config file, without the
+// fields the core owns (plugin, label, key_type, verify, then).
+syntax = "proto3";
+
+package krakenkey.connector.plugin.v1;
+
+option go_package = "github.com/krakenkey/connector/proto/krakenkey/connector/plugin/v1;pluginv1";
+
+// KeyType is the private key algorithm and size.
+enum KeyType {
+  KEY_TYPE_UNSPECIFIED = 0;
+  KEY_TYPE_ECDSA_P256 = 1;
+  KEY_TYPE_ECDSA_P384 = 2;
+  KEY_TYPE_RSA_2048 = 3;
+  KEY_TYPE_RSA_3072 = 4;
+  KEY_TYPE_RSA_4096 = 5;
+}
+
+// KeyFormat is how key material is handed from a key store to a target.
+enum KeyFormat {
+  KEY_FORMAT_UNSPECIFIED = 0;
+  // A reference to a key held in a vault or HSM. The key never leaves it.
+  KEY_FORMAT_VAULT_REF = 1;
+  // PKCS#8 private key, PEM encoded.
+  KEY_FORMAT_PEM = 2;
+  // PKCS#12 bundle holding the key and certificate chain.
+  KEY_FORMAT_PFX = 3;
+}
+
+// KeyMaterial is a key in one of the KeyFormat encodings.
+message KeyMaterial {
+  KeyFormat format = 1;
+  // PEM or PFX bytes. Empty for KEY_FORMAT_VAULT_REF.
+  bytes data = 2;
+  // Vault reference for KEY_FORMAT_VAULT_REF.
+  string ref = 3;
+  // Password protecting a PFX bundle, if any.
+  string password = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Key store
+// ---------------------------------------------------------------------------
+
+message KeyStoreCapabilities {
+  // Key formats this key store can hand to a target.
+  repeated KeyFormat provides = 1;
+  // Whether Export can return the private key.
+  bool exportable = 2;
+  // Key types CreateCSR accepts.
+  repeated KeyType key_types = 3;
+}
+
+message KeyStoreServiceDescribeRequest {}
+
+message KeyStoreServiceDescribeResponse {
+  KeyStoreCapabilities capabilities = 1;
+}
+
+message CreateCSRRequest {
+  bytes config_json = 1;
+  // KrakenKey certificate id, for naming keys.
+  string certificate_id = 2;
+  // DNS names for the CSR. The first is used as the subject common name.
+  repeated string names = 3;
+  KeyType key_type = 4;
+}
+
+message CreateCSRResponse {
+  // PEM encoded PKCS#10 certificate request.
+  string csr_pem = 1;
+  // Opaque reference to the new key, passed back in later calls.
+  string key_ref = 2;
+}
+
+message CompleteRequest {
+  bytes config_json = 1;
+  string key_ref = 2;
+  // Issued leaf certificate, PEM.
+  string cert_pem = 3;
+  // Intermediate certificates, PEM.
+  string chain_pem = 4;
+}
+
+message CompleteResponse {
+  // Reference to use from now on. May equal the request's key_ref.
+  string key_ref = 1;
+}
+
+message ExportRequest {
+  bytes config_json = 1;
+  string key_ref = 2;
+  // Requested format.
+  KeyFormat format = 3;
+}
+
+message ExportResponse {
+  KeyMaterial key = 1;
+}
+
+message ReleaseRequest {
+  bytes config_json = 1;
+  string key_ref = 2;
+}
+
+message ReleaseResponse {}
+
+// KeyStoreService owns private keys.
+service KeyStoreService {
+  // Describe reports what the key store can do.
+  rpc Describe(KeyStoreServiceDescribeRequest) returns (KeyStoreServiceDescribeResponse);
+  // CreateCSR creates a new key and returns a CSR signed by it.
+  rpc CreateCSR(CreateCSRRequest) returns (CreateCSRResponse);
+  // Complete attaches the issued certificate to the key, for key stores that
+  // track certificates next to keys.
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+  // Export returns key material. Only valid when exportable is true, or when
+  // the requested format is KEY_FORMAT_VAULT_REF.
+  rpc Export(ExportRequest) returns (ExportResponse);
+  // Release tells the key store that no target uses the key any more. The key
+  // store may delete it.
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Target
+// ---------------------------------------------------------------------------
+
+message TargetCapabilities {
+  // Key formats the target can install.
+  repeated KeyFormat accepts = 1;
+  // The target needs a key store that allows export, even when it is given
+  // a vault reference.
+  bool needs_exportable_key = 2;
+  // Rollback can restore the previous certificate.
+  bool supports_rollback = 3;
+  // Key types the target can serve. Empty means any.
+  repeated KeyType key_types = 4;
+  // Default time the core keeps checking the endpoint after Activate, in
+  // seconds. Zero means the core default.
+  int64 default_verify_window_seconds = 5;
+  // The target picks up changes on its own schedule (for example a cloud
+  // service that polls a vault). The core reports verification failures for
+  // such targets but does not roll them back.
+  bool propagates_async = 6;
+}
+
+message TargetServiceDescribeRequest {}
+
+message TargetServiceDescribeResponse {
+  TargetCapabilities capabilities = 1;
+}
+
+message ValidateRequest {
+  bytes config_json = 1;
+}
+
+message ValidateResponse {
+  // Human readable problems. Empty means the config is usable.
+  repeated string problems = 1;
+}
+
+message CurrentRequest {
+  bytes config_json = 1;
+}
+
+message CurrentResponse {
+  // Serial number (lowercase hex) of the certificate the target holds now.
+  // Empty when unknown or nothing is installed.
+  string serial = 1;
+}
+
+message StageRequest {
+  bytes config_json = 1;
+  string certificate_id = 2;
+  // Target label from the connector config.
+  string label = 3;
+  // Leaf certificate, PEM.
+  string cert_pem = 4;
+  // Intermediates, PEM.
+  string chain_pem = 5;
+  // Leaf followed by intermediates, PEM.
+  string fullchain_pem = 6;
+  KeyMaterial key = 7;
+  // Serial number of the leaf, lowercase hex.
+  string serial = 8;
+}
+
+message StageResponse {
+  // Opaque reference passed to Activate.
+  string staged_ref = 1;
+}
+
+message ActivateRequest {
+  bytes config_json = 1;
+  string staged_ref = 2;
+}
+
+message ActivateResponse {
+  // Opaque reference to what was live before, for Rollback.
+  string previous_ref = 1;
+}
+
+message RollbackRequest {
+  bytes config_json = 1;
+  string previous_ref = 2;
+}
+
+message RollbackResponse {}
+
+// TargetService installs certificates.
+service TargetService {
+  // Describe reports what the target can do.
+  rpc Describe(TargetServiceDescribeRequest) returns (TargetServiceDescribeResponse);
+  // Validate checks the target config without changing anything.
+  rpc Validate(ValidateRequest) returns (ValidateResponse);
+  // Current reports the serial of the certificate installed now.
+  rpc Current(CurrentRequest) returns (CurrentResponse);
+  // Stage prepares a certificate without making it live.
+  rpc Stage(StageRequest) returns (StageResponse);
+  // Activate makes a staged certificate live.
+  rpc Activate(ActivateRequest) returns (ActivateResponse);
+  // Rollback restores what was live before Activate.
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+}

@@ -1,0 +1,17 @@
+# Compiled binaries
+/krakenkey-connector
+/krakenkey-connector-*
+/dist/
+
+# Pinned code generation tools (scripts/protogen.sh)
+/.bin/
+
+# Test output / local dev artifacts
+*.key
+*.csr
+*.crt
+*.pem
+coverage.out
+
+# OS
+.DS_Store
