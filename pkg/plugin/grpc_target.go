@@ -72,6 +72,11 @@ func (s *targetGRPCServer) Rollback(ctx context.Context, req *pb.RollbackRequest
 	err := s.impl.Rollback(ctx, RollbackRequest{
 		Config: req.GetConfigJson(), PreviousRef: req.GetPreviousRef(),
 		CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
+		PreviousCertPEM:      req.GetPreviousCertPem(),
+		PreviousChainPEM:     req.GetPreviousChainPem(),
+		PreviousFullChainPEM: req.GetPreviousFullchainPem(),
+		PreviousKey:          goKeyMaterial(req.GetPreviousKey()),
+		PreviousSerial:       req.GetPreviousSerial(),
 	})
 	if err != nil {
 		return nil, toStatus(err)
@@ -155,6 +160,11 @@ func (c *targetGRPCClient) Activate(ctx context.Context, req ActivateRequest) (s
 func (c *targetGRPCClient) Rollback(ctx context.Context, req RollbackRequest) error {
 	_, err := c.client.Rollback(ctx, &pb.RollbackRequest{
 		ConfigJson: req.Config, PreviousRef: req.PreviousRef, CertificateId: req.CertificateID, Label: req.Label,
+		PreviousCertPem:      req.PreviousCertPEM,
+		PreviousChainPem:     req.PreviousChainPEM,
+		PreviousFullchainPem: req.PreviousFullChainPEM,
+		PreviousKey:          pbKeyMaterial(req.PreviousKey),
+		PreviousSerial:       req.PreviousSerial,
 	})
 	return fromStatus("target rollback", err)
 }

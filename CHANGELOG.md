@@ -8,6 +8,24 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+### Added
+
+- Rollback material for targets that cannot keep the previous certificate
+  and key themselves, such as a cloud service that never returns an
+  imported private key. A target sets `rollback_needs_material`, and the
+  connector hands back the certificate it last deployed there and its key
+  in `RollbackRequest` (`previous_cert_pem`, `previous_chain_pem`,
+  `previous_fullchain_pem`, `previous_key`, `previous_serial`). The state
+  now records earlier certificates while a target still serves them, so
+  this also works after a restart and when an interrupted deployment is
+  rolled back. `validate` warns when such a target is paired with a key
+  store that does not allow export.
+
+### Fixed
+
+- A pass cancelled partway through no longer forgets the deployment state
+  of the targets it had not reached yet.
+
 ## [v0.1.0] - 2026-10-10
 
 First release.

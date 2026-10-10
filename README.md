@@ -32,7 +32,9 @@ plugins, places such as key vaults and cloud load balancers.
   back to the recorded previous certificate on the next run.
 - **Old keys are kept until they are no longer needed.** The previous key is
   deleted only after every target serves the new certificate, so a rollback
-  always has something to go back to.
+  always has something to go back to. Targets that cannot keep the previous
+  certificate and key themselves (for example a cloud service that never
+  returns an imported private key) are handed them back on rollback.
 - **Plugins.** Key stores and targets are plugins: separate executables that
   the connector runs and talks to over gRPC, using
   [hashicorp/go-plugin](https://github.com/hashicorp/go-plugin), the same model
@@ -551,6 +553,17 @@ Each plugin reports its capabilities, and the connector checks every key
 store and target pair before deploying (`plugin.Match`). For example, a key
 store that keeps keys non-exportable cannot feed a target that needs the key
 as a PEM file, and an ECDSA key cannot go to a target that only serves RSA.
+
+A target that cannot keep what was live before (for example a service that
+never returns an imported private key) sets `RollbackNeedsMaterial`. On
+rollback the connector then fills `RollbackRequest.PreviousCertPEM`,
+`PreviousChainPEM`, `PreviousFullChainPEM`, `PreviousKey` and
+`PreviousSerial` with the certificate it last deployed to that target and
+its key, exported in the same format as for `Stage`. They are empty when the
+connector has nothing to hand back (the first deployment to the target, an
+expired certificate, or a key the key store no longer holds); the target then
+returns `ErrPermanent`. With a key store that does not allow export, rollback
+is unavailable for such a target and `validate` warns about it.
 
 ## Development
 

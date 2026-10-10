@@ -145,6 +145,9 @@ type fakeTarget struct {
 	broken       bool
 	failActivate error
 	noCurrent    bool
+	// rollbackReqs records every Rollback request, for targets that need
+	// the previous material (caps.RollbackNeedsMaterial).
+	rollbackReqs []plugin.RollbackRequest
 }
 
 func newFakeTarget() *fakeTarget {
@@ -202,6 +205,15 @@ func (f *fakeTarget) Rollback(_ context.Context, req plugin.RollbackRequest) err
 	old, ok := f.prev[req.PreviousRef]
 	if !ok {
 		return fmt.Errorf("%w: ref %s", plugin.ErrNotFound, req.PreviousRef)
+	}
+	if f.caps.RollbackNeedsMaterial {
+		f.rollbackReqs = append(f.rollbackReqs, req)
+		if !req.HasPreviousMaterial() {
+			return fmt.Errorf("%w: previous certificate and key required", plugin.ErrPermanent)
+		}
+		if req.PreviousSerial != old {
+			return fmt.Errorf("%w: material for %s, but %s was live", plugin.ErrPermanent, req.PreviousSerial, old)
+		}
 	}
 	f.rollbacks++
 	f.installed = old
@@ -889,7 +901,7 @@ func (c *crashAtVerify) restore() {
 		c.t.Fatal(err)
 	}
 	tg := c.e.targets["a"]
-	tg.live, tg.installed, tg.prev, tg.rollbacks = c.live, c.inst, c.prev, 0
+	tg.live, tg.installed, tg.prev, tg.rollbacks, tg.rollbackReqs = c.live, c.inst, c.prev, 0, nil
 }
 
 func maps(m map[string]string) map[string]string {

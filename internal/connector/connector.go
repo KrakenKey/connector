@@ -34,6 +34,9 @@ type TargetReport struct {
 	Format   plugin.KeyFormat
 	Window   time.Duration
 	Problems []string
+	// Warnings do not stop deployments, for example rollback being
+	// unavailable for this key store and target pair.
+	Warnings []string
 }
 
 // CertReport describes one certificate after resolving and checking its
@@ -136,6 +139,12 @@ func BuildJob(ctx context.Context, cert config.Certificate, r Resolver) (deploy.
 				}
 			} else {
 				tj.Format, tr.Format = f, f
+			}
+			if caps.SupportsRollback {
+				if why := plugin.RollbackUnavailable(*ksCaps, caps); why != "" {
+					tj.RollbackUnavailable = why
+					tr.Warnings = append(tr.Warnings, "rollback is unavailable: "+why+"; a failed deployment keeps the new certificate")
+				}
 			}
 		}
 		if tc.Then != nil {

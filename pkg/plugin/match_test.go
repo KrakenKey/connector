@@ -131,3 +131,30 @@ func TestParseKeyType(t *testing.T) {
 		t.Error("IsRSA/IsECDSA wrong")
 	}
 }
+
+func TestRollbackUnavailable(t *testing.T) {
+	exportable := KeyStoreCapabilities{Provides: []KeyFormat{KeyFormatPEM}, Exportable: true}
+	locked := KeyStoreCapabilities{Provides: []KeyFormat{KeyFormatVaultRef}}
+	plain := TargetCapabilities{SupportsRollback: true}
+	material := TargetCapabilities{SupportsRollback: true, RollbackNeedsMaterial: true}
+	none := TargetCapabilities{}
+
+	tests := []struct {
+		name string
+		ks   KeyStoreCapabilities
+		t    TargetCapabilities
+		want string
+	}{
+		{"plain target, exportable", exportable, plain, ""},
+		{"plain target, locked", locked, plain, ""},
+		{"material target, exportable", exportable, material, ""},
+		{"material target, locked", locked, material, "does not allow export"},
+		{"no rollback", exportable, none, "does not support rollback"},
+	}
+	for _, tt := range tests {
+		got := RollbackUnavailable(tt.ks, tt.t)
+		if (tt.want == "") != (got == "") || !strings.Contains(got, tt.want) {
+			t.Errorf("%s: RollbackUnavailable = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}

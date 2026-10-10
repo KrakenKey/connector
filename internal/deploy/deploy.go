@@ -22,8 +22,12 @@
 //     the previous ref in the state and the audit log before anything else),
 //     run the then command, and verify the endpoint. On failure, roll that
 //     target back, unless the certificate to go back to expires within a
-//     day. Other targets are not affected.
-//  6. When every target serves the new certificate, release the old keys.
+//     day. Other targets are not affected. A target that cannot keep the
+//     previous certificate and key itself (RollbackNeedsMaterial) is handed
+//     them on rollback: the state keeps every earlier certificate a target
+//     still serves, and the key store keeps its key.
+//  6. When every target serves the new certificate, release the old keys
+//     and forget the earlier certificates.
 //
 // Targets that failed keep their old certificate and are retried on later
 // passes, with growing delays.
@@ -126,6 +130,10 @@ type TargetJob struct {
 	Window time.Duration
 	// Roots come from verify.ca_file; nil means the system roots.
 	Roots *x509.CertPool
+	// RollbackUnavailable, when set, says why the previous certificate
+	// and key cannot be handed to a target with RollbackNeedsMaterial (see
+	// plugin.RollbackUnavailable). Rollback is then called without them.
+	RollbackUnavailable string
 }
 
 // Options change one pass.
@@ -502,6 +510,13 @@ func (r *run) finishIssued(ctx context.Context, issued *api.Cert, keyRef, spki s
 		return &BlockedError{Err: err}
 	}
 
+	if st.Serial != "" && st.Serial != newSerial && st.CertPEM != "" {
+		// Targets still serve the outgoing certificate until they are
+		// deployed; keep it for targets that need it to roll back.
+		prev := st.current()
+		st.PreviousCerts = slices.DeleteFunc(st.PreviousCerts, func(c CertRecord) bool { return c.Serial == prev.Serial })
+		st.PreviousCerts = append(st.PreviousCerts, prev)
+	}
 	if st.KeyRef != "" && st.KeyRef != newRef && !slices.Contains(st.RetiredKeys, st.KeyRef) {
 		st.RetiredKeys = append(st.RetiredKeys, st.KeyRef)
 	}
@@ -556,10 +571,12 @@ func (r *run) fullChain(ctx context.Context, issued *api.Cert, leaf *x509.Certif
 func (r *run) deployPending(ctx context.Context) error {
 	st := r.st
 	labels := make([]string, 0, len(r.job.Targets))
+	for _, tj := range r.job.Targets {
+		labels = append(labels, tj.Config.Label)
+	}
 	var errs []error
 	for _, tj := range r.job.Targets {
 		label := tj.Config.Label
-		labels = append(labels, label)
 		if ctx.Err() != nil {
 			errs = append(errs, ctx.Err())
 			break
@@ -601,6 +618,13 @@ func (r *run) deployPending(ctx context.Context) error {
 			r.log.Info("old keys released; every target serves the current certificate", "serial", st.Serial)
 		}
 	}
+	// Keep an earlier certificate only while a target serves it and its key
+	// is still held.
+	st.PreviousCerts = slices.DeleteFunc(st.PreviousCerts, func(c CertRecord) bool {
+		served := slices.ContainsFunc(labels, func(l string) bool { return st.Targets[l].Serial == c.Serial })
+		held := c.KeyRef == st.KeyRef || slices.Contains(st.RetiredKeys, c.KeyRef)
+		return c.Serial == st.Serial || !served || !held
+	})
 	if err := r.save(); err != nil {
 		errs = append(errs, err)
 	}
@@ -963,9 +987,16 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 
 	a := t.entry(audit.StepRollback, audit.ResultOK)
 	a.PreviousRef = prevRef
-	err := t.tj.Plugin.Rollback(rctx, plugin.RollbackRequest{
+	req := plugin.RollbackRequest{
 		Config: t.tj.Settings, PreviousRef: prevRef, CertificateID: strconv.Itoa(t.job.Cert.ID), Label: t.label(),
-	})
+	}
+	if t.tj.Caps.RollbackNeedsMaterial {
+		if why := t.previousMaterial(rctx, &req, ts.Serial); why != "" {
+			a.Detail = "previous certificate and key not available: " + why
+			t.log.Warn("rolling back without the previous certificate and key", "reason", why)
+		}
+	}
+	err := t.tj.Plugin.Rollback(rctx, req)
 	if err != nil {
 		a.Result, a.Error = audit.ResultFailed, err.Error()
 		_ = t.e.audit(a)
@@ -984,6 +1015,32 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 	_ = t.e.audit(a)
 	t.log.Warn("rolled back to the previous certificate", "cause", cause)
 	return done(fmt.Errorf("%w (rolled back)", cause), OutcomeRolledBack)
+}
+
+// previousMaterial fills req with the certificate the target served before
+// (serial) and its key, exported in the target's format. It returns why it
+// could not, or "".
+func (t *targetRun) previousMaterial(ctx context.Context, req *plugin.RollbackRequest, serial string) string {
+	if t.tj.RollbackUnavailable != "" {
+		return t.tj.RollbackUnavailable
+	}
+	if serial == "" {
+		return "the connector has not deployed a certificate to this target before"
+	}
+	rec, ok := t.st.certRecord(serial)
+	if !ok || rec.KeyRef == "" || rec.CertPEM == "" {
+		return "the connector no longer holds certificate " + serial
+	}
+	if !rec.NotAfter.IsZero() && !rec.NotAfter.After(t.e.now()) {
+		return "certificate " + serial + " has expired"
+	}
+	key, err := t.job.KeyStore.Export(ctx, plugin.ExportRequest{Config: t.job.KeyStoreConfig, KeyRef: rec.KeyRef, Format: t.tj.Format})
+	if err != nil {
+		return "key store could not export its key: " + err.Error()
+	}
+	req.PreviousCertPEM, req.PreviousChainPEM, req.PreviousFullChainPEM = rec.CertPEM, rec.ChainPEM, rec.FullChainPEM
+	req.PreviousKey, req.PreviousSerial = key, rec.Serial
+	return ""
 }
 
 func (t *targetRun) runThen(ctx context.Context, serial, action string) error {
