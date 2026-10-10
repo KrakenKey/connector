@@ -144,6 +144,31 @@ func (e *RejectedError) Error() string {
 	return "issued certificate rejected, nothing deployed: " + e.Reason
 }
 
+// BlocksDeployment marks a rejection as a failure on the connector's side.
+func (e *RejectedError) BlocksDeployment() bool { return true }
+
+// BlockedError wraps a failure on the connector's side (key store, config)
+// that kept a certificate from being renewed or deployed. Status reports
+// show such failures as failed deployments. Failures on KrakenKey's side
+// (issuance failed, API errors) are not BlockedErrors.
+type BlockedError struct{ Err error }
+
+func (e *BlockedError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the wrapped error.
+func (e *BlockedError) Unwrap() error { return e.Err }
+
+// BlocksDeployment marks the error as a failure on the connector's side.
+func (e *BlockedError) BlocksDeployment() bool { return true }
+
+// IsBlocked reports whether err, or an error it wraps, is a failure on the
+// connector's side that kept a certificate from being deployed: any error
+// with a BlocksDeployment method that returns true.
+func IsBlocked(err error) bool {
+	var b interface{ BlocksDeployment() bool }
+	return errors.As(err, &b) && b.BlocksDeployment()
+}
+
 func (e *Engine) now() time.Time {
 	if e.Now != nil {
 		return e.Now()
@@ -372,7 +397,7 @@ func (r *run) renew(ctx context.Context, cert *api.Cert, oldSerial, reason strin
 		KeyType:       job.Cert.KeyStore.KeyType,
 	})
 	if err != nil {
-		return fail(audit.StepCreateCSR, err)
+		return fail(audit.StepCreateCSR, &BlockedError{Err: err})
 	}
 	req, err := certutil.ParseCSR(csr.PEM)
 	if err == nil && !certutil.SameNames(certutil.CSRNames(req), job.Cert.Names) {
@@ -380,7 +405,7 @@ func (r *run) renew(ctx context.Context, cert *api.Cert, oldSerial, reason strin
 	}
 	if err != nil {
 		r.releaseKey(ctx, csr.KeyRef, "unused key from a bad CSR")
-		return fail(audit.StepCreateCSR, fmt.Errorf("key store returned a bad CSR: %w", err))
+		return fail(audit.StepCreateCSR, &BlockedError{Err: fmt.Errorf("key store returned a bad CSR: %w", err)})
 	}
 	a := r.entry(audit.StepCreateCSR, audit.ResultOK)
 	a.Detail = reason
@@ -463,7 +488,7 @@ func (r *run) finishIssued(ctx context.Context, issued *api.Cert, keyRef, spki s
 	} else if errors.Is(err, plugin.ErrNotFound) {
 		return reject("the key store no longer holds the key for this certificate")
 	} else if !plugin.IsUnsupported(err) {
-		return err
+		return &BlockedError{Err: fmt.Errorf("key store: %w", err)}
 	}
 
 	fullChain := r.fullChain(ctx, issued, leaf)
@@ -474,7 +499,7 @@ func (r *run) finishIssued(ctx context.Context, issued *api.Cert, keyRef, spki s
 		a := r.entry(audit.StepComplete, audit.ResultFailed)
 		a.Error = err.Error()
 		_ = r.e.audit(a)
-		return err
+		return &BlockedError{Err: err}
 	}
 
 	if st.KeyRef != "" && st.KeyRef != newRef && !slices.Contains(st.RetiredKeys, st.KeyRef) {
@@ -640,9 +665,11 @@ func (t *targetRun) failStep(step string, err error) {
 }
 
 // recordFailure ends a failed deployment and schedules the next attempt.
-func (t *targetRun) recordFailure(err error) error {
+// outcome is OutcomeFailed or OutcomeRolledBack.
+func (t *targetRun) recordFailure(err error, outcome string) error {
 	ts := t.ts()
 	ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+	ts.Outcome = outcome
 	ts.Failures++
 	base := t.e.RetryBase
 	if base == 0 {
@@ -657,9 +684,10 @@ func (t *targetRun) recordFailure(err error) error {
 	return err
 }
 
-func (t *targetRun) recordSuccess(serial string, notAfter time.Time) {
+func (t *targetRun) recordSuccess(serial string, notAfter time.Time, outcome string) {
 	ts := t.ts()
 	ts.Serial, ts.NotAfter = serial, notAfter
+	ts.Outcome = outcome
 	ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
 	ts.Failures, ts.NextAttempt, ts.LastError = 0, time.Time{}, ""
 	t.setTS(ts)
@@ -761,7 +789,7 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	key, err := t.job.KeyStore.Export(ctx, plugin.ExportRequest{Config: t.job.KeyStoreConfig, KeyRef: st.KeyRef, Format: tj.Format})
 	if err != nil {
 		t.failStep(audit.StepExport, err)
-		return t.recordFailure(err)
+		return t.recordFailure(err, OutcomeFailed)
 	}
 	stagedRef, err := tj.Plugin.Stage(ctx, plugin.StageRequest{
 		Config:        tj.Settings,
@@ -775,7 +803,7 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	})
 	if err != nil {
 		t.failStep(audit.StepStage, err)
-		return t.recordFailure(err)
+		return t.recordFailure(err, OutcomeFailed)
 	}
 	ts := t.ts()
 	ts.Phase, ts.StagedRef, ts.DeployingSerial = PhaseStaged, stagedRef, st.Serial
@@ -798,7 +826,7 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	if err != nil {
 		t.failStep(audit.StepActivate, err)
 		t.discard(ctx, stagedRef)
-		return t.recordFailure(err)
+		return t.recordFailure(err, OutcomeFailed)
 	}
 	ts.Phase, ts.StagedRef, ts.PreviousRef = PhaseActivated, "", prevRef
 	t.setTS(ts)
@@ -833,7 +861,7 @@ func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recover
 		a := t.entry(audit.StepVerify, audit.ResultSkipped)
 		a.Detail = "no verify block in config"
 		_ = t.e.audit(a)
-		t.recordSuccess(st.Serial, st.NotAfter)
+		t.recordSuccess(st.Serial, st.NotAfter, OutcomeUnverifiable)
 		return nil
 	}
 	leaf, err := certutil.ParseLeaf(st.CertPEM)
@@ -859,7 +887,7 @@ func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recover
 			a.Detail = "target propagates on its own schedule; not rolled back"
 			_ = t.e.audit(a)
 			t.log.Error("verification failed; not rolling back because this target propagates on its own schedule", "error", err)
-			t.recordSuccess(st.Serial, st.NotAfter)
+			t.recordSuccess(st.Serial, st.NotAfter, OutcomeUnverifiable)
 			ts := t.ts()
 			ts.LastError = err.Error()
 			t.setTS(ts)
@@ -878,7 +906,7 @@ func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recover
 	}
 	_ = t.e.audit(a)
 	t.log.Info("deployed and verified", "serial", st.Serial)
-	t.recordSuccess(st.Serial, st.NotAfter)
+	t.recordSuccess(st.Serial, st.NotAfter, OutcomeVerified)
 	return nil
 }
 
@@ -890,9 +918,9 @@ func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recover
 // countFailure is false when undoing an interrupted run's deployment, which
 // is not a failure of this target.
 func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, countFailure bool) error {
-	done := func(err error) error {
+	done := func(err error, outcome string) error {
 		if countFailure {
-			return t.recordFailure(err)
+			return t.recordFailure(err, outcome)
 		}
 		ts := t.ts()
 		ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
@@ -911,6 +939,7 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 		ts.Serial, ts.NotAfter = ts.DeployingSerial, t.st.NotAfter
 		ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
 		ts.LastError = cause.Error()
+		ts.Outcome = OutcomeFailed
 		t.setTS(ts)
 		_ = t.save()
 		return fmt.Errorf("%w (not rolled back: %s)", cause, why)
@@ -941,7 +970,7 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 		a.Result, a.Error = audit.ResultFailed, err.Error()
 		_ = t.e.audit(a)
 		t.log.Error("rollback failed", "error", err)
-		return done(errors.Join(cause, fmt.Errorf("rollback failed: %w", err)))
+		return done(errors.Join(cause, fmt.Errorf("rollback failed: %w", err)), OutcomeFailed)
 	}
 	if t.tj.Config.Then != nil {
 		if err := t.runThen(rctx, "", "rollback"); err != nil {
@@ -949,12 +978,12 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 			a.Detail = "files rolled back; then.exec failed afterwards"
 			_ = t.e.audit(a)
 			t.log.Error("rolled back, but then.exec failed afterwards", "error", err)
-			return done(errors.Join(cause, fmt.Errorf("files rolled back, but then.exec failed afterwards: %w", err)))
+			return done(errors.Join(cause, fmt.Errorf("files rolled back, but then.exec failed afterwards: %w", err)), OutcomeRolledBack)
 		}
 	}
 	_ = t.e.audit(a)
 	t.log.Warn("rolled back to the previous certificate", "cause", cause)
-	return done(fmt.Errorf("%w (rolled back)", cause))
+	return done(fmt.Errorf("%w (rolled back)", cause), OutcomeRolledBack)
 }
 
 func (t *targetRun) runThen(ctx context.Context, serial, action string) error {

@@ -1003,3 +1003,65 @@ func TestCrashDuringActivate(t *testing.T) {
 		})
 	}
 }
+
+func TestOutcomesAreRecorded(t *testing.T) {
+	cases := map[string]struct {
+		prepare func(e *env)
+		want    string
+	}{
+		"verified":      {func(*env) {}, OutcomeVerified},
+		"no verify":     {func(e *env) { e.job.Targets[0].Config.Verify = nil }, OutcomeUnverifiable},
+		"rolled back":   {func(e *env) { e.targets["a"].broken = true }, OutcomeRolledBack},
+		"activate fail": {func(e *env) { e.targets["a"].failActivate = errors.New("denied") }, OutcomeFailed},
+		"no rollback": {func(e *env) {
+			e.targets["a"].broken = true
+			e.targets["a"].caps.SupportsRollback = false
+		}, OutcomeFailed},
+		"async": {func(e *env) {
+			e.targets["a"].broken = true
+			e.targets["a"].caps.PropagatesAsync = true
+		}, OutcomeUnverifiable},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t, "a")
+			// A first, healthy deployment, so a rollback has somewhere to go.
+			if err := e.process(t, false); err != nil {
+				t.Fatal(err)
+			}
+			c.prepare(e)
+			_ = e.process(t, true)
+			ts := e.state(t).Targets["a"]
+			if ts.Outcome != c.want {
+				t.Errorf("outcome %q, want %q (%+v)", ts.Outcome, c.want, ts)
+			}
+			if c.want != OutcomeVerified && name != "no verify" && ts.LastError == "" {
+				t.Error("no error recorded")
+			}
+		})
+	}
+}
+
+func TestBlockedFailures(t *testing.T) {
+	cases := map[string]struct {
+		prepare func(e *env)
+		blocked bool
+	}{
+		"key store cannot create the key": {func(e *env) { e.job.Cert.KeyStore.KeyType = plugin.KeyTypeRSA2048 }, true},
+		"issued certificate rejected":     {func(e *env) { e.api.issueNames = []string{"evil.example.com"} }, true},
+		"issuance failed in KrakenKey":    {func(e *env) { e.api.failIssue = "CNAME missing" }, false},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t, "a")
+			c.prepare(e)
+			err := e.process(t, false)
+			if err == nil || IsBlocked(err) != c.blocked {
+				t.Errorf("IsBlocked(%v) = %v, want %v", err, IsBlocked(err), c.blocked)
+			}
+		})
+	}
+	if IsBlocked(nil) || IsBlocked(errors.New("x")) || !IsBlocked(fmt.Errorf("wrapped: %w", &BlockedError{Err: errors.New("x")})) {
+		t.Error("IsBlocked on plain errors")
+	}
+}

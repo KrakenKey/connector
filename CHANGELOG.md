@@ -8,11 +8,16 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
-First release. Reporting deployment status to KrakenKey is in progress and
-will follow in a later release.
+First release.
 
 ### Added
 
+- Deployment status reporting: after every pass an enrolled connector sends
+  KrakenKey each target's state (`pending` through `verified`, `failed` or
+  `rolled_back`), the serial it serves and a short redacted error, so the
+  dashboard shows what is deployed where and KrakenKey alerts on failures.
+  Failures on the connector's side are reported as `failed`. Reporting never
+  changes the outcome or exit code of a pass. (#4)
 - `krakenkey-connector enroll` and `rotate-identity`: the connector enrolls
   once with a one-time token from the KrakenKey dashboard, keeps an Ed25519
   identity key in `<data_dir>/identity/`, and exchanges a signed assertion

@@ -172,6 +172,10 @@ type Connector struct {
 	Resolver Resolver
 	Engine   *deploy.Engine
 	Log      *slog.Logger
+	// Reporter sends the deployment status after each pass. It is set only
+	// for an enrolled connector: KrakenKey takes reports only with keys
+	// issued to a connector.
+	Reporter *Reporter
 }
 
 // RunOptions change one pass.
@@ -189,6 +193,9 @@ func (c *Connector) RunOnce(ctx context.Context, opts RunOptions) error {
 	log.Info("pass started", "certificates", len(c.Config.Certificates), "force", opts.Force, "only_certificate", opts.CertID)
 
 	var errs []error
+	// results holds every certificate this pass processed: its error, or
+	// nil. The status report covers these certificates only.
+	results := map[int]error{}
 	for _, cert := range c.Config.Certificates {
 		if opts.CertID != 0 && cert.ID != opts.CertID {
 			continue
@@ -199,13 +206,15 @@ func (c *Connector) RunOnce(ctx context.Context, opts RunOptions) error {
 		}
 		job, rep := BuildJob(ctx, cert, c.Resolver)
 		if !rep.OK() {
-			err := fmt.Errorf("certificate %d: config problems, skipped (run validate for details): %s",
-				cert.ID, firstProblem(rep))
+			err := &deploy.BlockedError{Err: fmt.Errorf("certificate %d: config problems, skipped (run validate for details): %s",
+				cert.ID, firstProblem(rep))}
 			log.Error("certificate skipped", "certificate_id", cert.ID, "error", err)
 			errs = append(errs, err)
+			results[cert.ID] = err
 			continue
 		}
 		err := c.Engine.Process(ctx, job, deploy.Options{RunID: runID, Force: opts.Force})
+		results[cert.ID] = err
 		if err != nil {
 			log.Error("certificate failed", "certificate_id", cert.ID, "error", err)
 			errs = append(errs, err)
@@ -219,7 +228,23 @@ func (c *Connector) RunOnce(ctx context.Context, opts RunOptions) error {
 	} else {
 		log.Warn("pass finished with errors", "errors", len(errs))
 	}
-	return errors.Join(errs...)
+	err := errors.Join(errs...)
+	c.report(ctx, log, results, err)
+	return err
+}
+
+// report sends the deployment status, if the connector is enrolled and the
+// pass did not stop because KrakenKey refused the credentials or asked the
+// connector to back off. It never changes the result of the pass.
+func (c *Connector) report(ctx context.Context, log *slog.Logger, results map[int]error, passErr error) {
+	switch {
+	case c.Reporter == nil:
+		log.Debug("deployment status not reported: the connector is not enrolled")
+	case stopsPass(passErr):
+		log.Warn("deployment status not reported: the pass stopped early", "error", passErr)
+	default:
+		c.Reporter.Send(ctx, results)
+	}
 }
 
 // Run runs a pass now and then every check_interval until ctx is done or
