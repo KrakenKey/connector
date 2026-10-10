@@ -12,8 +12,8 @@ type targetGRPCServer struct {
 	impl Target
 }
 
-func (s *targetGRPCServer) Describe(ctx context.Context, _ *pb.TargetServiceDescribeRequest) (*pb.TargetServiceDescribeResponse, error) {
-	caps, err := s.impl.Describe(ctx)
+func (s *targetGRPCServer) Describe(ctx context.Context, req *pb.TargetServiceDescribeRequest) (*pb.TargetServiceDescribeResponse, error) {
+	caps, err := s.impl.Describe(WithCoreFeatures(ctx, req.GetCoreFeatures()...))
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -103,7 +103,7 @@ type targetGRPCClient struct {
 var _ Target = (*targetGRPCClient)(nil)
 
 func (c *targetGRPCClient) Describe(ctx context.Context) (TargetCapabilities, error) {
-	resp, err := c.client.Describe(ctx, &pb.TargetServiceDescribeRequest{})
+	resp, err := c.client.Describe(ctx, &pb.TargetServiceDescribeRequest{CoreFeatures: CoreFeatures})
 	if err != nil {
 		return TargetCapabilities{}, fromStatus("target describe", err)
 	}

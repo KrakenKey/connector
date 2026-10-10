@@ -12,8 +12,8 @@ type keyStoreGRPCServer struct {
 	impl KeyStore
 }
 
-func (s *keyStoreGRPCServer) Describe(ctx context.Context, _ *pb.KeyStoreServiceDescribeRequest) (*pb.KeyStoreServiceDescribeResponse, error) {
-	caps, err := s.impl.Describe(ctx)
+func (s *keyStoreGRPCServer) Describe(ctx context.Context, req *pb.KeyStoreServiceDescribeRequest) (*pb.KeyStoreServiceDescribeResponse, error) {
+	caps, err := s.impl.Describe(WithCoreFeatures(ctx, req.GetCoreFeatures()...))
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -21,11 +21,15 @@ func (s *keyStoreGRPCServer) Describe(ctx context.Context, _ *pb.KeyStoreService
 }
 
 func (s *keyStoreGRPCServer) Validate(ctx context.Context, req *pb.KeyStoreServiceValidateRequest) (*pb.KeyStoreServiceValidateResponse, error) {
-	problems, err := s.impl.Validate(ctx, KeyStoreValidateRequest{Config: req.GetConfigJson(), CertificateID: req.GetCertificateId()})
+	v, err := ValidateKeyStore(ctx, s.impl, KeyStoreValidateRequest{Config: req.GetConfigJson(), CertificateID: req.GetCertificateId()})
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	return &pb.KeyStoreServiceValidateResponse{Problems: problems}, nil
+	resp := &pb.KeyStoreServiceValidateResponse{Problems: v.Problems}
+	if v.Capabilities != nil {
+		resp.Capabilities = pbKeyStoreCaps(*v.Capabilities)
+	}
+	return resp, nil
 }
 
 func (s *keyStoreGRPCServer) CreateCSR(ctx context.Context, req *pb.CreateCSRRequest) (*pb.CreateCSRResponse, error) {
@@ -89,7 +93,7 @@ type keyStoreGRPCClient struct {
 var _ KeyStore = (*keyStoreGRPCClient)(nil)
 
 func (c *keyStoreGRPCClient) Describe(ctx context.Context) (KeyStoreCapabilities, error) {
-	resp, err := c.client.Describe(ctx, &pb.KeyStoreServiceDescribeRequest{})
+	resp, err := c.client.Describe(ctx, &pb.KeyStoreServiceDescribeRequest{CoreFeatures: CoreFeatures})
 	if err != nil {
 		return KeyStoreCapabilities{}, fromStatus("key store describe", err)
 	}
@@ -97,11 +101,23 @@ func (c *keyStoreGRPCClient) Describe(ctx context.Context) (KeyStoreCapabilities
 }
 
 func (c *keyStoreGRPCClient) Validate(ctx context.Context, req KeyStoreValidateRequest) ([]string, error) {
+	v, err := c.ValidateCapabilities(ctx, req)
+	return v.Problems, err
+}
+
+// ValidateCapabilities returns the problems and, if the key store sent
+// them, the capabilities for these settings.
+func (c *keyStoreGRPCClient) ValidateCapabilities(ctx context.Context, req KeyStoreValidateRequest) (KeyStoreValidation, error) {
 	resp, err := c.client.Validate(ctx, &pb.KeyStoreServiceValidateRequest{ConfigJson: req.Config, CertificateId: req.CertificateID})
 	if err != nil {
-		return nil, fromStatus("key store validate", err)
+		return KeyStoreValidation{}, fromStatus("key store validate", err)
 	}
-	return resp.GetProblems(), nil
+	v := KeyStoreValidation{Problems: resp.GetProblems()}
+	if resp.Capabilities != nil {
+		caps := goKeyStoreCaps(resp.GetCapabilities())
+		v.Capabilities = &caps
+	}
+	return v, nil
 }
 
 func (c *keyStoreGRPCClient) CreateCSR(ctx context.Context, req CSRRequest) (CSR, error) {

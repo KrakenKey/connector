@@ -34,9 +34,11 @@ type TargetReport struct {
 	Format   plugin.KeyFormat
 	Window   time.Duration
 	Problems []string
-	// Warnings do not stop deployments, for example rollback being
-	// unavailable for this key store and target pair.
+	// Warnings do not stop deployments.
 	Warnings []string
+	// RollbackUnavailable says why a failed deployment to this target
+	// cannot be rolled back with this key store, or is empty.
+	RollbackUnavailable string
 }
 
 // CertReport describes one certificate after resolving and checking its
@@ -85,13 +87,19 @@ func BuildJob(ctx context.Context, cert config.Certificate, r Resolver) (deploy.
 		rep.Problems = append(rep.Problems, err.Error())
 	}
 	if ks != nil && ksCaps != nil {
-		problems, err := ks.Validate(ctx, plugin.KeyStoreValidateRequest{Config: job.KeyStoreConfig, CertificateID: strconv.Itoa(cert.ID)})
+		v, err := plugin.ValidateKeyStore(ctx, ks, plugin.KeyStoreValidateRequest{Config: job.KeyStoreConfig, CertificateID: strconv.Itoa(cert.ID)})
 		switch {
 		case plugin.IsUnsupported(err):
 		case err != nil:
 			rep.Problems = append(rep.Problems, err.Error())
 		default:
-			rep.Problems = append(rep.Problems, problems...)
+			rep.Problems = append(rep.Problems, v.Problems...)
+			if v.Capabilities != nil {
+				// What this certificate's settings allow, which can be
+				// less than the key store's general capabilities.
+				ksCaps = v.Capabilities
+				rep.KeyStoreCaps = ksCaps
+			}
 		}
 	}
 
@@ -139,11 +147,10 @@ func BuildJob(ctx context.Context, cert config.Certificate, r Resolver) (deploy.
 				}
 			} else {
 				tj.Format, tr.Format = f, f
-			}
-			if caps.SupportsRollback {
-				if why := plugin.RollbackUnavailable(*ksCaps, caps); why != "" {
-					tj.RollbackUnavailable = why
-					tr.Warnings = append(tr.Warnings, "rollback is unavailable: "+why+"; a failed deployment keeps the new certificate")
+				if why := plugin.RollbackUnavailable(*ksCaps, caps, f); why != "" && caps.SupportsRollback {
+					tj.RollbackUnavailable, tr.RollbackUnavailable = why, why
+					tr.Warnings = append(tr.Warnings, "rollback is unavailable: "+why+
+						". If a deployment fails its checks, the connector still calls the target's rollback without the previous key; the target refuses it, the failed rollback is reported, and the target keeps the new certificate")
 				}
 			}
 		}

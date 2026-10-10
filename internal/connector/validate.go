@@ -65,7 +65,7 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 					rollback = "propagates on its own schedule, not rolled back"
 				case !t.Caps.SupportsRollback:
 					rollback = "no rollback"
-				case len(t.Warnings) > 0:
+				case t.RollbackUnavailable != "":
 					rollback = "rollback unavailable"
 				case t.Caps.RollbackNeedsMaterial:
 					rollback = "rollback supported (with the previous certificate and key from the connector)"

@@ -133,28 +133,38 @@ func TestParseKeyType(t *testing.T) {
 }
 
 func TestRollbackUnavailable(t *testing.T) {
-	exportable := KeyStoreCapabilities{Provides: []KeyFormat{KeyFormatPEM}, Exportable: true}
-	locked := KeyStoreCapabilities{Provides: []KeyFormat{KeyFormatVaultRef}}
-	plain := TargetCapabilities{SupportsRollback: true}
-	material := TargetCapabilities{SupportsRollback: true, RollbackNeedsMaterial: true}
-	none := TargetCapabilities{}
+	exportablePEM := KeyStoreCapabilities{Provides: []KeyFormat{KeyFormatPEM}, Exportable: true, KeyTypes: []KeyType{KeyTypeECDSAP256}}
+	lockedVault := KeyStoreCapabilities{Provides: []KeyFormat{KeyFormatVaultRef}, KeyTypes: []KeyType{KeyTypeECDSAP256}}
+	pemPlain := TargetCapabilities{Accepts: []KeyFormat{KeyFormatPEM}, SupportsRollback: true}
+	pemMaterial := TargetCapabilities{Accepts: []KeyFormat{KeyFormatPEM}, SupportsRollback: true, RollbackNeedsMaterial: true}
+	vaultMaterial := TargetCapabilities{Accepts: []KeyFormat{KeyFormatVaultRef}, SupportsRollback: true, RollbackNeedsMaterial: true}
+	noRollback := TargetCapabilities{Accepts: []KeyFormat{KeyFormatPEM}}
 
-	tests := []struct {
+	// Pairs Match accepts, with the format it agrees.
+	for _, tt := range []struct {
 		name string
 		ks   KeyStoreCapabilities
 		t    TargetCapabilities
 		want string
 	}{
-		{"plain target, exportable", exportable, plain, ""},
-		{"plain target, locked", locked, plain, ""},
-		{"material target, exportable", exportable, material, ""},
-		{"material target, locked", locked, material, "does not allow export"},
-		{"no rollback", exportable, none, "does not support rollback"},
-	}
-	for _, tt := range tests {
-		got := RollbackUnavailable(tt.ks, tt.t)
+		{"plain target", exportablePEM, pemPlain, ""},
+		{"material target, exportable PEM", exportablePEM, pemMaterial, ""},
+		{"material target, vault ref from a locked vault", lockedVault, vaultMaterial, ""},
+		{"no rollback", exportablePEM, noRollback, "does not support rollback"},
+	} {
+		f, err := Match(tt.ks, tt.t, KeyTypeECDSAP256)
+		if err != nil {
+			t.Fatalf("%s: test pair must match: %v", tt.name, err)
+		}
+		got := RollbackUnavailable(tt.ks, tt.t, f)
 		if (tt.want == "") != (got == "") || !strings.Contains(got, tt.want) {
 			t.Errorf("%s: RollbackUnavailable = %q, want %q", tt.name, got, tt.want)
 		}
+	}
+
+	// Key bytes from a key store that does not allow export. Match refuses
+	// this pair, but RollbackUnavailable must not depend on that.
+	if got := RollbackUnavailable(KeyStoreCapabilities{Provides: []KeyFormat{KeyFormatPEM}}, pemMaterial, KeyFormatPEM); !strings.Contains(got, "does not allow export") {
+		t.Errorf("locked PEM: %q", got)
 	}
 }

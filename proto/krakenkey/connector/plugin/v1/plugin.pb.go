@@ -312,7 +312,10 @@ func (x *KeyStoreCapabilities) GetKeyTypes() []KeyType {
 }
 
 type KeyStoreServiceDescribeRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional protocol features the connector supports (see
+	// TargetServiceDescribeRequest.core_features).
+	CoreFeatures  []string `protobuf:"bytes,1,rep,name=core_features,json=coreFeatures,proto3" json:"core_features,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -345,6 +348,13 @@ func (x *KeyStoreServiceDescribeRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use KeyStoreServiceDescribeRequest.ProtoReflect.Descriptor instead.
 func (*KeyStoreServiceDescribeRequest) Descriptor() ([]byte, []int) {
 	return file_krakenkey_connector_plugin_v1_plugin_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *KeyStoreServiceDescribeRequest) GetCoreFeatures() []string {
+	if x != nil {
+		return x.CoreFeatures
+	}
+	return nil
 }
 
 type KeyStoreServiceDescribeResponse struct {
@@ -446,7 +456,12 @@ func (x *KeyStoreServiceValidateRequest) GetCertificateId() string {
 type KeyStoreServiceValidateResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Human readable problems. Empty means the settings are usable.
-	Problems      []string `protobuf:"bytes,1,rep,name=problems,proto3" json:"problems,omitempty"`
+	Problems []string `protobuf:"bytes,1,rep,name=problems,proto3" json:"problems,omitempty"`
+	// Capabilities for these settings, when they differ from what Describe
+	// reports (for example a vault whose keys are exportable or not
+	// depending on a setting). The connector matches key store and targets
+	// with these. Unset means use Describe's.
+	Capabilities  *KeyStoreCapabilities `protobuf:"bytes,2,opt,name=capabilities,proto3" json:"capabilities,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -484,6 +499,13 @@ func (*KeyStoreServiceValidateResponse) Descriptor() ([]byte, []int) {
 func (x *KeyStoreServiceValidateResponse) GetProblems() []string {
 	if x != nil {
 		return x.Problems
+	}
+	return nil
+}
+
+func (x *KeyStoreServiceValidateResponse) GetCapabilities() *KeyStoreCapabilities {
+	if x != nil {
+		return x.Capabilities
 	}
 	return nil
 }
@@ -1039,7 +1061,10 @@ type TargetCapabilities struct {
 	// back, because the target cannot keep them itself (for example a cloud
 	// service that never returns an imported private key). The core then
 	// fills the previous_* fields of RollbackRequest when it still holds that
-	// material. Only meaningful together with supports_rollback.
+	// material. Only meaningful together with supports_rollback. A connector
+	// without the "rollback_material" core feature ignores this and never
+	// sends the material; such a target should refuse to run with it (fail
+	// Describe with FAILED_PRECONDITION).
 	RollbackNeedsMaterial bool `protobuf:"varint,7,opt,name=rollback_needs_material,json=rollbackNeedsMaterial,proto3" json:"rollback_needs_material,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
@@ -1125,7 +1150,16 @@ func (x *TargetCapabilities) GetRollbackNeedsMaterial() bool {
 }
 
 type TargetServiceDescribeRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional protocol features the connector supports, so a plugin can
+	// refuse to run with a connector that lacks one it needs. Connectors that
+	// predate this field send none. Known values:
+	//
+	//   - "rollback_material": the connector fills RollbackRequest's
+	//     previous_* fields for targets with rollback_needs_material.
+	//   - "keystore_validate_capabilities": the connector uses
+	//     KeyStoreServiceValidateResponse.capabilities.
+	CoreFeatures  []string `protobuf:"bytes,1,rep,name=core_features,json=coreFeatures,proto3" json:"core_features,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1158,6 +1192,13 @@ func (x *TargetServiceDescribeRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use TargetServiceDescribeRequest.ProtoReflect.Descriptor instead.
 func (*TargetServiceDescribeRequest) Descriptor() ([]byte, []int) {
 	return file_krakenkey_connector_plugin_v1_plugin_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *TargetServiceDescribeRequest) GetCoreFeatures() []string {
+	if x != nil {
+		return x.CoreFeatures
+	}
+	return nil
 }
 
 type TargetServiceDescribeResponse struct {
@@ -1967,16 +2008,18 @@ const file_krakenkey_connector_plugin_v1_plugin_proto_rawDesc = "" +
 	"\n" +
 	"exportable\x18\x02 \x01(\bR\n" +
 	"exportable\x12C\n" +
-	"\tkey_types\x18\x03 \x03(\x0e2&.krakenkey.connector.plugin.v1.KeyTypeR\bkeyTypes\" \n" +
-	"\x1eKeyStoreServiceDescribeRequest\"z\n" +
+	"\tkey_types\x18\x03 \x03(\x0e2&.krakenkey.connector.plugin.v1.KeyTypeR\bkeyTypes\"E\n" +
+	"\x1eKeyStoreServiceDescribeRequest\x12#\n" +
+	"\rcore_features\x18\x01 \x03(\tR\fcoreFeatures\"z\n" +
 	"\x1fKeyStoreServiceDescribeResponse\x12W\n" +
 	"\fcapabilities\x18\x01 \x01(\v23.krakenkey.connector.plugin.v1.KeyStoreCapabilitiesR\fcapabilities\"h\n" +
 	"\x1eKeyStoreServiceValidateRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12%\n" +
-	"\x0ecertificate_id\x18\x02 \x01(\tR\rcertificateId\"=\n" +
+	"\x0ecertificate_id\x18\x02 \x01(\tR\rcertificateId\"\x96\x01\n" +
 	"\x1fKeyStoreServiceValidateResponse\x12\x1a\n" +
-	"\bproblems\x18\x01 \x03(\tR\bproblems\"\xb3\x01\n" +
+	"\bproblems\x18\x01 \x03(\tR\bproblems\x12W\n" +
+	"\fcapabilities\x18\x02 \x01(\v23.krakenkey.connector.plugin.v1.KeyStoreCapabilitiesR\fcapabilities\"\xb3\x01\n" +
 	"\x10CreateCSRRequest\x12\x1f\n" +
 	"\vconfig_json\x18\x01 \x01(\fR\n" +
 	"configJson\x12%\n" +
@@ -2019,8 +2062,9 @@ const file_krakenkey_connector_plugin_v1_plugin_proto_rawDesc = "" +
 	"\tkey_types\x18\x04 \x03(\x0e2&.krakenkey.connector.plugin.v1.KeyTypeR\bkeyTypes\x12A\n" +
 	"\x1ddefault_verify_window_seconds\x18\x05 \x01(\x03R\x1adefaultVerifyWindowSeconds\x12)\n" +
 	"\x10propagates_async\x18\x06 \x01(\bR\x0fpropagatesAsync\x126\n" +
-	"\x17rollback_needs_material\x18\a \x01(\bR\x15rollbackNeedsMaterial\"\x1e\n" +
-	"\x1cTargetServiceDescribeRequest\"v\n" +
+	"\x17rollback_needs_material\x18\a \x01(\bR\x15rollbackNeedsMaterial\"C\n" +
+	"\x1cTargetServiceDescribeRequest\x12#\n" +
+	"\rcore_features\x18\x01 \x03(\tR\fcoreFeatures\"v\n" +
 	"\x1dTargetServiceDescribeResponse\x12U\n" +
 	"\fcapabilities\x18\x01 \x01(\v21.krakenkey.connector.plugin.v1.TargetCapabilitiesR\fcapabilities\"|\n" +
 	"\x1cTargetServiceValidateRequest\x12\x1f\n" +
@@ -2162,47 +2206,48 @@ var file_krakenkey_connector_plugin_v1_plugin_proto_depIdxs = []int32{
 	1,  // 1: krakenkey.connector.plugin.v1.KeyStoreCapabilities.provides:type_name -> krakenkey.connector.plugin.v1.KeyFormat
 	0,  // 2: krakenkey.connector.plugin.v1.KeyStoreCapabilities.key_types:type_name -> krakenkey.connector.plugin.v1.KeyType
 	3,  // 3: krakenkey.connector.plugin.v1.KeyStoreServiceDescribeResponse.capabilities:type_name -> krakenkey.connector.plugin.v1.KeyStoreCapabilities
-	0,  // 4: krakenkey.connector.plugin.v1.CreateCSRRequest.key_type:type_name -> krakenkey.connector.plugin.v1.KeyType
-	1,  // 5: krakenkey.connector.plugin.v1.ExportRequest.format:type_name -> krakenkey.connector.plugin.v1.KeyFormat
-	2,  // 6: krakenkey.connector.plugin.v1.ExportResponse.key:type_name -> krakenkey.connector.plugin.v1.KeyMaterial
-	1,  // 7: krakenkey.connector.plugin.v1.TargetCapabilities.accepts:type_name -> krakenkey.connector.plugin.v1.KeyFormat
-	0,  // 8: krakenkey.connector.plugin.v1.TargetCapabilities.key_types:type_name -> krakenkey.connector.plugin.v1.KeyType
-	18, // 9: krakenkey.connector.plugin.v1.TargetServiceDescribeResponse.capabilities:type_name -> krakenkey.connector.plugin.v1.TargetCapabilities
-	2,  // 10: krakenkey.connector.plugin.v1.StageRequest.key:type_name -> krakenkey.connector.plugin.v1.KeyMaterial
-	2,  // 11: krakenkey.connector.plugin.v1.RollbackRequest.previous_key:type_name -> krakenkey.connector.plugin.v1.KeyMaterial
-	4,  // 12: krakenkey.connector.plugin.v1.KeyStoreService.Describe:input_type -> krakenkey.connector.plugin.v1.KeyStoreServiceDescribeRequest
-	6,  // 13: krakenkey.connector.plugin.v1.KeyStoreService.Validate:input_type -> krakenkey.connector.plugin.v1.KeyStoreServiceValidateRequest
-	8,  // 14: krakenkey.connector.plugin.v1.KeyStoreService.CreateCSR:input_type -> krakenkey.connector.plugin.v1.CreateCSRRequest
-	10, // 15: krakenkey.connector.plugin.v1.KeyStoreService.PublicKey:input_type -> krakenkey.connector.plugin.v1.PublicKeyRequest
-	12, // 16: krakenkey.connector.plugin.v1.KeyStoreService.Complete:input_type -> krakenkey.connector.plugin.v1.CompleteRequest
-	14, // 17: krakenkey.connector.plugin.v1.KeyStoreService.Export:input_type -> krakenkey.connector.plugin.v1.ExportRequest
-	16, // 18: krakenkey.connector.plugin.v1.KeyStoreService.Release:input_type -> krakenkey.connector.plugin.v1.ReleaseRequest
-	19, // 19: krakenkey.connector.plugin.v1.TargetService.Describe:input_type -> krakenkey.connector.plugin.v1.TargetServiceDescribeRequest
-	21, // 20: krakenkey.connector.plugin.v1.TargetService.Validate:input_type -> krakenkey.connector.plugin.v1.TargetServiceValidateRequest
-	23, // 21: krakenkey.connector.plugin.v1.TargetService.Current:input_type -> krakenkey.connector.plugin.v1.CurrentRequest
-	25, // 22: krakenkey.connector.plugin.v1.TargetService.Stage:input_type -> krakenkey.connector.plugin.v1.StageRequest
-	27, // 23: krakenkey.connector.plugin.v1.TargetService.Activate:input_type -> krakenkey.connector.plugin.v1.ActivateRequest
-	29, // 24: krakenkey.connector.plugin.v1.TargetService.Rollback:input_type -> krakenkey.connector.plugin.v1.RollbackRequest
-	31, // 25: krakenkey.connector.plugin.v1.TargetService.Discard:input_type -> krakenkey.connector.plugin.v1.DiscardRequest
-	5,  // 26: krakenkey.connector.plugin.v1.KeyStoreService.Describe:output_type -> krakenkey.connector.plugin.v1.KeyStoreServiceDescribeResponse
-	7,  // 27: krakenkey.connector.plugin.v1.KeyStoreService.Validate:output_type -> krakenkey.connector.plugin.v1.KeyStoreServiceValidateResponse
-	9,  // 28: krakenkey.connector.plugin.v1.KeyStoreService.CreateCSR:output_type -> krakenkey.connector.plugin.v1.CreateCSRResponse
-	11, // 29: krakenkey.connector.plugin.v1.KeyStoreService.PublicKey:output_type -> krakenkey.connector.plugin.v1.PublicKeyResponse
-	13, // 30: krakenkey.connector.plugin.v1.KeyStoreService.Complete:output_type -> krakenkey.connector.plugin.v1.CompleteResponse
-	15, // 31: krakenkey.connector.plugin.v1.KeyStoreService.Export:output_type -> krakenkey.connector.plugin.v1.ExportResponse
-	17, // 32: krakenkey.connector.plugin.v1.KeyStoreService.Release:output_type -> krakenkey.connector.plugin.v1.ReleaseResponse
-	20, // 33: krakenkey.connector.plugin.v1.TargetService.Describe:output_type -> krakenkey.connector.plugin.v1.TargetServiceDescribeResponse
-	22, // 34: krakenkey.connector.plugin.v1.TargetService.Validate:output_type -> krakenkey.connector.plugin.v1.TargetServiceValidateResponse
-	24, // 35: krakenkey.connector.plugin.v1.TargetService.Current:output_type -> krakenkey.connector.plugin.v1.CurrentResponse
-	26, // 36: krakenkey.connector.plugin.v1.TargetService.Stage:output_type -> krakenkey.connector.plugin.v1.StageResponse
-	28, // 37: krakenkey.connector.plugin.v1.TargetService.Activate:output_type -> krakenkey.connector.plugin.v1.ActivateResponse
-	30, // 38: krakenkey.connector.plugin.v1.TargetService.Rollback:output_type -> krakenkey.connector.plugin.v1.RollbackResponse
-	32, // 39: krakenkey.connector.plugin.v1.TargetService.Discard:output_type -> krakenkey.connector.plugin.v1.DiscardResponse
-	26, // [26:40] is the sub-list for method output_type
-	12, // [12:26] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	3,  // 4: krakenkey.connector.plugin.v1.KeyStoreServiceValidateResponse.capabilities:type_name -> krakenkey.connector.plugin.v1.KeyStoreCapabilities
+	0,  // 5: krakenkey.connector.plugin.v1.CreateCSRRequest.key_type:type_name -> krakenkey.connector.plugin.v1.KeyType
+	1,  // 6: krakenkey.connector.plugin.v1.ExportRequest.format:type_name -> krakenkey.connector.plugin.v1.KeyFormat
+	2,  // 7: krakenkey.connector.plugin.v1.ExportResponse.key:type_name -> krakenkey.connector.plugin.v1.KeyMaterial
+	1,  // 8: krakenkey.connector.plugin.v1.TargetCapabilities.accepts:type_name -> krakenkey.connector.plugin.v1.KeyFormat
+	0,  // 9: krakenkey.connector.plugin.v1.TargetCapabilities.key_types:type_name -> krakenkey.connector.plugin.v1.KeyType
+	18, // 10: krakenkey.connector.plugin.v1.TargetServiceDescribeResponse.capabilities:type_name -> krakenkey.connector.plugin.v1.TargetCapabilities
+	2,  // 11: krakenkey.connector.plugin.v1.StageRequest.key:type_name -> krakenkey.connector.plugin.v1.KeyMaterial
+	2,  // 12: krakenkey.connector.plugin.v1.RollbackRequest.previous_key:type_name -> krakenkey.connector.plugin.v1.KeyMaterial
+	4,  // 13: krakenkey.connector.plugin.v1.KeyStoreService.Describe:input_type -> krakenkey.connector.plugin.v1.KeyStoreServiceDescribeRequest
+	6,  // 14: krakenkey.connector.plugin.v1.KeyStoreService.Validate:input_type -> krakenkey.connector.plugin.v1.KeyStoreServiceValidateRequest
+	8,  // 15: krakenkey.connector.plugin.v1.KeyStoreService.CreateCSR:input_type -> krakenkey.connector.plugin.v1.CreateCSRRequest
+	10, // 16: krakenkey.connector.plugin.v1.KeyStoreService.PublicKey:input_type -> krakenkey.connector.plugin.v1.PublicKeyRequest
+	12, // 17: krakenkey.connector.plugin.v1.KeyStoreService.Complete:input_type -> krakenkey.connector.plugin.v1.CompleteRequest
+	14, // 18: krakenkey.connector.plugin.v1.KeyStoreService.Export:input_type -> krakenkey.connector.plugin.v1.ExportRequest
+	16, // 19: krakenkey.connector.plugin.v1.KeyStoreService.Release:input_type -> krakenkey.connector.plugin.v1.ReleaseRequest
+	19, // 20: krakenkey.connector.plugin.v1.TargetService.Describe:input_type -> krakenkey.connector.plugin.v1.TargetServiceDescribeRequest
+	21, // 21: krakenkey.connector.plugin.v1.TargetService.Validate:input_type -> krakenkey.connector.plugin.v1.TargetServiceValidateRequest
+	23, // 22: krakenkey.connector.plugin.v1.TargetService.Current:input_type -> krakenkey.connector.plugin.v1.CurrentRequest
+	25, // 23: krakenkey.connector.plugin.v1.TargetService.Stage:input_type -> krakenkey.connector.plugin.v1.StageRequest
+	27, // 24: krakenkey.connector.plugin.v1.TargetService.Activate:input_type -> krakenkey.connector.plugin.v1.ActivateRequest
+	29, // 25: krakenkey.connector.plugin.v1.TargetService.Rollback:input_type -> krakenkey.connector.plugin.v1.RollbackRequest
+	31, // 26: krakenkey.connector.plugin.v1.TargetService.Discard:input_type -> krakenkey.connector.plugin.v1.DiscardRequest
+	5,  // 27: krakenkey.connector.plugin.v1.KeyStoreService.Describe:output_type -> krakenkey.connector.plugin.v1.KeyStoreServiceDescribeResponse
+	7,  // 28: krakenkey.connector.plugin.v1.KeyStoreService.Validate:output_type -> krakenkey.connector.plugin.v1.KeyStoreServiceValidateResponse
+	9,  // 29: krakenkey.connector.plugin.v1.KeyStoreService.CreateCSR:output_type -> krakenkey.connector.plugin.v1.CreateCSRResponse
+	11, // 30: krakenkey.connector.plugin.v1.KeyStoreService.PublicKey:output_type -> krakenkey.connector.plugin.v1.PublicKeyResponse
+	13, // 31: krakenkey.connector.plugin.v1.KeyStoreService.Complete:output_type -> krakenkey.connector.plugin.v1.CompleteResponse
+	15, // 32: krakenkey.connector.plugin.v1.KeyStoreService.Export:output_type -> krakenkey.connector.plugin.v1.ExportResponse
+	17, // 33: krakenkey.connector.plugin.v1.KeyStoreService.Release:output_type -> krakenkey.connector.plugin.v1.ReleaseResponse
+	20, // 34: krakenkey.connector.plugin.v1.TargetService.Describe:output_type -> krakenkey.connector.plugin.v1.TargetServiceDescribeResponse
+	22, // 35: krakenkey.connector.plugin.v1.TargetService.Validate:output_type -> krakenkey.connector.plugin.v1.TargetServiceValidateResponse
+	24, // 36: krakenkey.connector.plugin.v1.TargetService.Current:output_type -> krakenkey.connector.plugin.v1.CurrentResponse
+	26, // 37: krakenkey.connector.plugin.v1.TargetService.Stage:output_type -> krakenkey.connector.plugin.v1.StageResponse
+	28, // 38: krakenkey.connector.plugin.v1.TargetService.Activate:output_type -> krakenkey.connector.plugin.v1.ActivateResponse
+	30, // 39: krakenkey.connector.plugin.v1.TargetService.Rollback:output_type -> krakenkey.connector.plugin.v1.RollbackResponse
+	32, // 40: krakenkey.connector.plugin.v1.TargetService.Discard:output_type -> krakenkey.connector.plugin.v1.DiscardResponse
+	27, // [27:41] is the sub-list for method output_type
+	13, // [13:27] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_krakenkey_connector_plugin_v1_plugin_proto_init() }
