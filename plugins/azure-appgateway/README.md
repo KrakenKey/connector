@@ -7,6 +7,10 @@ one the `azure-keyvault` key store just completed.
 
 Binary: `krakenkey-connector-plugin-azure-appgateway`.
 
+Every connector release includes this plugin, in the container image and as
+a release archive, with the connector's version. See
+[Included plugins](../../README.md#included-plugins) for how to install it.
+
 ## How it works
 
 Application Gateway reads listener certificates from Key Vault with its own

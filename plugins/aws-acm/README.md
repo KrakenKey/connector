@@ -12,6 +12,10 @@ Binary: `krakenkey-connector-plugin-aws-acm`. It only reads and re-imports
 the one certificate it is configured with, and never creates or deletes
 certificates.
 
+Every connector release includes this plugin, in the container image and as
+a release archive, with the connector's version. See
+[Included plugins](../../README.md#included-plugins) for how to install it.
+
 ## How it works
 
 | Call | What it does in AWS |
