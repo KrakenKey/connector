@@ -15,8 +15,8 @@ protocol and the KrakenKey API the connector uses.
   CloudFront and API Gateway keep using the same ARN. It checks the
   replacement before changing anything (key type, key usages, names), and
   rolls back by re-importing the previous certificate and key the connector
-  hands back. Needs `acm:DescribeCertificate` and `acm:ImportCertificate`.
-
+  hands back. Needs `acm:DescribeCertificate` and `acm:ImportCertificate`,
+  and a connector with the `rollback_material` core feature.
 - Rollback material for targets that cannot keep the previous certificate
   and key themselves, such as a cloud service that never returns an
   imported private key. A target sets `rollback_needs_material`, and the

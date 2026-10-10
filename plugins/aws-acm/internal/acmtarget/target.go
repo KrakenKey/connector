@@ -16,7 +16,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -38,9 +41,14 @@ const DefaultVerifyWindow = 10 * time.Minute
 // abandoned.
 const stagedTTL = time.Hour
 
-// confirmTimeout bounds the DescribeCertificate call that checks whether an
-// ImportCertificate with an unknown outcome went through.
+// confirmTimeout bounds the DescribeCertificate call that checks whether a
+// failed ImportCertificate went through anyway. ImportCertificate gets the
+// caller's deadline minus this, so the check still fits.
 const confirmTimeout = 30 * time.Second
+
+// refPrefix marks a previous ref. The ref is stored in the connector's
+// state, so its format is part of the plugin's compatibility.
+const refPrefix = "serial:"
 
 // ACM is the part of the ACM API the target uses.
 type ACM interface {
@@ -63,24 +71,32 @@ type Target struct {
 	// Now defaults to time.Now.
 	Now func() time.Time
 
+	// ttl defaults to stagedTTL; tests shorten it.
+	ttl time.Duration
+	// core records whether the connector said in Describe that it hands
+	// back rollback material: 0 not asked yet, 1 yes, 2 no.
+	core atomic.Int32
+
 	mu      sync.Mutex
 	clients map[string]ACM
 	staged  map[string]*staged
 }
 
 // staged is checked material waiting for Activate. It lives only in this
-// process's memory; the staged ref the connector stores is a random id.
+// process's memory; the staged ref the connector stores is a random id. A
+// timer wipes it when the TTL runs out, even if no further call comes.
 type staged struct {
-	arn string
-	m   *material
-	at  time.Time
+	arn   string
+	m     *material
+	at    time.Time
+	timer *time.Timer
 }
 
 var _ plugin.Target = (*Target)(nil)
 
 // New returns a target that uses the default AWS credential chain.
 func New() *Target {
-	return &Target{clients: map[string]ACM{}, staged: map[string]*staged{}}
+	return &Target{clients: map[string]ACM{}, staged: map[string]*staged{}, ttl: stagedTTL}
 }
 
 func (t *Target) now() time.Time {
@@ -130,9 +146,20 @@ func config(raw []byte) (Config, error) {
 	return cfg, nil
 }
 
+// errOldCore explains why the plugin refuses a connector without the
+// rollback material feature.
+var errOldCore = fmt.Errorf("%w: this plugin needs a connector that hands back the previous certificate and key on rollback (core feature %q); upgrade the connector",
+	plugin.ErrPermanent, plugin.FeatureRollbackMaterial)
+
 // Describe reports a PEM target that needs the previous material to roll
-// back.
-func (t *Target) Describe(context.Context) (plugin.TargetCapabilities, error) {
+// back. It refuses a connector that would not hand that material back,
+// since every rollback would then fail.
+func (t *Target) Describe(ctx context.Context) (plugin.TargetCapabilities, error) {
+	if !plugin.HasCoreFeature(ctx, plugin.FeatureRollbackMaterial) {
+		t.core.Store(2)
+		return plugin.TargetCapabilities{}, errOldCore
+	}
+	t.core.Store(1)
 	return plugin.TargetCapabilities{
 		Accepts:               []plugin.KeyFormat{plugin.KeyFormatPEM},
 		NeedsExportableKey:    true,
@@ -153,6 +180,9 @@ func (t *Target) Describe(context.Context) (plugin.TargetCapabilities, error) {
 // imported certificate, and lives in the configured region. It changes
 // nothing.
 func (t *Target) Validate(ctx context.Context, req plugin.TargetValidateRequest) ([]string, error) {
+	if t.core.Load() == 2 {
+		return []string{errOldCore.Error()}, nil
+	}
 	cfg, err := parseConfig(req.Config)
 	if err != nil {
 		return []string{err.Error()}, nil
@@ -220,23 +250,47 @@ func (t *Target) Stage(ctx context.Context, req plugin.StageRequest) (string, er
 	b := make([]byte, 12)
 	_, _ = rand.Read(b)
 	ref := "staged-" + hex.EncodeToString(b)
+	s := &staged{arn: cfg.CertificateARN, m: m, at: t.now()}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.sweepLocked()
+	s.timer = time.AfterFunc(t.ttl, func() { t.drop(ref, s) })
+	t.staged[ref] = s
+	return ref, nil
+}
+
+// sweepLocked wipes staged material older than the TTL. t.mu is held.
+func (t *Target) sweepLocked() {
 	for r, s := range t.staged {
-		if t.now().Sub(s.at) > stagedTTL {
+		if t.now().Sub(s.at) > t.ttl {
+			s.timer.Stop()
 			s.m.wipe()
 			delete(t.staged, r)
 		}
 	}
-	t.staged[ref] = &staged{arn: cfg.CertificateARN, m: m, at: t.now()}
-	return ref, nil
 }
 
+// drop wipes staged material when its timer fires, unless it was taken.
+func (t *Target) drop(ref string, s *staged) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.staged[ref] == s {
+		delete(t.staged, ref)
+		s.m.wipe()
+	}
+}
+
+// take removes and returns staged material, or nil if it is unknown or
+// expired. The caller wipes it.
 func (t *Target) take(ref string) *staged {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.sweepLocked()
 	s := t.staged[ref]
 	delete(t.staged, ref)
+	if s != nil {
+		s.timer.Stop()
+	}
 	return s
 }
 
@@ -265,16 +319,26 @@ func (t *Target) Activate(ctx context.Context, req plugin.ActivateRequest) (stri
 		return "", fmt.Errorf("%w: ACM certificate %s: %s", plugin.ErrPermanent, cfg.CertificateARN, p)
 	}
 	prev := acmSerial(aws.ToString(d.Serial))
+	if prev == s.m.serial {
+		// ACM already holds this certificate (an earlier import whose
+		// answer was lost). What was there before it is unknown.
+		log.Printf("[WARN] ACM certificate %s already holds serial %s; nothing to import, and the previous certificate is unknown, so this activation cannot be rolled back", cfg.CertificateARN, prev)
+		return "", nil
+	}
 	if err := t.importCert(ctx, cfg, s.m); err != nil {
 		return "", err
 	}
-	return prev, nil
+	if prev == "" {
+		return "", nil
+	}
+	return refPrefix + prev, nil
 }
 
 // Rollback re-imports the certificate that was live before the Activate
-// that returned previousRef (its serial). ACM never returns an imported
+// that returned previousRef ("serial:<hex>"). ACM never returns an imported
 // private key, so this needs the previous certificate and key from the
-// connector.
+// connector. Material for another certificate is refused before anything
+// else, even when ACM already holds the previous serial.
 func (t *Target) Rollback(ctx context.Context, req plugin.RollbackRequest) error {
 	cfg, err := config(req.Config)
 	if err != nil {
@@ -283,10 +347,30 @@ func (t *Target) Rollback(ctx context.Context, req plugin.RollbackRequest) error
 	if req.PreviousRef == "" {
 		return fmt.Errorf("%w: no previous certificate was recorded, and ACM cannot remove an imported certificate that services may use", plugin.ErrPermanent)
 	}
-	prev := hexSerial(req.PreviousRef)
-	if prev == "" {
-		return fmt.Errorf("%w: previous ref %q is not a certificate serial", plugin.ErrInvalid, req.PreviousRef)
+	hexPart, ok := strings.CutPrefix(req.PreviousRef, refPrefix)
+	prev := hexSerial(hexPart)
+	if !ok || prev == "" {
+		return fmt.Errorf("%w: previous ref %q is not one this plugin returns (want %s<hex serial>)", plugin.ErrInvalid, req.PreviousRef, refPrefix)
 	}
+
+	var m *material
+	if req.HasPreviousMaterial() {
+		if req.PreviousSerial != "" && hexSerial(req.PreviousSerial) != prev {
+			return fmt.Errorf("%w: was handed certificate %s, but %s was live before", plugin.ErrPermanent, req.PreviousSerial, prev)
+		}
+		if req.PreviousKey.Format != plugin.KeyFormatPEM || len(req.PreviousKey.Data) == 0 {
+			return fmt.Errorf("%w: ACM needs the previous private key as PEM, got %s", plugin.ErrPermanent, req.PreviousKey.Format)
+		}
+		m, err = parseMaterial(req.PreviousCertPEM, req.PreviousChainPEM, req.PreviousKey.Data, t.now())
+		if err != nil {
+			return fmt.Errorf("%w: previous certificate %s: %v", plugin.ErrPermanent, prev, err)
+		}
+		defer m.wipe()
+		if m.serial != prev {
+			return fmt.Errorf("%w: was handed certificate %s, but %s was live before", plugin.ErrPermanent, m.serial, prev)
+		}
+	}
+
 	d, err := t.describe(ctx, cfg)
 	if err != nil {
 		return err
@@ -294,20 +378,9 @@ func (t *Target) Rollback(ctx context.Context, req plugin.RollbackRequest) error
 	if acmSerial(aws.ToString(d.Serial)) == prev {
 		return nil // already back
 	}
-	if !req.HasPreviousMaterial() {
+	if m == nil {
 		return fmt.Errorf("%w: cannot restore certificate %s: ACM does not return imported private keys, and the connector did not hand back the previous certificate and key",
 			plugin.ErrPermanent, prev)
-	}
-	if req.PreviousKey.Format != plugin.KeyFormatPEM || len(req.PreviousKey.Data) == 0 {
-		return fmt.Errorf("%w: ACM needs the previous private key as PEM, got %s", plugin.ErrPermanent, req.PreviousKey.Format)
-	}
-	m, err := parseMaterial(req.PreviousCertPEM, req.PreviousChainPEM, req.PreviousKey.Data, t.now())
-	if err != nil {
-		return fmt.Errorf("%w: previous certificate %s: %v", plugin.ErrPermanent, prev, err)
-	}
-	defer m.wipe()
-	if m.serial != prev || (req.PreviousSerial != "" && hexSerial(req.PreviousSerial) != prev) {
-		return fmt.Errorf("%w: was handed certificate %s, but %s was live before", plugin.ErrPermanent, m.serial, prev)
 	}
 	if p := typeProblem(d); p != "" {
 		return fmt.Errorf("%w: ACM certificate %s: %s", plugin.ErrPermanent, cfg.CertificateARN, p)
@@ -324,10 +397,11 @@ func (t *Target) Discard(_ context.Context, req plugin.DiscardRequest) error {
 }
 
 // importCert re-imports m under the configured ARN. Tags are not passed:
-// ACM refuses them on reimport and keeps the existing ones. When the
-// outcome is unknown (no answer from ACM), it asks ACM which certificate
-// it holds now, so a re-import that went through is not reported as a
-// failure.
+// ACM refuses them on reimport and keeps the existing ones. When the call
+// fails for any reason, it asks ACM which certificate it holds before
+// reporting the failure, since a throttled or timed out request may still
+// have been applied. ImportCertificate gets the caller's deadline minus
+// what that check needs.
 func (t *Target) importCert(ctx context.Context, cfg Config, m *material) error {
 	c, err := t.client(ctx, cfg.Region)
 	if err != nil {
@@ -341,9 +415,17 @@ func (t *Target) importCert(ctx context.Context, cfg Config, m *material) error 
 	if len(m.chainPEM) > 0 {
 		in.CertificateChain = m.chainPEM
 	}
-	out, err := c.ImportCertificate(ctx, in)
+	reserve := confirmTimeout
+	ictx := ctx
+	if dl, ok := ctx.Deadline(); ok {
+		reserve = min(confirmTimeout, time.Until(dl)/2)
+		var cancel context.CancelFunc
+		ictx, cancel = context.WithDeadline(ctx, dl.Add(-reserve))
+		defer cancel()
+	}
+	out, err := c.ImportCertificate(ictx, in)
 	if err != nil {
-		if !isAPIError(err) && t.confirmImported(ctx, cfg, m.serial) {
+		if t.confirmImported(ctx, cfg, m.serial, reserve) {
 			return nil
 		}
 		return mapErr("ImportCertificate", cfg.CertificateARN, err)
@@ -355,11 +437,11 @@ func (t *Target) importCert(ctx context.Context, cfg Config, m *material) error 
 }
 
 // confirmImported reports whether ACM holds serial under the ARN now. It
-// runs with its own short deadline so it also works after the caller's
-// context ran out.
-func (t *Target) confirmImported(ctx context.Context, cfg Config, serial string) bool {
-	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), confirmTimeout)
+// runs with its own deadline so it also works after the caller's context
+// was cancelled.
+func (t *Target) confirmImported(ctx context.Context, cfg Config, serial string, d time.Duration) bool {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d)
 	defer cancel()
-	d, err := t.describe(cctx, cfg)
-	return err == nil && acmSerial(aws.ToString(d.Serial)) == serial
+	cur, err := t.describe(cctx, cfg)
+	return err == nil && acmSerial(aws.ToString(cur.Serial)) == serial
 }

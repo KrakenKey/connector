@@ -208,27 +208,10 @@ func hexSerial(s string) string {
 	return serialHex(n)
 }
 
-// acmSerial turns ACM's serial into lowercase hex without separators
-// or leading zeros, the form the connector uses. ACM writes one hex pair
-// per byte, separated by colons ("07:71:f4"), so a serial longer than one
-// byte always has colons. LocalStack writes the serial as a decimal
-// number instead; a colon-free value longer than two characters is read
-// that way. It returns "" for anything else.
-func acmSerial(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	if s == "" {
-		return ""
-	}
-	base := 16
-	if !strings.Contains(s, ":") && len(s) > 2 {
-		base = 10
-	}
-	n, ok := new(big.Int).SetString(strings.ReplaceAll(s, ":", ""), base)
-	if !ok || n.Sign() < 0 {
-		return ""
-	}
-	return serialHex(n)
-}
+// acmSerial turns ACM's serial ("07:71:f4", one hex pair per byte) into
+// lowercase hex without separators or leading zeros. It returns "" for
+// anything else.
+func acmSerial(s string) string { return hexSerial(s) }
 
 // acmNames returns every name the ACM certificate covers now.
 func acmNames(d *types.CertificateDetail) []string {
@@ -295,8 +278,10 @@ var extKeyUsages = map[types.ExtendedKeyUsageName]x509.ExtKeyUsage{
 	types.ExtendedKeyUsageNameIpsecEndSystem:             x509.ExtKeyUsageIPSECEndSystem,
 	types.ExtendedKeyUsageNameIpsecTunnel:                x509.ExtKeyUsageIPSECTunnel,
 	types.ExtendedKeyUsageNameIpsecUser:                  x509.ExtKeyUsageIPSECUser,
-	// Client authentication may be dropped on reimport, so it is not
-	// checked.
+	// Client authentication is not checked: ACM's documentation says it
+	// may be dropped on reimport (Let's Encrypt leaves no longer carry
+	// it). This is not confirmed against ACM itself; if ACM refuses,
+	// ImportCertificate fails and nothing changes.
 }
 
 // replaceProblem returns why ACM would refuse to re-import leaf over the
@@ -310,7 +295,7 @@ func replaceProblem(d *types.CertificateDetail, leaf *x509.Certificate) string {
 	if err != nil {
 		return err.Error()
 	}
-	if d.KeyAlgorithm != "" && !sameAlgorithm(d.KeyAlgorithm, alg) {
+	if d.KeyAlgorithm != "" && d.KeyAlgorithm != alg {
 		return fmt.Sprintf("the ACM certificate has a %s key and this one %s; ACM cannot change the key type on reimport. Set key_store.key_type to match, or import a certificate with the new key type yourself first",
 			d.KeyAlgorithm, alg)
 	}
@@ -344,13 +329,6 @@ func replaceProblem(d *types.CertificateDetail, leaf *x509.Certificate) string {
 		}
 	}
 	return ""
-}
-
-// sameAlgorithm compares ACM key algorithm names. LocalStack writes
-// "EC-prime256v1" where ACM writes "EC_prime256v1".
-func sameAlgorithm(a, b types.KeyAlgorithm) bool {
-	norm := func(k types.KeyAlgorithm) string { return strings.ToUpper(strings.ReplaceAll(string(k), "-", "_")) }
-	return norm(a) == norm(b)
 }
 
 func typeProblem(d *types.CertificateDetail) string {

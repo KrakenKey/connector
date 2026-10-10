@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
+
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 
 	"github.com/aws/smithy-go"
 
@@ -75,14 +79,22 @@ func mapErr(action, certARN string, err error) error {
 		return fmt.Errorf("%w: %s: %s: %s", plugin.ErrUnavailable, op, code, msg)
 	case code == "ResourceNotFoundException":
 		return fmt.Errorf("%w: %s: %w (%s)", plugin.ErrPermanent, op, errCertNotFound, msg)
+	case transientStatus(err) || strings.Contains(code, "Throttl"):
+		// A code this plugin does not know; the HTTP status says it is
+		// worth retrying.
+		return fmt.Errorf("%w: %s: %s: %s", plugin.ErrUnavailable, op, code, msg)
 	default:
 		return fmt.Errorf("%w: %s: %s: %s", plugin.ErrPermanent, op, code, msg)
 	}
 }
 
-// isAPIError reports whether ACM answered the request, so its outcome is
-// known.
-func isAPIError(err error) bool {
-	var ae smithy.APIError
-	return errors.As(err, &ae)
+// transientStatus reports whether the HTTP response was a server error or
+// a rate limit.
+func transientStatus(err error) bool {
+	var re *awshttp.ResponseError
+	if !errors.As(err, &re) {
+		return false
+	}
+	st := re.HTTPStatusCode()
+	return st >= 500 || st == http.StatusTooManyRequests
 }

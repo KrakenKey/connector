@@ -3,6 +3,7 @@ package acmtarget
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
 	"github.com/aws/aws-sdk-go-v2/service/acm/types"
+	"github.com/aws/smithy-go/middleware"
 
 	"github.com/krakenkey/connector/pkg/plugin"
 	"github.com/krakenkey/connector/plugins/aws-acm/internal/testcert"
@@ -61,6 +63,9 @@ func TestLocalStack(t *testing.T) {
 	t.Logf("imported %s", arn)
 
 	tg := testTarget(ep)
+	tg.ClientOptions = append(tg.ClientOptions, func(o *acm.Options) {
+		o.APIOptions = append(o.APIOptions, normalizeLocalStack)
+	})
 	e := &env{t: t, ca: ca, tg: tg, arn: arn, cfg: cfgFor(region, arn), orig: first}
 
 	if p, err := tg.Validate(ctx, plugin.TargetValidateRequest{Config: e.cfg}); err != nil || len(p) != 0 {
@@ -73,8 +78,8 @@ func TestLocalStack(t *testing.T) {
 	// Re-import keeps the ARN and the tags.
 	next := ca.Issue(t, names, testcert.Options{})
 	prev := e.deploy(next)
-	if prev != first.Serial {
-		t.Errorf("previous ref = %q, want %s", prev, first.Serial)
+	if prev != "serial:"+first.Serial {
+		t.Errorf("previous ref = %q, want serial:%s", prev, first.Serial)
 	}
 	if got := e.current(); got != next.Serial {
 		t.Errorf("Current after Activate = %q, want %s", got, next.Serial)
@@ -129,4 +134,31 @@ func TestLocalStack(t *testing.T) {
 	if p, err := tg.Validate(ctx, plugin.TargetValidateRequest{Config: missing}); err != nil || len(p) != 1 || !strings.Contains(p[0], "does not exist") {
 		t.Errorf("Validate of a missing certificate = %v, %v", p, err)
 	}
+}
+
+// normalizeLocalStack rewrites the two DescribeCertificate fields where
+// LocalStack differs from ACM, so the plugin's ACM parsing is tested
+// unchanged: LocalStack writes the serial in decimal ("6493...") where ACM
+// writes colon-separated hex, and the key algorithm with a dash
+// ("EC-prime256v1") where ACM uses an underscore.
+func normalizeLocalStack(stack *middleware.Stack) error {
+	return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("NormalizeLocalStack",
+		func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
+			out, md, err := next.HandleInitialize(ctx, in)
+			if r, ok := out.Result.(*acm.DescribeCertificateOutput); ok && err == nil && r.Certificate != nil {
+				d := r.Certificate
+				if s := aws.ToString(d.Serial); s != "" && !strings.Contains(s, ":") {
+					if n, ok := new(big.Int).SetString(s, 10); ok {
+						b := n.Bytes()
+						parts := make([]string, len(b))
+						for i, x := range b {
+							parts[i] = fmt.Sprintf("%02x", x)
+						}
+						d.Serial = aws.String(strings.Join(parts, ":"))
+					}
+				}
+				d.KeyAlgorithm = types.KeyAlgorithm(strings.ReplaceAll(string(d.KeyAlgorithm), "-", "_"))
+			}
+			return out, md, err
+		}), middleware.After)
 }

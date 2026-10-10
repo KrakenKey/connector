@@ -163,7 +163,7 @@ func TestParseConfig(t *testing.T) {
 }
 
 func TestDescribe(t *testing.T) {
-	caps, err := New().Describe(context.Background())
+	caps, err := New().Describe(plugin.WithCoreFeatures(context.Background(), plugin.CoreFeatures...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,13 +228,25 @@ func TestCurrent(t *testing.T) {
 	}
 }
 
+func TestDescribeRefusesAnOlderConnector(t *testing.T) {
+	tg := New()
+	_, err := tg.Describe(context.Background()) // no core features: a connector that predates them
+	if !plugin.IsPermanent(err) || !strings.Contains(err.Error(), plugin.FeatureRollbackMaterial) {
+		t.Errorf("Describe from an older connector: %v", err)
+	}
+	p, err := tg.Validate(context.Background(), plugin.TargetValidateRequest{Config: cfgFor("us-east-1", "arn:aws:acm:us-east-1:1:certificate/x")})
+	if err != nil || len(p) != 1 || !strings.Contains(p[0], "upgrade the connector") {
+		t.Errorf("Validate after a refused Describe = %v, %v", p, err)
+	}
+}
+
 func TestNormalizeSerial(t *testing.T) {
 	for in, want := range map[string]string{
 		"00:a1:0b": "a10b", "0A:1B": "a1b", "0a": "a", "": "", "zz": "", " 01 ": "1",
 		"07:71:71:f4:6b:e7:bf:63:87:e6:ad:3c:b2:0f:d0:5b": "77171f46be7bf6387e6ad3cb20fd05b",
-		// LocalStack reports decimal.
-		"649359588532886887599900921666152440": "7d0fe64901d0bcd2bd9390659327f8",
-		"-12":                                  "",
+		// Colon-free values are hex too, never decimal.
+		"1234": "1234",
+		"-12":  "",
 	} {
 		if got := acmSerial(in); got != want {
 			t.Errorf("acmSerial(%q) = %q, want %q", in, got, want)
@@ -253,8 +265,8 @@ func TestActivateReimportsKeepingARNAndTags(t *testing.T) {
 	before := len(e.acm.Calls())
 
 	prev := e.deploy(next)
-	if prev != e.orig.Serial {
-		t.Errorf("previous ref = %q, want the old serial %s", prev, e.orig.Serial)
+	if prev != "serial:"+e.orig.Serial {
+		t.Errorf("previous ref = %q, want serial:%s", prev, e.orig.Serial)
 	}
 	c := e.acm.Cert(e.arn)
 	if c == nil || c.Leaf.SerialNumber.Cmp(next.Cert.SerialNumber) != 0 || c.Imports != 2 {
@@ -433,8 +445,8 @@ func TestActivateWithUnknownOutcome(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	prev, err := e.tg.Activate(ctx, plugin.ActivateRequest{Config: e.cfg, StagedRef: ref})
-	if err != nil || prev != e.orig.Serial {
-		t.Errorf("Activate = %q, %v; want success with previous %s", prev, err, e.orig.Serial)
+	if err != nil || prev != "serial:"+e.orig.Serial {
+		t.Errorf("Activate = %q, %v; want success with previous serial:%s", prev, err, e.orig.Serial)
 	}
 	if got := e.current(); got != next.Serial {
 		t.Errorf("serves %s, want %s", got, next.Serial)
@@ -496,6 +508,14 @@ func TestRollback(t *testing.T) {
 		t.Error("second Rollback imported again")
 	}
 
+	// Material that does not match the previous ref is refused even when
+	// ACM already holds the previous serial.
+	if err := e.tg.Rollback(ctx, e.rollbackReq(prev, &wrong)); !plugin.IsPermanent(err) || !strings.Contains(err.Error(), "was live before") {
+		t.Errorf("no-op rollback with the wrong material: %v", err)
+	}
+	if err := e.tg.Rollback(ctx, e.rollbackReq(e.orig.Serial, &e.orig)); !errors.Is(err, plugin.ErrInvalid) {
+		t.Errorf("rollback with a bare serial as previous ref: %v", err)
+	}
 	if err := e.tg.Rollback(ctx, e.rollbackReq("", &e.orig)); !plugin.IsPermanent(err) {
 		t.Errorf("rollback with no previous ref: %v", err)
 	}
@@ -562,11 +582,114 @@ func TestStagedMaterialExpires(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.tg.mu.Lock()
+	s := e.tg.staged[old]
+	e.tg.mu.Unlock()
 	now = now.Add(2 * time.Hour)
-	if _, err := e.tg.Stage(context.Background(), e.stageReq(e.ca.Issue(t, names, testcert.Options{}))); err != nil {
-		t.Fatal(err)
-	}
+	// No other Stage in between: Activate itself sweeps.
 	if _, err := e.tg.Activate(context.Background(), plugin.ActivateRequest{Config: e.cfg, StagedRef: old}); !errors.Is(err, plugin.ErrNotFound) {
 		t.Errorf("Activate of abandoned staged material: %v", err)
+	}
+	if s.m.keyPEM != nil {
+		t.Error("expired staged key not wiped")
+	}
+}
+
+func TestStagedMaterialIsWipedWithoutFurtherCalls(t *testing.T) {
+	e := setup(t)
+	e.tg.ttl = 50 * time.Millisecond
+	ref, err := e.tg.Stage(context.Background(), e.stageReq(e.ca.Issue(t, names, testcert.Options{})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tg.mu.Lock()
+	s := e.tg.staged[ref]
+	e.tg.mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		e.tg.mu.Lock()
+		_, still := e.tg.staged[ref]
+		wiped := s.m.keyPEM == nil
+		e.tg.mu.Unlock()
+		if !still && wiped {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("staged key still in memory after its TTL")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Regression for a review probe: ACM applies the import, but the call ends
+// with a throttling error. Activate must notice the import went through,
+// and a repeated Activate must not report the new serial as the previous
+// one.
+func TestImportAppliedButThrottled(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	next := e.ca.Issue(t, names, testcert.Options{})
+	ref, err := e.tg.Stage(ctx, e.stageReq(next))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.acm.Fail("ImportCertificate", fakeacm.Fault{After: true, Code: "ThrottlingException", Message: "Rate exceeded", Times: 2})
+	prev, err := e.tg.Activate(ctx, plugin.ActivateRequest{Config: e.cfg, StagedRef: ref})
+	if err != nil || prev != "serial:"+e.orig.Serial {
+		t.Fatalf("Activate = %q, %v; want success with previous serial:%s", prev, err, e.orig.Serial)
+	}
+	if got := e.current(); got != next.Serial {
+		t.Fatalf("ACM serves %s, want %s", got, next.Serial)
+	}
+
+	// Activating the same certificate again: nothing to import, and the
+	// previous certificate is unknown.
+	before := e.acm.Cert(e.arn).Imports
+	ref, err = e.tg.Stage(ctx, e.stageReq(next))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev, err = e.tg.Activate(ctx, plugin.ActivateRequest{Config: e.cfg, StagedRef: ref})
+	if err != nil || prev != "" {
+		t.Errorf("second Activate = %q, %v; want an empty previous ref", prev, err)
+	}
+	if e.acm.Cert(e.arn).Imports != before {
+		t.Error("second Activate imported again")
+	}
+
+	// A rollback to the original still works with its material.
+	if err := e.tg.Rollback(ctx, e.rollbackReq("serial:"+e.orig.Serial, &e.orig)); err != nil || e.current() != e.orig.Serial {
+		t.Errorf("Rollback = %v; ACM serves %s", err, e.current())
+	}
+}
+
+func TestPermanentImportErrorStillChecksACM(t *testing.T) {
+	// Even a refusal is checked: the error may come from a retry after a
+	// first attempt that went through.
+	e := setup(t)
+	next := e.ca.Issue(t, names, testcert.Options{})
+	ref, err := e.tg.Stage(context.Background(), e.stageReq(next))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.acm.Fail("ImportCertificate", fakeacm.Fault{After: true, Code: "ValidationException", Message: "odd", Times: 1})
+	calls := len(e.acm.Calls())
+	if _, err := e.tg.Activate(context.Background(), plugin.ActivateRequest{Config: e.cfg, StagedRef: ref}); err != nil {
+		t.Errorf("Activate after an applied but refused import: %v", err)
+	}
+	if got := e.acm.Calls()[calls:]; countCalls(got, "DescribeCertificate") != 2 {
+		t.Errorf("calls = %v, want a DescribeCertificate check after the failed import", got)
+	}
+}
+
+func TestUnknownErrorCodesUseTheHTTPStatus(t *testing.T) {
+	e := setup(t)
+	e.acm.Fail("DescribeCertificate", fakeacm.Fault{Code: "SomethingNewException", Message: "x", Status: http.StatusServiceUnavailable})
+	if _, err := e.tg.Current(context.Background(), plugin.CurrentRequest{Config: e.cfg}); !errors.Is(err, plugin.ErrUnavailable) || plugin.IsPermanent(err) {
+		t.Errorf("unknown code with 503: %v", err)
+	}
+	e.acm.Fail("DescribeCertificate", fakeacm.Fault{Code: "SomethingNewException", Message: "x", Status: http.StatusBadRequest})
+	if _, err := e.tg.Current(context.Background(), plugin.CurrentRequest{Config: e.cfg}); !plugin.IsPermanent(err) {
+		t.Errorf("unknown code with 400: %v", err)
 	}
 }

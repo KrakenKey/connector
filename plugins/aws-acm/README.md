@@ -19,16 +19,18 @@ certificates.
 | `Validate` | `DescribeCertificate`: the certificate must exist in the configured region and be an imported certificate. |
 | `Current` | `DescribeCertificate`: reports the serial ACM holds under the ARN. |
 | `Stage` | `DescribeCertificate` only. Checks the certificate, chain and key (key matches, valid now, key at most 5 KB) and that ACM will take it as a replacement (same key type, no key usage or extended key usage removed, every name the ACM certificate covers now is still covered). ACM has no staging, so nothing changes; the checked material waits in the plugin's memory for `Activate`. |
-| `Activate` | `ImportCertificate` with the ARN, certificate, chain and key. The previous ref is the serial ACM held before. If it fails, ACM still holds the previous certificate. If ACM's answer is lost (for example a timeout), the plugin asks ACM which certificate it holds before reporting a failure. |
-| `Rollback` | `ImportCertificate` with the previous certificate, chain and key, which the connector hands back (see below). |
-| `Discard` | Drops staged material from memory. |
+| `Activate` | `ImportCertificate` with the ARN, certificate, chain and key. The previous ref is `serial:<hex>`, the serial ACM held before. If the call fails for any reason (including throttling or a timeout after ACM applied it), the plugin asks ACM which certificate it holds before reporting a failure; a failure means ACM still holds the previous certificate. If ACM already holds the new certificate, nothing is imported and the previous ref is empty, so that activation cannot be rolled back. |
+| `Rollback` | `ImportCertificate` with the previous certificate, chain and key, which the connector hands back (see below). Material for any other serial than the one the previous ref names is refused. |
+| `Discard` | Drops staged material from memory and wipes the key bytes. |
 
 ACM never returns an imported certificate's private key, so the plugin
 cannot keep the previous certificate itself. It sets the
 `rollback_needs_material` capability, and the connector hands back the
 certificate it last deployed to this target and its key when it rolls back.
 That needs a key store that allows export (the built-in `local` key store
-does). Without the material, for example on the very first deployment over
+does), and a connector that supports it: the plugin refuses to start
+(`Describe` fails) with a connector that does not send the
+`rollback_material` core feature. Without the material, for example on the very first deployment over
 a certificate you imported by hand, a failed deployment is not rolled back
 and the new certificate stays in ACM.
 
@@ -132,8 +134,24 @@ IAM roles for service accounts), the ECS task role, and the EC2 instance
 profile. The connector passes its environment to the plugin, so set these
 for the connector. Prefer a task role or instance profile to static keys.
 
-`AWS_ENDPOINT_URL_ACM` points the plugin at another ACM endpoint (for
-example LocalStack); leave it unset in production.
+### Environment that decides where the key goes
+
+`ImportCertificate` carries the private key, so anyone who can change these
+can make the plugin send keys and AWS credentials elsewhere. Keep them unset
+in production, or set them only where you control the connector's
+environment and AWS config files:
+
+- `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_ACM`, and `endpoint_url` in the
+  shared config file (`AWS_CONFIG_FILE`, `AWS_PROFILE`). The tests use
+  `AWS_ENDPOINT_URL_ACM` to reach a fake ACM.
+  `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true` makes the SDK ignore all of
+  them.
+- `AWS_CA_BUNDLE`, `SSL_CERT_FILE` and `SSL_CERT_DIR`, which decide which
+  certificate authorities the plugin trusts for the ACM endpoint.
+- `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`.
+
+The connector removes its own KrakenKey credentials from the plugin's
+environment and passes everything else.
 
 ## Permissions
 
@@ -184,9 +202,17 @@ and network errors are retried.
 - Dropping a name: the plugin refuses a certificate that does not cover a
   name the ACM certificate covers now. If that is intended, re-import a
   certificate without the name yourself first.
-- Staged material lives in the plugin process's memory for at most an hour.
-  The connector activates right after staging; if the plugin restarts in
+- Staged material lives only in the plugin process's memory. A timer wipes
+  it an hour after `Stage` if `Activate` or `Discard` has not taken it, so
+  key bytes do not outlive that hour while the process keeps running. The
+  connector activates right after staging; if the plugin restarts in
   between, the deployment is retried on the next pass.
+- Client Authentication: the plugin lets a new certificate drop the
+  Client Authentication extended key usage that the ACM certificate has,
+  because ACM's documentation says reimport allows that (Let's Encrypt
+  leaves no longer carry it). This has not been confirmed against ACM
+  itself. If ACM refuses, `Activate` fails with ACM's message and nothing
+  changes; please report it.
 - `ImportCertificate` is limited to one request per second per account and
   region. Throttled calls are retried by the SDK and, if that is not enough,
   on the next pass.
@@ -208,5 +234,7 @@ docker stop localstack-acm
 
 `4.14.0` is the last LocalStack community image that starts without an
 account token; later images need `LOCALSTACK_AUTH_TOKEN`. LocalStack differs
-from ACM in a few ways the tests allow for: it reports serials in decimal,
-spells key algorithms with a dash, and drops tags on reimport.
+from ACM: it reports serials in decimal, spells key algorithms with a dash,
+and drops tags on reimport. The LocalStack test rewrites the first two in a
+test-only SDK middleware, so the plugin itself only parses ACM's formats,
+and it does not check tags.

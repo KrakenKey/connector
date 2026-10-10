@@ -70,10 +70,11 @@ func TestHarness(t *testing.T) {
 		t.Fatalf("Describe = %+v, %v", caps, err)
 	}
 	ks := plugin.KeyStoreCapabilities{Provides: []plugin.KeyFormat{plugin.KeyFormatPEM}, Exportable: true, KeyTypes: []plugin.KeyType{plugin.KeyTypeECDSAP256}}
-	if f, err := plugin.Match(ks, caps, plugin.KeyTypeECDSAP256); err != nil || f != plugin.KeyFormatPEM {
+	f, err := plugin.Match(ks, caps, plugin.KeyTypeECDSAP256)
+	if err != nil || f != plugin.KeyFormatPEM {
 		t.Errorf("Match = %q, %v", f, err)
 	}
-	if why := plugin.RollbackUnavailable(ks, caps); why != "" {
+	if why := plugin.RollbackUnavailable(ks, caps, f); why != "" {
 		t.Errorf("rollback unavailable with an exportable key store: %s", why)
 	}
 
@@ -95,7 +96,7 @@ func TestHarness(t *testing.T) {
 		t.Fatalf("Stage: %v", err)
 	}
 	prev, err := tg.Activate(ctx, plugin.ActivateRequest{Config: cfg, StagedRef: ref, CertificateID: "1", Label: "alb"})
-	if err != nil || prev != first.Serial {
+	if err != nil || prev != "serial:"+first.Serial {
 		t.Fatalf("Activate = %q, %v", prev, err)
 	}
 	if cur, err := tg.Current(ctx, plugin.CurrentRequest{Config: cfg}); err != nil || cur != next.Serial {
