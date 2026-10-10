@@ -484,6 +484,13 @@ most 1 minute for quick calls such as `Describe` and `Validate`). A rollback
 gets the longer of `call_timeout` and 5 minutes. A plugin that exits is
 started again on the next call.
 
+Plugins maintained in this repository, each its own Go module under
+[`plugins/`](plugins):
+
+| Plugin | Kind | What it does |
+|--------|------|--------------|
+| [`aws-acm`](plugins/aws-acm) | target | Re-imports certificates into an existing AWS Certificate Manager certificate, keeping its ARN. |
+
 ### Audit log
 
 Every step that changes something is appended to `audit_log` and synced to
