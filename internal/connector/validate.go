@@ -117,6 +117,17 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 			bad("KrakenKey API: %v", err)
 			continue
 		}
+		if c.Status == api.StatusAwaitingCSR {
+			fmt.Fprintf(w, "  KrakenKey: status %s: waiting for this connector to issue it (the first pass sends the CSR)\n", c.Status)
+			switch {
+			case len(c.RequestedNames) == 0:
+				bad("KrakenKey did not say which names certificate %d is for (no requestedNames)", cert.ID)
+			case !certutil.SameNames(c.RequestedNames, cert.Names):
+				bad("config names %v differ from the names KrakenKey is waiting for %v",
+					certutil.NormalizeNames(cert.Names), certutil.NormalizeNames(c.RequestedNames))
+			}
+			continue
+		}
 		fmt.Fprintf(w, "  KrakenKey: status %s", c.Status)
 		if c.ExpiresAt != nil {
 			fmt.Fprintf(w, ", expires %s", c.ExpiresAt.UTC().Format(time.RFC3339))
