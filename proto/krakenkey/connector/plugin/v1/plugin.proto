@@ -1,0 +1,334 @@
+// Plugin protocol for the KrakenKey connector.
+//
+// The connector core talks to plugins over gRPC using hashicorp/go-plugin.
+// A plugin binary serves one or both of the services below:
+//
+//   - KeyStoreService decides where a private key lives and produces CSRs.
+//   - TargetService installs an issued certificate somewhere.
+//
+// Plugin-specific settings travel as a JSON object in config_json. The core
+// fills it from the plugin's block in the connector config file, without the
+// fields the core owns (plugin, label, key_type, verify, then).
+//
+// Error codes. Plugins return gRPC status codes with these meanings, and the
+// core acts on them:
+//
+//   - FAILED_PRECONDITION: permanent for this input. Retrying the same call
+//     will not help (bad settings, key not exportable, unsupported key type,
+//     nothing to roll back to). The core reports it and does not retry the
+//     step in the same pass.
+//   - INVALID_ARGUMENT: the request itself is malformed. Treated like
+//     FAILED_PRECONDITION.
+//   - NOT_FOUND: a key_ref, staged_ref or previous_ref does not exist.
+//   - UNAVAILABLE: transient (a remote API is down, a lock is held). The core
+//     retries on a later pass.
+//   - UNIMPLEMENTED: the plugin does not support this call. For optional
+//     calls (KeyStoreService.Validate, KeyStoreService.PublicKey,
+//     TargetService.Discard, TargetService.Current) the core treats it as
+//     "not supported" and carries on.
+//   - DEADLINE_EXCEEDED, CANCELED: the core's deadline or cancellation.
+//   - Anything else (UNKNOWN, INTERNAL, ...) is treated as transient.
+//
+// Secrets. KeyMaterial carries private keys and passwords. Neither side may
+// log request or response messages that contain it (CreateCSR responses do
+// not; ExportResponse and StageRequest do).
+syntax = "proto3";
+
+package krakenkey.connector.plugin.v1;
+
+option go_package = "github.com/krakenkey/connector/proto/krakenkey/connector/plugin/v1;pluginv1";
+
+// KeyType is the private key algorithm and size.
+enum KeyType {
+  KEY_TYPE_UNSPECIFIED = 0;
+  KEY_TYPE_ECDSA_P256 = 1;
+  KEY_TYPE_ECDSA_P384 = 2;
+  KEY_TYPE_RSA_2048 = 3;
+  KEY_TYPE_RSA_3072 = 4;
+  KEY_TYPE_RSA_4096 = 5;
+}
+
+// KeyFormat is how key material is handed from a key store to a target.
+enum KeyFormat {
+  KEY_FORMAT_UNSPECIFIED = 0;
+  // A reference to a key held in a vault or HSM. The key never leaves it.
+  // KeyMaterial.ref is set and data is empty.
+  KEY_FORMAT_VAULT_REF = 1;
+  // KeyMaterial.data is the private key alone, PKCS#8, PEM encoded
+  // ("PRIVATE KEY" block).
+  KEY_FORMAT_PEM = 2;
+  // KeyMaterial.data is a PKCS#12 bundle holding the private key, the leaf
+  // and the intermediates as passed to Complete. KeyMaterial.password
+  // protects it and may be empty.
+  KEY_FORMAT_PFX = 3;
+}
+
+// KeyMaterial is a key in one of the KeyFormat encodings. Never log it.
+message KeyMaterial {
+  KeyFormat format = 1;
+  // PEM or PFX bytes. Empty for KEY_FORMAT_VAULT_REF.
+  bytes data = 2;
+  // Vault reference for KEY_FORMAT_VAULT_REF.
+  string ref = 3;
+  // Password protecting a PFX bundle, if any.
+  string password = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Key store
+// ---------------------------------------------------------------------------
+
+message KeyStoreCapabilities {
+  // Key formats this key store can hand to a target.
+  repeated KeyFormat provides = 1;
+  // Whether Export can return private key bytes (KEY_FORMAT_PEM or
+  // KEY_FORMAT_PFX).
+  bool exportable = 2;
+  // Key types CreateCSR accepts.
+  repeated KeyType key_types = 3;
+}
+
+message KeyStoreServiceDescribeRequest {}
+
+message KeyStoreServiceDescribeResponse {
+  KeyStoreCapabilities capabilities = 1;
+}
+
+message KeyStoreServiceValidateRequest {
+  bytes config_json = 1;
+  string certificate_id = 2;
+}
+
+message KeyStoreServiceValidateResponse {
+  // Human readable problems. Empty means the settings are usable.
+  repeated string problems = 1;
+}
+
+message CreateCSRRequest {
+  bytes config_json = 1;
+  // KrakenKey certificate id, for naming keys.
+  string certificate_id = 2;
+  // DNS names for the CSR. The first is used as the subject common name.
+  repeated string names = 3;
+  KeyType key_type = 4;
+}
+
+message CreateCSRResponse {
+  // PEM encoded PKCS#10 certificate request.
+  string csr_pem = 1;
+  // Opaque reference to the new key, passed back in later calls.
+  string key_ref = 2;
+}
+
+message PublicKeyRequest {
+  bytes config_json = 1;
+  string key_ref = 2;
+}
+
+message PublicKeyResponse {
+  // DER encoded SubjectPublicKeyInfo of the key.
+  bytes spki_der = 1;
+}
+
+message CompleteRequest {
+  bytes config_json = 1;
+  string key_ref = 2;
+  // Issued leaf certificate, PEM.
+  string cert_pem = 3;
+  // Intermediate certificates, PEM.
+  string chain_pem = 4;
+}
+
+message CompleteResponse {
+  // Reference to use from now on. May equal the request's key_ref.
+  string key_ref = 1;
+}
+
+message ExportRequest {
+  bytes config_json = 1;
+  string key_ref = 2;
+  // Requested format.
+  KeyFormat format = 3;
+}
+
+message ExportResponse {
+  KeyMaterial key = 1;
+}
+
+message ReleaseRequest {
+  bytes config_json = 1;
+  string key_ref = 2;
+}
+
+message ReleaseResponse {}
+
+// KeyStoreService owns private keys.
+service KeyStoreService {
+  // Describe reports what the key store can do.
+  rpc Describe(KeyStoreServiceDescribeRequest) returns (KeyStoreServiceDescribeResponse);
+  // Validate checks the key store settings without changing anything.
+  // Optional: UNIMPLEMENTED means "nothing to check".
+  rpc Validate(KeyStoreServiceValidateRequest) returns (KeyStoreServiceValidateResponse);
+  // CreateCSR creates a new key and returns a CSR signed by it.
+  rpc CreateCSR(CreateCSRRequest) returns (CreateCSRResponse);
+  // PublicKey returns the public half of a key, so the core can check that
+  // the key store still holds the key for a certificate. NOT_FOUND if the key
+  // is gone. Optional: UNIMPLEMENTED makes the core rely on its own record of
+  // the public key.
+  rpc PublicKey(PublicKeyRequest) returns (PublicKeyResponse);
+  // Complete attaches the issued certificate to the key, for key stores that
+  // track certificates next to keys. The core calls it at most once per
+  // issued certificate, before any Export of that key.
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+  // Export returns key material in the requested format:
+  //   - KEY_FORMAT_VAULT_REF: always allowed when listed in provides.
+  //   - KEY_FORMAT_PEM, KEY_FORMAT_PFX: only when exportable is true;
+  //     otherwise FAILED_PRECONDITION. PFX bundles include the certificates
+  //     passed to Complete.
+  // A format not listed in provides returns FAILED_PRECONDITION.
+  rpc Export(ExportRequest) returns (ExportResponse);
+  // Release tells the key store that no target uses the key any more. The key
+  // store may delete it. Releasing an unknown key is not an error.
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Target
+// ---------------------------------------------------------------------------
+
+message TargetCapabilities {
+  // Key formats the target can install.
+  repeated KeyFormat accepts = 1;
+  // The target needs a key store that allows export, even when it is given
+  // a vault reference.
+  bool needs_exportable_key = 2;
+  // Rollback can restore the previous certificate.
+  bool supports_rollback = 3;
+  // Key types the target can serve. Empty means any.
+  repeated KeyType key_types = 4;
+  // Default time the core keeps checking the endpoint after Activate, in
+  // seconds. Zero means the core default.
+  int64 default_verify_window_seconds = 5;
+  // The target picks up changes on its own schedule (for example a cloud
+  // service that polls a vault). The core reports verification failures for
+  // such targets but does not roll them back.
+  bool propagates_async = 6;
+}
+
+message TargetServiceDescribeRequest {}
+
+message TargetServiceDescribeResponse {
+  TargetCapabilities capabilities = 1;
+}
+
+message TargetServiceValidateRequest {
+  bytes config_json = 1;
+  string certificate_id = 2;
+  // Target label from the connector config.
+  string label = 3;
+}
+
+message TargetServiceValidateResponse {
+  // Human readable problems. Empty means the config is usable.
+  repeated string problems = 1;
+}
+
+message CurrentRequest {
+  bytes config_json = 1;
+  string certificate_id = 2;
+  string label = 3;
+}
+
+message CurrentResponse {
+  // Serial number (lowercase hex) of the certificate this target is set up
+  // to serve right now, as the target itself records it (for example the
+  // certificate file on disk, or the certificate bound to a listener). It is
+  // not a TLS check of the endpoint. Empty means the target cannot tell or
+  // nothing is installed; that is not an error.
+  string serial = 1;
+}
+
+message StageRequest {
+  bytes config_json = 1;
+  string certificate_id = 2;
+  // Target label from the connector config.
+  string label = 3;
+  // Leaf certificate, PEM.
+  string cert_pem = 4;
+  // Intermediates, PEM.
+  string chain_pem = 5;
+  // Leaf followed by intermediates, PEM.
+  string fullchain_pem = 6;
+  // Never log this message: it carries the key.
+  KeyMaterial key = 7;
+  // Serial number of the leaf, lowercase hex.
+  string serial = 8;
+}
+
+message StageResponse {
+  // Opaque reference passed to Activate or Discard.
+  string staged_ref = 1;
+}
+
+message ActivateRequest {
+  bytes config_json = 1;
+  string staged_ref = 2;
+  string certificate_id = 3;
+  string label = 4;
+}
+
+message ActivateResponse {
+  // Opaque reference to what was live before, for Rollback.
+  string previous_ref = 1;
+}
+
+message RollbackRequest {
+  bytes config_json = 1;
+  string previous_ref = 2;
+  string certificate_id = 3;
+  string label = 4;
+}
+
+message RollbackResponse {}
+
+message DiscardRequest {
+  bytes config_json = 1;
+  string staged_ref = 2;
+  string certificate_id = 3;
+  string label = 4;
+}
+
+message DiscardResponse {}
+
+// TargetService installs certificates.
+//
+// A deployment is Stage, then Activate, then (if verification fails)
+// Rollback. The core keeps the staged_ref and previous_ref in its state, so
+// these calls may come from a later connector process after a restart.
+service TargetService {
+  // Describe reports what the target can do.
+  rpc Describe(TargetServiceDescribeRequest) returns (TargetServiceDescribeResponse);
+  // Validate checks the target config without changing anything.
+  rpc Validate(TargetServiceValidateRequest) returns (TargetServiceValidateResponse);
+  // Current reports the serial of the certificate installed now (see
+  // CurrentResponse). The core uses it in validate and to recover a
+  // deployment interrupted during Activate. Optional: UNIMPLEMENTED is
+  // treated as "cannot tell".
+  rpc Current(CurrentRequest) returns (CurrentResponse);
+  // Stage prepares a certificate without making it live.
+  rpc Stage(StageRequest) returns (StageResponse);
+  // Activate makes a staged certificate live and consumes the staged_ref.
+  // If Activate fails, the target must leave what was live before in place,
+  // undoing any partial change itself; the core does not call Rollback after
+  // a failed Activate. The core then calls Discard with the same staged_ref.
+  rpc Activate(ActivateRequest) returns (ActivateResponse);
+  // Rollback restores exactly what was live before the Activate that
+  // returned previous_ref. If nothing was installed before, it removes what
+  // that Activate installed. A target that cannot do this returns
+  // FAILED_PRECONDITION. NOT_FOUND if previous_ref is unknown.
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+  // Discard deletes staged material that will not be activated. It must be
+  // idempotent: an unknown or already consumed staged_ref is not an error.
+  // Optional: UNIMPLEMENTED is ignored.
+  rpc Discard(DiscardRequest) returns (DiscardResponse);
+}
