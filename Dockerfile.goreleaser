@@ -1,5 +1,26 @@
 # Release image, built by GoReleaser (dockers_v2) from the binaries it has
-# already compiled. The runtime matches Dockerfile, which builds from source.
+# already compiled: the connector and the plugins in this repository. The
+# runtime matches Dockerfile, which builds from source.
+
+# Lay out the plugins as <name>/<version>/krakenkey-connector-plugin-<name>
+# and write plugins.lock from the binaries actually copied in. This only
+# moves and hashes files, so it runs on the build machine's platform.
+FROM --platform=$BUILDPLATFORM alpine:3.24 AS plugins
+ARG TARGETPLATFORM
+ARG VERSION
+COPY ${TARGETPLATFORM}/krakenkey-connector-plugin-* /in/
+RUN set -eu; \
+    test -n "${VERSION}"; \
+    umask 022; \
+    out=/out/usr/lib/krakenkey-connector/plugins; \
+    for bin in /in/krakenkey-connector-plugin-*; do \
+      file=$(basename "$bin"); \
+      install -D -m 0755 "$bin" "$out/${file#krakenkey-connector-plugin-}/${VERSION}/$file"; \
+    done; \
+    cd "$out"; \
+    sha256sum -- */*/krakenkey-connector-plugin-* > plugins.lock; \
+    chmod 0644 plugins.lock; \
+    cat plugins.lock
 
 # Alpine rather than distroless so exec targets and then.exec hooks have a
 # shell available.
@@ -11,6 +32,9 @@ RUN apk add --no-cache ca-certificates \
     && chmod 700 /var/lib/krakenkey-connector
 ARG TARGETPLATFORM
 COPY ${TARGETPLATFORM}/krakenkey-connector /usr/local/bin/krakenkey-connector
+# Root-owned and read-only for the connector's user, as the system plugin
+# directory requires.
+COPY --from=plugins --chown=0:0 /out/usr/lib/krakenkey-connector /usr/lib/krakenkey-connector
 USER connector
 VOLUME /var/lib/krakenkey-connector
 ENTRYPOINT ["/usr/local/bin/krakenkey-connector"]

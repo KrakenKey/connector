@@ -330,8 +330,9 @@ messages do not include them.
 
 ## Building
 
-Release archives for plugins are not published yet. To build from a clone of
-the repository:
+Every connector release includes this plugin, in the container image and as
+a release archive; see [Included plugins](../../README.md#included-plugins).
+To build it from a clone of the repository instead:
 
 ```sh
 cd plugins/azure-keyvault

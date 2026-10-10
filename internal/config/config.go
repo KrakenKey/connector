@@ -28,6 +28,7 @@ const (
 	DefaultAPIURL        = "https://api.krakenkey.io"
 	DefaultCheckInterval = 6 * time.Hour
 	DefaultDataDir       = "/var/lib/krakenkey-connector"
+	DefaultPluginDir     = "/usr/lib/krakenkey-connector/plugins"
 	DefaultKeyType       = plugin.KeyTypeECDSAP256
 	DefaultVerifyPort    = 443
 	DefaultVerifyWindow  = 10 * time.Minute
@@ -54,6 +55,7 @@ type Config struct {
 	KrakenKey     KrakenKey             `yaml:"krakenkey"`
 	CheckInterval time.Duration         `yaml:"check_interval"`
 	DataDir       string                `yaml:"data_dir"`
+	PluginDir     string                `yaml:"plugin_dir"`
 	AuditLog      string                `yaml:"audit_log"`
 	Plugins       map[string]PluginSpec `yaml:"plugins"`
 	Certificates  []Certificate         `yaml:"certificates"`
@@ -66,12 +68,14 @@ type KrakenKey struct {
 
 // PluginSpec declares an external plugin.
 type PluginSpec struct {
-	// Version selects <data_dir>/plugins/<name>/<version>/krakenkey-connector-plugin-<name>.
+	// Version selects <data_dir>/plugins/<name>/<version>/krakenkey-connector-plugin-<name>,
+	// or, when that does not exist, the same layout under plugin_dir.
 	Version string `yaml:"version"`
 	// Path overrides the binary location.
 	Path string `yaml:"path"`
 	// SHA256 is the expected checksum of the binary, hex encoded. Required
-	// for plugins installed by version; optional with path.
+	// for plugins installed under data_dir; optional with path and for
+	// plugins in plugin_dir, which plugin_dir/plugins.lock pins.
 	SHA256 string `yaml:"sha256"`
 	// CallTimeout bounds each call to the plugin. Default 5m.
 	CallTimeout time.Duration `yaml:"call_timeout"`
@@ -161,7 +165,8 @@ func settingsJSON(m map[string]any) (json.RawMessage, error) {
 }
 
 // Load reads, defaults and validates the config file at path. The
-// KK_API_URL environment variable overrides krakenkey.api_url.
+// KK_API_URL environment variable overrides krakenkey.api_url, and
+// KK_PLUGIN_DIR overrides plugin_dir.
 func Load(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -210,6 +215,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.DataDir == "" {
 		c.DataDir = DefaultDataDir
+	}
+	if v := os.Getenv("KK_PLUGIN_DIR"); v != "" {
+		c.PluginDir = v
+	}
+	if c.PluginDir == "" {
+		c.PluginDir = DefaultPluginDir
 	}
 	if c.AuditLog == "" {
 		c.AuditLog = filepath.Join(c.DataDir, "audit.jsonl")
@@ -269,6 +280,9 @@ func (c *Config) Validate() error {
 	if !filepath.IsAbs(c.AuditLog) {
 		add("audit_log %q must be an absolute path", c.AuditLog)
 	}
+	if !filepath.IsAbs(c.PluginDir) {
+		add("plugin_dir %q must be an absolute path", c.PluginDir)
+	}
 
 	for name, spec := range c.Plugins {
 		switch {
@@ -286,12 +300,13 @@ func (c *Config) Validate() error {
 		if spec.Path != "" && !filepath.IsAbs(spec.Path) {
 			add("plugins.%s: path must be absolute", name)
 		}
+		// sha256 is required for plugins installed under data_dir, but
+		// whether a plugin is there or in plugin_dir is only known when it
+		// is started, so the plugin host checks that.
 		if spec.SHA256 != "" {
 			if b, err := hex.DecodeString(spec.SHA256); err != nil || len(b) != 32 {
 				add("plugins.%s: sha256 must be 64 hex characters", name)
 			}
-		} else if spec.Path == "" {
-			add("plugins.%s: sha256 is required for plugins installed by version", name)
 		}
 		if spec.CallTimeout < time.Second {
 			add("plugins.%s: call_timeout must be at least 1s", name)

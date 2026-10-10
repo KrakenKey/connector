@@ -152,10 +152,19 @@ jobs:
       - name: Check config
         run: goreleaser check
 
-      # Builds every archive and both image architectures without publishing
-      # or signing, so a broken release config shows up here, not on a tag.
+      # Builds every archive (the connector and each plugin) and both image
+      # architectures without publishing or signing, so a broken release
+      # config shows up here, not on a tag.
       - name: Snapshot build
         run: goreleaser release --snapshot --clean --skip=publish,sign
+
+      # The amd64 snapshot image must carry the plugin binaries GoReleaser
+      # built, with a plugins.lock that matches them, and the connector must
+      # find and start them as the image's non-root user.
+      - name: Check the plugins in the image
+        run: |
+          version=$(jq -r .version dist/metadata.json)
+          scripts/check-image-plugins.sh "ghcr.io/krakenkey/connector:v${version}-amd64" "$version" dist
 
   proto:
     name: Generated code is current

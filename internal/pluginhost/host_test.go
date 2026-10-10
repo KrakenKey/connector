@@ -191,10 +191,7 @@ func TestExternalPluginBinaryChecks(t *testing.T) {
 	defer h.Close()
 
 	want := filepath.Join(dataDir, "plugins", "azure-keyvault", "0.1.0", BinaryName("azure-keyvault"))
-	if p, stop, _ := h.BinaryPath("azure-keyvault"); p != want || stop != dataDir {
-		t.Errorf("BinaryPath = %s (stop %s), want %s", p, stop, want)
-	}
-	if _, err := h.KeyStore("azure-keyvault"); err == nil || !strings.Contains(err.Error(), want) {
+	if _, err := h.KeyStore("azure-keyvault"); err == nil || !strings.Contains(err.Error(), want+" does not exist") {
 		t.Errorf("missing binary: %v", err)
 	}
 
@@ -210,6 +207,10 @@ func TestExternalPluginBinaryChecks(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), wantErr) {
 			t.Errorf("%s: err = %v, want %q", name, err, wantErr)
 		}
+	}
+
+	if loc, stop, err := h.find("azure-keyvault", h.specs["azure-keyvault"]); err != nil || loc.Path != want || loc.Source != SourceDataDir || stop != dataDir {
+		t.Errorf("find = %+v (stop %s), %v; want %s", loc, stop, err, want)
 	}
 
 	check("well-formed binary with the wrong checksum", "checksum mismatch")

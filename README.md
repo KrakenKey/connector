@@ -63,8 +63,10 @@ plugins, places such as key vaults and cloud load balancers.
   its environment or memory through `/proc`. Root still can. Keys, tokens
   and the identity key are never logged.
 - Plugins and deployment commands run with the connector's permissions. Only
-  install plugins you trust. Plugins installed by version must have their
-  `sha256` pinned in the config.
+  install plugins you trust. Plugins you install under the data directory
+  must have their `sha256` pinned in the config; the plugins in the
+  container image are pinned by its `plugins.lock` (see
+  [External plugins](#external-plugins)).
 - Plugins get the connector's environment without `KK_API_KEY`,
   `KK_API_KEY_FILE`, `CREDENTIALS_DIRECTORY` and `KK_ENROLLMENT_TOKEN*`.
   Everything else is passed on, because cloud SDKs read their credentials and
@@ -85,7 +87,8 @@ plugins, places such as key vaults and cloud load balancers.
 ### Release binaries
 
 Each [release](https://github.com/KrakenKey/connector/releases) has archives
-for Linux and macOS (amd64 and arm64), a `checksums.txt` covering
+for Linux and macOS (amd64 and arm64) of the connector and of each
+[included plugin](#included-plugins), a `checksums.txt` covering
 them, and `checksums.txt.sigstore.json`, a [Sigstore](https://www.sigstore.dev/)
 signature for the checksums made by this repository's release workflow. There
 is no long-lived signing key: the signature is tied to the workflow and the
@@ -124,7 +127,9 @@ Packages for Homebrew, apt and dnf are planned for later releases.
 
 ### Container image
 
-`ghcr.io/krakenkey/connector`, for `linux/amd64` and `linux/arm64`:
+`ghcr.io/krakenkey/connector`, for `linux/amd64` and `linux/arm64`. The image
+also carries the [included plugins](#included-plugins), so a container needs
+no plugin downloads.
 
 | Tag | Points to |
 |-----|-----------|
@@ -351,6 +356,7 @@ Connectors that use an API key instead of enrollment do not report.
 | `krakenkey.api_url` | `https://api.krakenkey.io` | API base URL. `KK_API_URL` overrides it. |
 | `check_interval` | `6h` | Time between passes in `run` mode (minimum `1m`). |
 | `data_dir` | `/var/lib/krakenkey-connector` | Keys, identity, state and plugin binaries. Must be owned by the connector's user, mode `0700`. |
+| `plugin_dir` | `/usr/lib/krakenkey-connector/plugins` | System plugin directory, read-only and owned by root, with a `plugins.lock`. `KK_PLUGIN_DIR` overrides it. See [External plugins](#external-plugins). |
 | `audit_log` | `<data_dir>/audit.jsonl` | Audit log, one JSON object per line. Must be mode `0600`. |
 | `plugins` | | External plugins, by name. See [Plugins](#external-plugins). |
 | `certificates[].id` | | KrakenKey certificate id. |
@@ -463,15 +469,38 @@ plugins:
   azure-keyvault: { version: 0.1.0, sha256: "<hex>", call_timeout: 5m }
 ```
 
-The connector looks for the plugin at
-`<data_dir>/plugins/<name>/<version>/krakenkey-connector-plugin-<name>`, or at
-`path` if set. `sha256` is required for plugins installed by version and
-optional with `path`.
+The connector finds a plugin's binary, `krakenkey-connector-plugin-<name>`,
+in the first of these places that applies:
+
+1. `path`, if set. `sha256` is optional; without it the binary is not
+   pinned, and `validate` says so.
+2. `<data_dir>/plugins/<name>/<version>/`, if the binary is there. `sha256`
+   is required.
+3. `<plugin_dir>/<name>/<version>/`, the system plugin directory (default
+   `/usr/lib/krakenkey-connector/plugins`). This is where the
+   [container image](#container-image) keeps the
+   [included plugins](#included-plugins). `sha256` is optional here: the
+   binary must match its line in `<plugin_dir>/plugins.lock`, and also the
+   `sha256` setting if there is one.
+
+`plugins.lock` lists one binary per line in `sha256sum` format:
+
+```text
+<sha256>  azure-keyvault/0.1.0/krakenkey-connector-plugin-azure-keyvault
+```
+
+It may list plugins that are not installed. If it is missing, has a line the
+connector does not understand, or fails the ownership checks below, the
+connector refuses every plugin in the system plugin directory, and
+`validate` says why. A version installed in the data directory always wins
+over the system plugin directory, and then needs its own `sha256`.
 
 Before starting a plugin, the connector checks that the binary is a regular
 file (not a symlink) owned by root or the connector's user and not writable by
 group or others, and that every directory above it, up to the data directory
-(or `/` for `path`), meets the same rule. Root-owned directories with the
+(or `/` for `path`), meets the same rule. In the system plugin directory the
+binaries, `plugins.lock` and every directory up to `/` must be owned by root,
+so the connector's own user cannot change them. Root-owned directories with the
 sticky bit, such as `/tmp`, are accepted on the way. It computes the checksum
 from the opened file. On Linux it then runs that same open file (through
 `/proc/self/fd`), so the binary cannot be swapped between the check and the
@@ -479,17 +508,22 @@ start; plugins must therefore be native executables, not scripts. On other
 systems the binary is started by path after the check, and the ownership
 rules are what keep it from being replaced in between.
 
+`validate` starts every declared plugin and shows where it was found and
+which checksum it matched:
+
+```text
+Plugins
+  azure-keyvault 0.1.0: /usr/lib/krakenkey-connector/plugins/azure-keyvault/0.1.0/krakenkey-connector-plugin-azure-keyvault (system plugin dir)
+    sha256 6125080b70a3914640985d62df1862b3e29cb536fed660a0c919569eb01da51d, matches plugins.lock
+```
+
 Every call to a plugin has a timeout (`call_timeout`, default 5 minutes; at
 most 1 minute for quick calls such as `Describe` and `Validate`). A rollback
 gets the longer of `call_timeout` and 5 minutes. A plugin that exits is
 started again on the next call.
 
-Plugins maintained in this repository, each its own Go module under
-[`plugins/`](plugins):
-
-| Plugin | Kind | What it does |
-|--------|------|--------------|
-| [`aws-acm`](plugins/aws-acm) | target | Re-imports certificates into an existing AWS Certificate Manager certificate, keeping its ARN. |
+The plugins maintained in this repository are listed under
+[Included plugins](#included-plugins).
 
 ### Audit log
 
@@ -500,6 +534,85 @@ target's reference to what was live before (what a rollback needs). The audit
 log never contains key material: error text and command output are scrubbed
 of private keys and API keys and capped in length. The file must be a regular
 file owned by the connector's user with mode `0600`.
+
+## Included plugins
+
+These plugins are maintained in this repository, each its own Go module
+under [`plugins/`](plugins). They are released with the connector and carry
+its version: release `v0.1.0` ships version `0.1.0` of each.
+
+| Plugin | Kind | What it does |
+|--------|------|--------------|
+| [`aws-acm`](plugins/aws-acm/README.md) | target | Re-imports certificates into an existing AWS Certificate Manager certificate, keeping its ARN, so load balancers, CloudFront and API Gateway pick up the new certificate. |
+| [`azure-keyvault`](plugins/azure-keyvault/README.md) | key store | Keeps keys and certificates in Azure Key Vault: the vault creates the key and the CSR, and the key leaves it only for exportable certificates whose targets need PEM or PFX. |
+| [`azure-appgateway`](plugins/azure-appgateway/README.md) | target | Points an Azure Application Gateway v2 SSL certificate at a specific Key Vault secret version, and rolls back by restoring the previous version. |
+
+Each plugin's README covers its settings, credentials and the permissions it
+needs.
+
+### In the container image
+
+The image has the plugins in the system plugin directory,
+`/usr/lib/krakenkey-connector/plugins/<name>/<version>/`, owned by root and
+read-only for the connector's user, with a `plugins.lock` written when the
+image was built. Declare a plugin with the connector's version (what
+`krakenkey-connector version` prints, without the leading `v`) and no
+`sha256`:
+
+```yaml
+plugins:
+  azure-keyvault: { version: 0.1.0 }
+  azure-appgateway: { version: 0.1.0, call_timeout: 15m }
+```
+
+When you upgrade the image, change the version in the config with it. An
+image built from source with `docker build` uses the `VERSION` build
+argument (default `dev`) as the version.
+
+### On a host
+
+Download the plugin's archive from the same release as the connector,
+verify it like the connector's archive (see
+[Release binaries](#release-binaries)), and install the binary under the
+data directory with its checksum in the config:
+
+```sh
+VERSION=0.1.0
+OS=linux
+ARCH=amd64
+PLUGIN=azure-keyvault
+ARCHIVE="krakenkey-connector-plugin-${PLUGIN}_${VERSION}_${OS}_${ARCH}.tar.gz"
+BASE="https://github.com/KrakenKey/connector/releases/download/v${VERSION}"
+curl -fsSLO "${BASE}/${ARCHIVE}"
+curl -fsSLO "${BASE}/checksums.txt"
+curl -fsSLO "${BASE}/checksums.txt.sigstore.json"
+
+cosign verify-blob checksums.txt \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity "https://github.com/KrakenKey/connector/.github/workflows/release.yaml@refs/tags/v${VERSION}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+grep " ${ARCHIVE}\$" checksums.txt | sha256sum -c
+
+tar -xzf "${ARCHIVE}" "krakenkey-connector-plugin-${PLUGIN}"
+DEST="/var/lib/krakenkey-connector/plugins/${PLUGIN}/${VERSION}"   # <data_dir>/plugins/...
+sudo install -d -m 0755 "${DEST}"
+sudo install -m 0755 "krakenkey-connector-plugin-${PLUGIN}" "${DEST}/"
+sha256sum "${DEST}/krakenkey-connector-plugin-${PLUGIN}"
+```
+
+Then put the checksum in the config:
+
+```yaml
+plugins:
+  azure-keyvault: { version: 0.1.0, sha256: "<sha256 printed above>" }
+```
+
+To keep plugins out of the connector user's reach, install them as root
+under the system plugin directory instead (for example
+`/usr/lib/krakenkey-connector/plugins/azure-keyvault/0.1.0/`) and write its
+`plugins.lock` with `sha256sum */*/krakenkey-connector-plugin-* > plugins.lock`
+run in that directory, or install them anywhere root owns and set `path` and
+`sha256`.
 
 ## Docker
 

@@ -94,6 +94,7 @@ func TestParseExample(t *testing.T) {
 
 func TestDefaults(t *testing.T) {
 	t.Setenv("KK_API_URL", "")
+	t.Setenv("KK_PLUGIN_DIR", "")
 	cfg, err := Parse(strings.NewReader(`
 certificates:
   - id: 7
@@ -105,7 +106,7 @@ certificates:
 		t.Fatalf("Parse: %v", err)
 	}
 	if cfg.KrakenKey.APIURL != DefaultAPIURL || cfg.CheckInterval != DefaultCheckInterval ||
-		cfg.DataDir != DefaultDataDir || cfg.AuditLog != DefaultDataDir+"/audit.jsonl" {
+		cfg.DataDir != DefaultDataDir || cfg.AuditLog != DefaultDataDir+"/audit.jsonl" || cfg.PluginDir != DefaultPluginDir {
 		t.Errorf("defaults = %+v", cfg)
 	}
 	c := cfg.Certificates[0]
@@ -131,8 +132,37 @@ func TestAPIURLFromEnv(t *testing.T) {
 	}
 }
 
+func TestPluginDir(t *testing.T) {
+	t.Setenv("KK_API_URL", "")
+	const cfg = `
+plugin_dir: /opt/connector/plugins
+plugins:
+  azure-keyvault: { version: 0.1.0 }
+certificates: [{ id: 1, names: [a.example.com], targets: [{ label: x, plugin: file }] }]
+`
+	t.Setenv("KK_PLUGIN_DIR", "")
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("a plugin by version without sha256: %v", err)
+	}
+	if c.PluginDir != "/opt/connector/plugins" {
+		t.Errorf("plugin_dir = %q", c.PluginDir)
+	}
+
+	t.Setenv("KK_PLUGIN_DIR", "/srv/plugins")
+	if c, err = Parse(strings.NewReader(cfg)); err != nil || c.PluginDir != "/srv/plugins" {
+		t.Errorf("KK_PLUGIN_DIR: plugin_dir = %q, %v", c.PluginDir, err)
+	}
+
+	t.Setenv("KK_PLUGIN_DIR", "plugins")
+	if _, err := Parse(strings.NewReader(cfg)); err == nil || !strings.Contains(err.Error(), `plugin_dir "plugins" must be an absolute path`) {
+		t.Errorf("relative plugin dir: %v", err)
+	}
+}
+
 func TestValidationErrors(t *testing.T) {
 	t.Setenv("KK_API_URL", "")
+	t.Setenv("KK_PLUGIN_DIR", "")
 	tests := []struct {
 		name string
 		yaml string
@@ -157,7 +187,6 @@ plugins:
   Bad_Name: { path: /x }
   nover: {}
   badsum: { version: 1.0.0, sha256: abc }
-  nosum: { version: 1.0.0 }
   slow: { path: /x, call_timeout: 10ms }
 certificates:
   - id: 0
@@ -190,7 +219,6 @@ certificates:
 			"plugins.Bad_Name: name must be lowercase",
 			"plugins.nover: set version or path",
 			"plugins.badsum: sha256 must be 64 hex characters",
-			"plugins.nosum: sha256 is required for plugins installed by version",
 			"plugins.slow: call_timeout must be at least 1s",
 			`certificate 6: target w: verify: host "other.example.com" is not one of the certificate's names`,
 			`certificate 6: target rel: then.exec "./reload.sh" is a relative path`,
