@@ -1,5 +1,5 @@
 // Package fakekk is an in-memory KrakenKey for tests: the connector
-// enrolment, token, and rotation routes, checked strictly against the API
+// enrollment, token, and rotation routes, checked strictly against the API
 // contract. Other routes go to Fallback.
 package fakekk
 
@@ -47,7 +47,7 @@ type Server struct {
 	RotateStatus int
 
 	mu          sync.Mutex
-	tokens      map[string]string // enrolment token -> connector name
+	tokens      map[string]string // enrollment token -> connector name
 	connectors  map[string]*Connector
 	nonces      map[string]bool
 	issued      map[string]string // api key -> connector id
@@ -74,8 +74,8 @@ func (s *Server) now() time.Time {
 	return time.Now()
 }
 
-// AddEnrolmentToken makes token valid once, for a connector named name.
-func (s *Server) AddEnrolmentToken(token, name string) {
+// AddEnrollmentToken makes token valid once, for a connector named name.
+func (s *Server) AddEnrollmentToken(token, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tokens[token] = name
@@ -155,8 +155,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/connectors/") {
 		switch r.URL.Path {
-		case "/connectors/enrol":
-			s.enrol(w, r)
+		case "/connectors/enroll":
+			s.enroll(w, r)
 			return
 		case "/connectors/token":
 			s.token(w, r)
@@ -179,26 +179,26 @@ func (s *Server) noBearer(r *http.Request) {
 	}
 }
 
-func (s *Server) enrol(w http.ResponseWriter, r *http.Request) {
+func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 	s.noBearer(r)
 	var body struct {
 		Token, PublicKey, Version, OS, Arch string
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		s.t.Errorf("enrol: bad body: %v", err)
+		s.t.Errorf("enroll: bad body: %v", err)
 	}
 	pub, err := base64.StdEncoding.DecodeString(body.PublicKey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
-		s.t.Errorf("enrol: publicKey %q is not standard base64 of 32 bytes", body.PublicKey)
+		s.t.Errorf("enroll: publicKey %q is not standard base64 of 32 bytes", body.PublicKey)
 	}
 	if body.Version == "" || body.OS == "" || body.Arch == "" {
-		s.t.Errorf("enrol: version/os/arch missing: %+v", body)
+		s.t.Errorf("enroll: version/os/arch missing: %+v", body)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	name, ok := s.tokens[body.Token]
 	if !ok {
-		unauthorized(w, "Invalid enrolment token")
+		unauthorized(w, "Invalid enrollment token")
 		return
 	}
 	delete(s.tokens, body.Token)

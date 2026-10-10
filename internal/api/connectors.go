@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// EnrolRequest is the body of POST /connectors/enrol.
-type EnrolRequest struct {
+// EnrollRequest is the body of POST /connectors/enroll.
+type EnrollRequest struct {
 	Token     string `json:"token"`
 	PublicKey string `json:"publicKey"`
 	Version   string `json:"version"`
@@ -16,8 +16,8 @@ type EnrolRequest struct {
 	Arch      string `json:"arch"`
 }
 
-// EnrolResponse is returned by POST /connectors/enrol.
-type EnrolResponse struct {
+// EnrollResponse is returned by POST /connectors/enroll.
+type EnrollResponse struct {
 	ConnectorID string `json:"connectorId"`
 	Name        string `json:"name"`
 }
@@ -46,12 +46,12 @@ type RotateRequest struct {
 	Signature    string `json:"signature"`
 }
 
-// EnrolmentTokenError means KrakenKey refused the enrolment token: it is
+// EnrollmentTokenError means KrakenKey refused the enrollment token: it is
 // wrong, expired, already used, or its connector was revoked.
-type EnrolmentTokenError struct{ Message string }
+type EnrollmentTokenError struct{ Message string }
 
-func (e *EnrolmentTokenError) Error() string {
-	return "KrakenKey refused the enrolment token (401): " + e.Message +
+func (e *EnrollmentTokenError) Error() string {
+	return "KrakenKey refused the enrollment token (401): " + e.Message +
 		"; tokens work once and expire after 24 hours, so issue a new one in the dashboard"
 }
 
@@ -62,22 +62,22 @@ type ConnectorAuthError struct{ Message string }
 
 func (e *ConnectorAuthError) Error() string {
 	return "KrakenKey refused the connector's identity (401): " + e.Message +
-		"; the connector may have been revoked (enrol it again with a new token), or this machine's clock is off"
+		"; the connector may have been revoked (enroll it again with a new token), or this machine's clock is off"
 }
 
-// Enrol registers the connector's public key with a one-time enrolment
+// Enroll registers the connector's public key with a one-time enrollment
 // token. It sends no API key.
-func (c *Client) Enrol(ctx context.Context, req EnrolRequest) (*EnrolResponse, error) {
-	var r EnrolResponse
-	err := c.send(ctx, http.MethodPost, "/connectors/enrol", req, &r, false)
+func (c *Client) Enroll(ctx context.Context, req EnrollRequest) (*EnrollResponse, error) {
+	var r EnrollResponse
+	err := c.send(ctx, http.MethodPost, "/connectors/enroll", req, &r, false)
 	if e, ok := unauthorized(err); ok {
-		return nil, &EnrolmentTokenError{Message: e.Message()}
+		return nil, &EnrollmentTokenError{Message: e.Message()}
 	}
 	if err != nil {
 		return nil, err
 	}
 	if r.ConnectorID == "" {
-		return nil, errors.New("POST /connectors/enrol: response has no connectorId")
+		return nil, errors.New("POST /connectors/enroll: response has no connectorId")
 	}
 	return &r, nil
 }

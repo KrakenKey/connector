@@ -11,41 +11,41 @@ import (
 	"github.com/krakenkey/connector/internal/securefs"
 )
 
-// Enroller is the API call enrolment uses.
+// Enroller is the API call enrollment uses.
 type Enroller interface {
-	Enrol(ctx context.Context, req api.EnrolRequest) (*api.EnrolResponse, error)
+	Enroll(ctx context.Context, req api.EnrollRequest) (*api.EnrollResponse, error)
 }
 
-// EnrolOptions are the inputs to Enrol.
-type EnrolOptions struct {
-	// Token is the one-time enrolment token from the dashboard.
+// EnrollOptions are the inputs to Enroll.
+type EnrollOptions struct {
+	// Token is the one-time enrollment token from the dashboard.
 	Token string
 	// Version, OS and Arch describe this connector to KrakenKey.
 	Version, OS, Arch string
 	// APIURL is recorded in connector.json, so a later change of
 	// krakenkey.api_url can be pointed out.
 	APIURL string
-	// Force enrols even if an identity exists. The old files are kept
+	// Force enrolls even if an identity exists. The old files are kept
 	// with a .bak-<time> suffix.
 	Force bool
 	Now   time.Time
 }
 
-// EnrolResult says what Enrol did.
-type EnrolResult struct {
+// EnrollResult says what Enroll did.
+type EnrollResult struct {
 	Identity *Identity
-	// Backups are the old identity files kept by a forced enrolment.
+	// Backups are the old identity files kept by a forced enrollment.
 	Backups []string
 }
 
-// Enrol creates an identity key, registers its public key with KrakenKey
-// using the enrolment token, and stores the key and the connector id. The
+// Enroll creates an identity key, registers its public key with KrakenKey
+// using the enrollment token, and stores the key and the connector id. The
 // caller holds the data directory lock.
 //
 // The new key is written to disk before KrakenKey is called, so a full or
 // read-only disk is found before the single-use token is spent. The old
 // identity, if any, stays in place until KrakenKey has accepted the new one.
-func (s *Store) Enrol(ctx context.Context, client Enroller, opts EnrolOptions) (*EnrolResult, error) {
+func (s *Store) Enroll(ctx context.Context, client Enroller, opts EnrollOptions) (*EnrollResult, error) {
 	if err := securefs.EnsurePrivateDir(s.dir); err != nil {
 		return nil, fmt.Errorf("identity: %w", err)
 	}
@@ -55,7 +55,7 @@ func (s *Store) Enrol(ctx context.Context, client Enroller, opts EnrolOptions) (
 			return nil, loadErr
 		}
 		if existing != nil {
-			return nil, fmt.Errorf("%w as %s; to replace its identity, enrol with --force and a new token", ErrAlreadyEnrolled, existing)
+			return nil, fmt.Errorf("%w as %s; to replace its identity, enroll with --force and a new token", ErrAlreadyEnrolled, existing)
 		}
 	}
 
@@ -66,7 +66,7 @@ func (s *Store) Enrol(ctx context.Context, client Enroller, opts EnrolOptions) (
 	if err := s.writeKey(newKeyFile, key); err != nil {
 		return nil, err
 	}
-	resp, err := client.Enrol(ctx, api.EnrolRequest{
+	resp, err := client.Enroll(ctx, api.EnrollRequest{
 		Token:     opts.Token,
 		PublicKey: EncodePublicKey(key.Public().(ed25519.PublicKey)),
 		Version:   opts.Version,
@@ -78,7 +78,7 @@ func (s *Store) Enrol(ctx context.Context, client Enroller, opts EnrolOptions) (
 		return nil, err
 	}
 
-	res := &EnrolResult{}
+	res := &EnrollResult{}
 	stamp := opts.Now.UTC().Format("20060102T150405Z")
 	for _, name := range []string{KeyFile, MetaFile, NextKeyFile} {
 		ok, err := s.exists(name)

@@ -1,5 +1,5 @@
 // Package identity holds the connector's enrolled identity: an Ed25519 key
-// pair whose public half KrakenKey stores at enrolment, and the connector
+// pair whose public half KrakenKey stores at enrollment, and the connector
 // id it was given. The connector proves it holds the private key to get
 // short-lived API keys, so no long-lived API key has to live on the
 // machine.
@@ -38,7 +38,7 @@ const (
 	KeyFile     = "identity.key"
 	NextKeyFile = "identity.key.next"
 	MetaFile    = "connector.json"
-	// newKeyFile holds the key of an enrolment in progress.
+	// newKeyFile holds the key of an enrollment in progress.
 	newKeyFile = "identity.key.new"
 )
 
@@ -48,7 +48,7 @@ const (
 	RotateMessageV1 = "KRAKENKEY-CONNECTOR-ROTATE-V1"
 )
 
-// ErrAlreadyEnrolled means an identity exists and enrol was not forced.
+// ErrAlreadyEnrolled means an identity exists and enroll was not forced.
 var ErrAlreadyEnrolled = errors.New("this connector is already enrolled")
 
 // Meta is what connector.json holds.
@@ -154,7 +154,7 @@ func (s *Store) Load() (*Identity, error) {
 	case !keyExists && !metaExists:
 		return nil, nil
 	case keyExists != metaExists:
-		return nil, fmt.Errorf("identity in %s is incomplete (an interrupted enrolment?); enrol again with a new token and --force", s.dir)
+		return nil, fmt.Errorf("identity in %s is incomplete (an interrupted enrollment?); enroll again with a new token and --force", s.dir)
 	}
 
 	id := &Identity{}

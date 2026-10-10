@@ -20,7 +20,7 @@ import (
 	"github.com/krakenkey/connector/internal/fakekk"
 )
 
-const enrolToken = "kkce_test_token_0123456789abcdef"
+const enrollToken = "kkce_test_token_0123456789abcdef"
 
 func quietLog() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
@@ -28,15 +28,15 @@ func newClient(srv *fakekk.Server) *api.Client {
 	return api.NewClient(srv.URL, "", "krakenkey-connector/test")
 }
 
-func enrol(t *testing.T, srv *fakekk.Server, dataDir string) (*Store, *Identity) {
+func enroll(t *testing.T, srv *fakekk.Server, dataDir string) (*Store, *Identity) {
 	t.Helper()
-	srv.AddEnrolmentToken(enrolToken, "edge-1")
+	srv.AddEnrollmentToken(enrollToken, "edge-1")
 	store := NewStore(dataDir)
-	res, err := store.Enrol(context.Background(), newClient(srv), EnrolOptions{
-		Token: enrolToken, Version: "test", OS: "linux", Arch: "amd64", APIURL: srv.URL, Now: time.Now(),
+	res, err := store.Enroll(context.Background(), newClient(srv), EnrollOptions{
+		Token: enrollToken, Version: "test", OS: "linux", Arch: "amd64", APIURL: srv.URL, Now: time.Now(),
 	})
 	if err != nil {
-		t.Fatalf("Enrol: %v", err)
+		t.Fatalf("Enroll: %v", err)
 	}
 	return store, res.Identity
 }
@@ -55,10 +55,10 @@ func checkMode(t *testing.T, path string, want os.FileMode) {
 	}
 }
 
-func TestEnrolStoresIdentity(t *testing.T) {
+func TestEnrollStoresIdentity(t *testing.T) {
 	srv := fakekk.New(t)
 	dataDir := t.TempDir()
-	store, id := enrol(t, srv, dataDir)
+	store, id := enroll(t, srv, dataDir)
 
 	if id.Name != "edge-1" || id.ConnectorID == "" {
 		t.Errorf("identity %+v", id.Meta)
@@ -88,23 +88,23 @@ func TestEnrolStoresIdentity(t *testing.T) {
 	}
 }
 
-func TestEnrolRefusesToReenrol(t *testing.T) {
+func TestEnrollRefusesToReenroll(t *testing.T) {
 	srv := fakekk.New(t)
 	dataDir := t.TempDir()
-	store, first := enrol(t, srv, dataDir)
+	store, first := enroll(t, srv, dataDir)
 
-	srv.AddEnrolmentToken("kkce_second_token_0123456789", "edge-2")
-	_, err := store.Enrol(context.Background(), newClient(srv), EnrolOptions{Token: "kkce_second_token_0123456789", Now: time.Now(), Version: "v", OS: "o", Arch: "a"})
+	srv.AddEnrollmentToken("kkce_second_token_0123456789", "edge-2")
+	_, err := store.Enroll(context.Background(), newClient(srv), EnrollOptions{Token: "kkce_second_token_0123456789", Now: time.Now(), Version: "v", OS: "o", Arch: "a"})
 	if !errors.Is(err, ErrAlreadyEnrolled) {
-		t.Fatalf("second enrol: %v", err)
+		t.Fatalf("second enroll: %v", err)
 	}
 	if n := len(srv.Requests()); n != 1 {
-		t.Errorf("refusing to re-enrol still called KrakenKey (%d requests)", n)
+		t.Errorf("refusing to re-enroll still called KrakenKey (%d requests)", n)
 	}
 
-	// A forced enrolment with a bad token keeps the existing identity.
-	_, err = store.Enrol(context.Background(), newClient(srv), EnrolOptions{Token: "kkce_wrong_token_0123456789", Force: true, Now: time.Now(), Version: "v", OS: "o", Arch: "a"})
-	var tokErr *api.EnrolmentTokenError
+	// A forced enrollment with a bad token keeps the existing identity.
+	_, err = store.Enroll(context.Background(), newClient(srv), EnrollOptions{Token: "kkce_wrong_token_0123456789", Force: true, Now: time.Now(), Version: "v", OS: "o", Arch: "a"})
+	var tokErr *api.EnrollmentTokenError
 	if !errors.As(err, &tokErr) {
 		t.Fatalf("bad token: %v", err)
 	}
@@ -112,19 +112,19 @@ func TestEnrolRefusesToReenrol(t *testing.T) {
 		t.Error("the token is in the error")
 	}
 	if got, _ := store.Load(); got == nil || got.ConnectorID != first.ConnectorID {
-		t.Fatalf("failed forced enrolment changed the identity: %v", got)
+		t.Fatalf("failed forced enrollment changed the identity: %v", got)
 	}
 	if _, err := os.Stat(filepath.Join(store.Dir(), newKeyFile)); !errors.Is(err, os.ErrNotExist) {
-		t.Error("the key of the failed enrolment was left behind")
+		t.Error("the key of the failed enrollment was left behind")
 	}
 
-	// A forced enrolment that works keeps the old files as backups.
-	res, err := store.Enrol(context.Background(), newClient(srv), EnrolOptions{Token: "kkce_second_token_0123456789", Force: true, Now: time.Now(), Version: "v", OS: "o", Arch: "a"})
+	// A forced enrollment that works keeps the old files as backups.
+	res, err := store.Enroll(context.Background(), newClient(srv), EnrollOptions{Token: "kkce_second_token_0123456789", Force: true, Now: time.Now(), Version: "v", OS: "o", Arch: "a"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Identity.ConnectorID == first.ConnectorID || len(res.Backups) != 2 {
-		t.Fatalf("forced enrol: %+v", res)
+		t.Fatalf("forced enroll: %+v", res)
 	}
 	for _, b := range res.Backups {
 		checkMode(t, b, 0o600)
@@ -134,7 +134,7 @@ func TestEnrolRefusesToReenrol(t *testing.T) {
 		t.Errorf("backup %s does not hold the old key: %v", res.Backups[0], err)
 	}
 	if got, _ := store.Load(); got.ConnectorID != res.Identity.ConnectorID {
-		t.Errorf("loaded %s after forced enrol", got)
+		t.Errorf("loaded %s after forced enroll", got)
 	}
 }
 
@@ -143,7 +143,7 @@ func TestLoadChecksPermissions(t *testing.T) {
 		t.Skip("no unix permissions")
 	}
 	srv := fakekk.New(t)
-	store, _ := enrol(t, srv, t.TempDir())
+	store, _ := enroll(t, srv, t.TempDir())
 	keyPath := filepath.Join(store.Dir(), KeyFile)
 	if err := os.Chmod(keyPath, 0o640); err != nil {
 		t.Fatal(err)
@@ -174,7 +174,7 @@ func TestLoadNotEnrolled(t *testing.T) {
 
 func TestIdentityNeverPrintsKeys(t *testing.T) {
 	srv := fakekk.New(t)
-	_, id := enrol(t, srv, t.TempDir())
+	_, id := enroll(t, srv, t.TempDir())
 	var buf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&buf, nil))
 	log.Info("x", "identity", id)
@@ -235,7 +235,7 @@ func TestTokenSourceCachesAndRefreshes(t *testing.T) {
 	srv := fakekk.New(t)
 	clock := &fixedClock{t: time.Now().UTC().Truncate(time.Second)}
 	srv.Now = clock.Now
-	store, id := enrol(t, srv, t.TempDir())
+	store, id := enroll(t, srv, t.TempDir())
 	ts := NewTokenSource(newClient(srv), store, id, quietLog())
 	ts.Now = clock.Now
 	ctx := context.Background()
@@ -278,7 +278,7 @@ func TestTokenSourceClockSkew(t *testing.T) {
 	serverNow := time.Now()
 	srv.Now = func() time.Time { return serverNow }
 	srv.TokenTTL = 4 * time.Minute // expires within RefreshBefore
-	store, id := enrol(t, srv, t.TempDir())
+	store, id := enroll(t, srv, t.TempDir())
 	ts := NewTokenSource(newClient(srv), store, id, quietLog())
 	for range 3 {
 		if _, err := ts.APIKey(context.Background()); err != nil {
@@ -292,7 +292,7 @@ func TestTokenSourceClockSkew(t *testing.T) {
 
 func TestTokenSource401IsFinal(t *testing.T) {
 	srv := fakekk.New(t)
-	store, id := enrol(t, srv, t.TempDir())
+	store, id := enroll(t, srv, t.TempDir())
 	srv.Revoke(id.ConnectorID)
 	ts := NewTokenSource(newClient(srv), store, id, quietLog())
 	for range 3 {
@@ -309,7 +309,7 @@ func TestTokenSource401IsFinal(t *testing.T) {
 
 func TestTokenSourceRejectedClock(t *testing.T) {
 	srv := fakekk.New(t)
-	store, id := enrol(t, srv, t.TempDir())
+	store, id := enroll(t, srv, t.TempDir())
 	ts := NewTokenSource(newClient(srv), store, id, quietLog())
 	ts.Now = func() time.Time { return time.Now().Add(10 * time.Minute) }
 	_, err := ts.APIKey(context.Background())
@@ -320,7 +320,7 @@ func TestTokenSourceRejectedClock(t *testing.T) {
 
 func TestRotate(t *testing.T) {
 	srv := fakekk.New(t)
-	store, id := enrol(t, srv, t.TempDir())
+	store, id := enroll(t, srv, t.TempDir())
 	oldKey := id.key
 	if err := store.Rotate(context.Background(), newClient(srv), id, time.Now()); err != nil {
 		t.Fatalf("Rotate: %v", err)
@@ -349,7 +349,7 @@ func TestRotate(t *testing.T) {
 
 func TestRotateRefused(t *testing.T) {
 	srv := fakekk.New(t)
-	store, id := enrol(t, srv, t.TempDir())
+	store, id := enroll(t, srv, t.TempDir())
 	oldKey := id.key
 	srv.RotateStatus = 401
 	err := store.Rotate(context.Background(), newClient(srv), id, time.Now())
@@ -382,7 +382,7 @@ func TestRotationCrashSafety(t *testing.T) {
 	for _, delivered := range []bool{true, false} {
 		t.Run(fmt.Sprintf("delivered=%v", delivered), func(t *testing.T) {
 			srv := fakekk.New(t)
-			store, id := enrol(t, srv, t.TempDir())
+			store, id := enroll(t, srv, t.TempDir())
 			oldKey := id.key
 			err := store.Rotate(context.Background(), lostAnswer{newClient(srv), delivered}, id, time.Now())
 			if !errors.Is(err, ErrRotationUnknown) {

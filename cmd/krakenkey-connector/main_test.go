@@ -191,11 +191,11 @@ func TestRunOnceExitCodes(t *testing.T) {
 	}
 }
 
-// enrolEnv clears every credential variable and points the API at srv.
-func enrolEnv(t *testing.T, srv *fakekk.Server) {
+// enrollEnv clears every credential variable and points the API at srv.
+func enrollEnv(t *testing.T, srv *fakekk.Server) {
 	t.Helper()
 	for _, v := range []string{"KK_API_KEY", "KK_API_KEY_FILE", "CREDENTIALS_DIRECTORY",
-		"KK_ENROLMENT_TOKEN", "KK_ENROLMENT_TOKEN_FILE"} {
+		"KK_ENROLLMENT_TOKEN", "KK_ENROLLMENT_TOKEN_FILE"} {
 		t.Setenv(v, "")
 	}
 	t.Setenv("KK_API_URL", srv.URL)
@@ -231,83 +231,83 @@ func connectorID(t *testing.T, dataDir string) string {
 	return meta.ConnectorID
 }
 
-func enrolOK(t *testing.T, srv *fakekk.Server, cfg string) string {
+func enrollOK(t *testing.T, srv *fakekk.Server, cfg string) string {
 	t.Helper()
-	srv.AddEnrolmentToken("kkce_cmd_token_0123456789abcdef", "edge-1")
-	t.Setenv("KK_ENROLMENT_TOKEN", "kkce_cmd_token_0123456789abcdef")
+	srv.AddEnrollmentToken("kkce_cmd_token_0123456789abcdef", "edge-1")
+	t.Setenv("KK_ENROLLMENT_TOKEN", "kkce_cmd_token_0123456789abcdef")
 	var out, errOut bytes.Buffer
-	if code := run([]string{"enrol", "--config", cfg}, &out, &errOut); code != exitOK {
-		t.Fatalf("enrol: exit %d\n%s", code, errOut.String())
+	if code := run([]string{"enroll", "--config", cfg}, &out, &errOut); code != exitOK {
+		t.Fatalf("enroll: exit %d\n%s", code, errOut.String())
 	}
 	return out.String()
 }
 
-func TestEnrolCommand(t *testing.T) {
+func TestEnrollCommand(t *testing.T) {
 	srv := fakekk.New(t)
-	enrolEnv(t, srv)
+	enrollEnv(t, srv)
 	cfg := writeConfig(t)
 	var out, errOut bytes.Buffer
 
 	// No token.
-	if code := run([]string{"enrol", "--config", cfg}, &out, &errOut); code != exitUsage || !strings.Contains(errOut.String(), "no enrolment token") {
+	if code := run([]string{"enroll", "--config", cfg}, &out, &errOut); code != exitUsage || !strings.Contains(errOut.String(), "no enrollment token") {
 		t.Errorf("no token: exit %d\n%s", code, errOut.String())
 	}
-	// Not an enrolment token.
-	t.Setenv("KK_ENROLMENT_TOKEN", "kk_api_key_by_mistake")
+	// Not an enrollment token.
+	t.Setenv("KK_ENROLLMENT_TOKEN", "kk_api_key_by_mistake")
 	errOut.Reset()
-	if code := run([]string{"enrol", "--config", cfg}, &out, &errOut); code != exitUsage || strings.Contains(errOut.String(), "by_mistake") {
+	if code := run([]string{"enroll", "--config", cfg}, &out, &errOut); code != exitUsage || strings.Contains(errOut.String(), "by_mistake") {
 		t.Errorf("API key as token: exit %d\n%s", code, errOut.String())
 	}
 	// A token file other users can read.
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	_ = os.WriteFile(tokenFile, []byte("kkce_file_token_0123456789\n"), 0o644)
-	t.Setenv("KK_ENROLMENT_TOKEN_FILE", tokenFile)
+	t.Setenv("KK_ENROLLMENT_TOKEN_FILE", tokenFile)
 	errOut.Reset()
-	if code := run([]string{"enrol", "--config", cfg}, &out, &errOut); code != exitUsage || !strings.Contains(errOut.String(), "readable by other users") {
+	if code := run([]string{"enroll", "--config", cfg}, &out, &errOut); code != exitUsage || !strings.Contains(errOut.String(), "readable by other users") {
 		t.Errorf("world-readable token file: exit %d\n%s", code, errOut.String())
 	}
 	// A token KrakenKey does not know.
 	_ = os.Chmod(tokenFile, 0o600)
 	errOut.Reset()
-	if code := run([]string{"enrol", "--config", cfg}, &out, &errOut); code != exitAuth || strings.Contains(errOut.String(), "kkce_file_token") {
+	if code := run([]string{"enroll", "--config", cfg}, &out, &errOut); code != exitAuth || strings.Contains(errOut.String(), "kkce_file_token") {
 		t.Errorf("unknown token: exit %d\n%s", code, errOut.String())
 	}
 	// The file wins over the environment, and the token works once.
-	srv.AddEnrolmentToken("kkce_file_token_0123456789", "edge-file")
-	t.Setenv("KK_ENROLMENT_TOKEN", "kkce_env_token_0123456789")
+	srv.AddEnrollmentToken("kkce_file_token_0123456789", "edge-file")
+	t.Setenv("KK_ENROLLMENT_TOKEN", "kkce_env_token_0123456789")
 	out.Reset()
 	errOut.Reset()
-	if code := run([]string{"enrol", "--config", cfg}, &out, &errOut); code != exitOK {
-		t.Fatalf("enrol: exit %d\n%s", code, errOut.String())
+	if code := run([]string{"enroll", "--config", cfg}, &out, &errOut); code != exitOK {
+		t.Fatalf("enroll: exit %d\n%s", code, errOut.String())
 	}
 	if !strings.Contains(out.String(), `Enrolled as connector "edge-file" (id `) {
 		t.Errorf("output %q", out.String())
 	}
-	if os.Getenv("KK_ENROLMENT_TOKEN") != "" {
-		t.Error("KK_ENROLMENT_TOKEN left in the environment")
+	if os.Getenv("KK_ENROLLMENT_TOKEN") != "" {
+		t.Error("KK_ENROLLMENT_TOKEN left in the environment")
 	}
 	if strings.Contains(out.String()+errOut.String(), "kkce_") {
 		t.Error("token printed")
 	}
-	// A second enrolment is refused without --force.
+	// A second enrollment is refused without --force.
 	errOut.Reset()
-	if code := run([]string{"enrol", "--config", cfg}, &out, &errOut); code != exitUsage || !strings.Contains(errOut.String(), "already enrolled") {
-		t.Errorf("re-enrol: exit %d\n%s", code, errOut.String())
+	if code := run([]string{"enroll", "--config", cfg}, &out, &errOut); code != exitUsage || !strings.Contains(errOut.String(), "already enrolled") {
+		t.Errorf("re-enroll: exit %d\n%s", code, errOut.String())
 	}
 	// --force with a new token keeps a backup.
-	srv.AddEnrolmentToken("kkce_file_token_0123456789", "edge-new")
+	srv.AddEnrollmentToken("kkce_file_token_0123456789", "edge-new")
 	out.Reset()
-	if code := run([]string{"enrol", "--force", "--config", cfg}, &out, &errOut); code != exitOK || !strings.Contains(out.String(), "Kept the previous identity file") {
-		t.Errorf("forced re-enrol: exit %d\n%s\n%s", code, out.String(), errOut.String())
+	if code := run([]string{"enroll", "--force", "--config", cfg}, &out, &errOut); code != exitOK || !strings.Contains(out.String(), "Kept the previous identity file") {
+		t.Errorf("forced re-enroll: exit %d\n%s\n%s", code, out.String(), errOut.String())
 	}
 }
 
 func TestRunWithIdentity(t *testing.T) {
 	srv := fakekk.New(t)
 	srv.Fallback = certsNeedConnectorKey(srv)
-	enrolEnv(t, srv)
+	enrollEnv(t, srv)
 	cfg := writeConfig(t)
-	enrolOK(t, srv, cfg)
+	enrollOK(t, srv, cfg)
 
 	t.Setenv("KK_API_KEY", "kk_ignored_because_enrolled")
 	var out, errOut bytes.Buffer
@@ -327,7 +327,7 @@ func TestRunWithIdentity(t *testing.T) {
 func TestRunWithRevokedIdentity(t *testing.T) {
 	srv := fakekk.New(t)
 	srv.Fallback = certsNeedConnectorKey(srv)
-	enrolEnv(t, srv)
+	enrollEnv(t, srv)
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "config.yaml")
 	_ = os.WriteFile(cfg, []byte(`
@@ -340,7 +340,7 @@ certificates:
     names: [www.example.com]
     targets: [{ label: b, plugin: exec, command: [/bin/true] }]
 `), 0o600)
-	enrolOK(t, srv, cfg)
+	enrollOK(t, srv, cfg)
 	srv.Revoke(connectorID(t, filepath.Join(dir, "data")))
 
 	var out, errOut bytes.Buffer
@@ -357,10 +357,10 @@ certificates:
 	}
 }
 
-func TestValidateShowsEnrolment(t *testing.T) {
+func TestValidateShowsEnrollment(t *testing.T) {
 	srv := fakekk.New(t)
 	srv.Fallback = certsNeedConnectorKey(srv)
-	enrolEnv(t, srv)
+	enrollEnv(t, srv)
 	cfg := writeConfig(t)
 	var out, errOut bytes.Buffer
 	_ = run([]string{"validate", "--offline", "--config", cfg}, &out, &errOut)
@@ -368,7 +368,7 @@ func TestValidateShowsEnrolment(t *testing.T) {
 		t.Errorf("not enrolled:\n%s", out.String())
 	}
 
-	enrolOK(t, srv, cfg)
+	enrollOK(t, srv, cfg)
 	out.Reset()
 	_ = run([]string{"validate", "--config", cfg}, &out, &errOut)
 	for _, want := range []string{`Identity:   enrolled as connector "edge-1" (id `, "Token:      exchange works (short-lived key valid until "} {
@@ -386,14 +386,14 @@ func TestValidateShowsEnrolment(t *testing.T) {
 
 func TestRotateIdentityCommand(t *testing.T) {
 	srv := fakekk.New(t)
-	enrolEnv(t, srv)
+	enrollEnv(t, srv)
 	cfg := writeConfig(t)
 	var out, errOut bytes.Buffer
 	_ = os.MkdirAll(filepath.Join(filepath.Dir(cfg), "data"), 0o700)
 	if code := run([]string{"rotate-identity", "--config", cfg}, &out, &errOut); code != exitUsage || !strings.Contains(errOut.String(), "not enrolled") {
 		t.Errorf("not enrolled: exit %d\n%s", code, errOut.String())
 	}
-	enrolOK(t, srv, cfg)
+	enrollOK(t, srv, cfg)
 	keyPath := filepath.Join(filepath.Dir(cfg), "data", "identity", "identity.key")
 	before, _ := os.ReadFile(keyPath)
 	out.Reset()
