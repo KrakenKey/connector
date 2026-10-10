@@ -20,6 +20,9 @@ const (
 	StatusRenewing = "renewing"
 	StatusRevoking = "revoking"
 	StatusRevoked  = "revoked"
+	// StatusAwaitingCSR is a certificate created in KrakenKey with names
+	// only, waiting for a connector to send the first CSR through renew.
+	StatusAwaitingCSR = "awaiting_csr"
 )
 
 // FallbackRenewBefore is used to work out when to renew when the API does
@@ -37,6 +40,9 @@ type Cert struct {
 	ManagedBy     *string    `json:"managedBy"`
 	AutoRenew     bool       `json:"autoRenew"`
 	FailureReason string     `json:"failureReason,omitempty"`
+	// RequestedNames are the names of an awaiting_csr certificate; the
+	// first CSR must cover exactly these.
+	RequestedNames []string `json:"requestedNames"`
 }
 
 // Renewal time sources reported by RenewAt.
