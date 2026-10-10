@@ -82,6 +82,13 @@ func TestAwaitingCSRNamesMismatch(t *testing.T) {
 			if !e.audit.has(audit.StepCheck, audit.ResultFailed, "names") {
 				t.Error("mismatch not audited")
 			}
+			// A mismatch is the connector's config, so it counts as a
+			// failure on the connector's side; missing names are KrakenKey's.
+			var blocking interface{ BlocksDeployment() bool }
+			isBlocking := errors.As(err, &blocking) && blocking.BlocksDeployment()
+			if isBlocking != (requested != nil) {
+				t.Errorf("BlocksDeployment = %v for %v", isBlocking, err)
+			}
 		})
 	}
 }

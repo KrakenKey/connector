@@ -304,11 +304,26 @@ func checkRequestedNames(cert *api.Cert, configured []string) error {
 		return errors.New("KrakenKey is waiting for a CSR but did not say for which names (no requestedNames)")
 	}
 	if !certutil.SameNames(cert.RequestedNames, configured) {
-		return fmt.Errorf("config names %v differ from the names KrakenKey is waiting for %v; change the config to match, or create the certificate again with the right names",
-			certutil.NormalizeNames(configured), certutil.NormalizeNames(cert.RequestedNames))
+		return &RequestedNamesError{Configured: certutil.NormalizeNames(configured), Requested: certutil.NormalizeNames(cert.RequestedNames)}
 	}
 	return nil
 }
+
+// RequestedNamesError means the configured names differ from the names an
+// awaiting_csr certificate was created for, so the connector will not
+// issue it. It is a failure on the connector's side (its config): status
+// reports show it as a failed deployment.
+type RequestedNamesError struct {
+	Configured, Requested []string
+}
+
+func (e *RequestedNamesError) Error() string {
+	return fmt.Sprintf("config names %v differ from the names KrakenKey is waiting for %v; change the config to match, or create the certificate again with the right names",
+		e.Configured, e.Requested)
+}
+
+// BlocksDeployment marks the error as a failure on the connector's side.
+func (e *RequestedNamesError) BlocksDeployment() bool { return true }
 
 // adopt takes KrakenKey's current certificate when it carries a key the
 // connector holds.
