@@ -284,6 +284,16 @@ var extKeyUsages = map[types.ExtendedKeyUsageName]x509.ExtKeyUsage{
 	// ImportCertificate fails and nothing changes.
 }
 
+// sameKeyAlgorithm compares ACM key algorithm names. DescribeCertificate
+// reports EC keys with a hyphen ("EC-prime256v1") while the API enum uses
+// an underscore ("EC_prime256v1"), so both spellings are accepted.
+func sameKeyAlgorithm(a, b types.KeyAlgorithm) bool {
+	norm := func(k types.KeyAlgorithm) string {
+		return strings.ToUpper(strings.ReplaceAll(string(k), "-", "_"))
+	}
+	return norm(a) == norm(b)
+}
+
 // replaceProblem returns why ACM would refuse to re-import leaf over the
 // certificate described by d, or why doing so would stop serving a name
 // the certificate serves now. It returns "" when the replacement is fine.
@@ -295,7 +305,7 @@ func replaceProblem(d *types.CertificateDetail, leaf *x509.Certificate) string {
 	if err != nil {
 		return err.Error()
 	}
-	if d.KeyAlgorithm != "" && d.KeyAlgorithm != alg {
+	if d.KeyAlgorithm != "" && !sameKeyAlgorithm(d.KeyAlgorithm, alg) {
 		return fmt.Sprintf("the ACM certificate has a %s key and this one %s; ACM cannot change the key type on reimport. Set key_store.key_type to match, or import a certificate with the new key type yourself first",
 			d.KeyAlgorithm, alg)
 	}
@@ -309,8 +319,19 @@ func replaceProblem(d *types.CertificateDetail, leaf *x509.Certificate) string {
 		return fmt.Sprintf("the new certificate does not cover %s, which the ACM certificate serves now; if dropping it is intended, re-import a certificate without it yourself first",
 			strings.Join(missing, ", "))
 	}
+	return keyUsageProblem(d, leaf)
+}
+
+// keyUsageProblem returns why ACM would refuse leaf's key usages or extended
+// key usages over the certificate described by d, or "".
+func keyUsageProblem(d *types.CertificateDetail, leaf *x509.Certificate) string {
 	_, isECDSA := leaf.PublicKey.(*ecdsa.PublicKey)
 	for _, ku := range d.KeyUsages {
+		// ACM records a certificate without a key usage extension as ANY and
+		// then refuses any reimport that restricts key usage.
+		if ku.Name == types.KeyUsageNameAny && leaf.KeyUsage != 0 {
+			return "the ACM certificate has no key usage restriction (ACM shows ANY) and the new certificate restricts it; ACM refuses that on reimport. Import a placeholder with the same key usage as KrakenKey's certificates (keyUsage=critical,digitalSignature, extendedKeyUsage=serverAuth) and use its ARN"
+		}
 		bit, known := keyUsageBits[ku.Name]
 		if !known || (isECDSA && ku.Name == types.KeyUsageNameKeyEncipherment) {
 			continue
@@ -320,6 +341,9 @@ func replaceProblem(d *types.CertificateDetail, leaf *x509.Certificate) string {
 		}
 	}
 	for _, eku := range d.ExtendedKeyUsages {
+		if eku.Name == types.ExtendedKeyUsageNameAny && !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageAny) {
+			return "the ACM certificate allows any extended key usage (ACM shows ANY) and the new certificate restricts it; ACM refuses that on reimport. Import a placeholder with extendedKeyUsage=serverAuth and use its ARN"
+		}
 		want, known := extKeyUsages[eku.Name]
 		if !known {
 			continue
