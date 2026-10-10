@@ -2,24 +2,27 @@
 // and target implementations: built-in ones in process, external ones as
 // go-plugin subprocesses.
 //
+// An external plugin is found at its configured path, or by version under
+// <data_dir>/plugins, or, when it is not installed there, under the system
+// plugin directory (plugin_dir), whose plugins.lock pins every binary's
+// checksum. See Host.CheckPlugin and the README for the lookup order.
+//
 // External plugin binaries must be regular files (not symlinks) owned by
 // root or the connector's user, not writable by group or others, in
 // directories with the same properties up to the data directory (or up to
-// / for an explicit path). Root-owned directories with the sticky bit, such
-// as /tmp, are accepted along the way. The checksum is computed from the
-// opened file, and on Linux that same open file is executed through
-// /proc/self/fd, so the binary cannot be swapped between check and start.
-// Elsewhere the binary is executed by path after the check, which leaves a
-// small window; the ownership checks above are what close it.
+// / for an explicit path). In the system plugin directory the binaries,
+// plugins.lock and every directory up to / must be owned by root. Root-owned
+// directories with the sticky bit, such as /tmp, are accepted along the
+// way. The checksum is computed from the opened file, and on Linux that
+// same open file is executed through /proc/self/fd, so the binary cannot be
+// swapped between check and start. Elsewhere the binary is executed by
+// path after the check, which leaves a small window; the ownership checks
+// above are what close it.
 package pluginhost
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -58,18 +61,28 @@ func BinaryName(name string) string {
 
 // Host owns plugin instances for one connector run.
 type Host struct {
-	dataDir string
-	specs   map[string]config.PluginSpec
-	log     *slog.Logger
+	dataDir   string
+	pluginDir string
+	specs     map[string]config.PluginSpec
+	log       *slog.Logger
 
-	mu      sync.Mutex
-	local   *local.Store
-	clients map[string]*goplugin.Client
+	mu        sync.Mutex
+	local     *local.Store
+	clients   map[string]*goplugin.Client
+	locations map[string]Location
 }
 
-// New returns a host. Nothing starts until a plugin is requested.
+// New returns a host. Nothing starts until a plugin is requested. An empty
+// cfg.PluginDir turns the system plugin directory off.
 func New(cfg *config.Config, log *slog.Logger) *Host {
-	return &Host{dataDir: cfg.DataDir, specs: cfg.Plugins, log: log, clients: map[string]*goplugin.Client{}}
+	return &Host{
+		dataDir:   cfg.DataDir,
+		pluginDir: cfg.PluginDir,
+		specs:     cfg.Plugins,
+		log:       log,
+		clients:   map[string]*goplugin.Client{},
+		locations: map[string]Location{},
+	}
 }
 
 // KeyStore returns the key store called name. External key stores are
@@ -117,17 +130,16 @@ func (h *Host) timeout(name string) time.Duration {
 	return config.DefaultCallTimeout
 }
 
-// BinaryPath returns where the executable for an external plugin is
-// expected, and the directory up to which its parents are checked.
-func (h *Host) BinaryPath(name string) (path, stop string, err error) {
-	spec, ok := h.specs[name]
-	if !ok {
-		return "", "", fmt.Errorf("plugin %q is not declared under plugins", name)
+// CheckPlugin starts the external plugin called name, if it is not running
+// yet, and returns where its executable was found and what its checksum
+// was checked against.
+func (h *Host) CheckPlugin(name string) (Location, error) {
+	if _, err := h.rpc(name); err != nil {
+		return Location{}, err
 	}
-	if spec.Path != "" {
-		return spec.Path, string(filepath.Separator), nil
-	}
-	return filepath.Join(h.dataDir, "plugins", name, spec.Version, BinaryName(name)), h.dataDir, nil
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.locations[name], nil
 }
 
 // rpc returns a running client for the plugin, starting it, or restarting
@@ -143,7 +155,7 @@ func (h *Host) rpc(name string) (goplugin.ClientProtocol, error) {
 		c.Kill()
 		delete(h.clients, name)
 	}
-	client, err := h.start(name)
+	client, loc, err := h.start(name)
 	if err != nil {
 		return nil, err
 	}
@@ -153,31 +165,20 @@ func (h *Host) rpc(name string) (goplugin.ClientProtocol, error) {
 		return nil, fmt.Errorf("start plugin %s: %w", name, err)
 	}
 	h.clients[name] = client
+	h.locations[name] = loc
 	return rpc, nil
 }
 
-func (h *Host) start(name string) (*goplugin.Client, error) {
-	path, stop, err := h.BinaryPath(name)
-	if err != nil {
-		return nil, err
+func (h *Host) start(name string) (*goplugin.Client, Location, error) {
+	if _, ok := h.specs[name]; !ok {
+		return nil, Location{}, fmt.Errorf("plugin %q is not declared under plugins", name)
 	}
-	f, err := OpenBinary(path, stop)
+	f, loc, err := h.open(name)
 	if err != nil {
-		return nil, fmt.Errorf("plugin %s: %w", name, err)
+		return nil, loc, fmt.Errorf("plugin %s: %w", name, err)
 	}
 	defer func() { _ = f.Close() }()
-
-	sum := sha256.New()
-	if _, err := io.Copy(sum, f); err != nil {
-		return nil, fmt.Errorf("plugin %s: hash %s: %w", name, path, err)
-	}
-	got := sum.Sum(nil)
-	if want := h.specs[name].SHA256; want != "" {
-		wantBytes, _ := hex.DecodeString(want)
-		if !bytes.Equal(got, wantBytes) {
-			return nil, fmt.Errorf("plugin %s: checksum mismatch for %s: sha256 is %x, config says %s", name, path, got, want)
-		}
-	}
+	path := loc.Path
 
 	cmdPath := path
 	if runtime.GOOS == "linux" {
@@ -198,10 +199,10 @@ func (h *Host) start(name string) (*goplugin.Client, error) {
 	client := goplugin.NewClient(cfg)
 	if _, err := client.Start(); err != nil {
 		client.Kill()
-		return nil, fmt.Errorf("start plugin %s (%s): %w", name, path, err)
+		return nil, loc, fmt.Errorf("start plugin %s (%s): %w", name, path, err)
 	}
-	h.log.Debug("plugin started", "plugin", name, "path", path, "sha256", hex.EncodeToString(got))
-	return client, nil
+	h.log.Debug("plugin started", "plugin", name, "path", path, "source", string(loc.Source), "sha256", loc.SHA256, "pinned_by", strings.Join(loc.PinnedBy, ","))
+	return client, loc, nil
 }
 
 // connectorSecretEnv lists environment variables that carry the
@@ -224,9 +225,11 @@ func PluginEnv(environ []string) []string {
 	return out
 }
 
-// OpenBinary checks a plugin executable and its parent directories, then
-// opens it. See the package documentation for the rules.
-func OpenBinary(path, stop string) (*os.File, error) {
+// openChecked checks a file and its parent directories up to stop, then
+// opens it. See the package documentation for the rules. With rootOnly, the
+// file and the directories must be owned by root. With exe, the file must
+// be executable.
+func openChecked(path, stop string, rootOnly, exe bool) (*os.File, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("%s is not an absolute path", path)
 	}
@@ -234,16 +237,16 @@ func OpenBinary(path, stop string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := checkOwned(path, info, false); err != nil {
+	if err := checkOwned(path, info, false, rootOnly); err != nil {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file", path)
 	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o100 == 0 {
+	if exe && runtime.GOOS != "windows" && info.Mode().Perm()&0o100 == 0 {
 		return nil, fmt.Errorf("%s is not executable", path)
 	}
-	if err := checkParents(filepath.Dir(path), stop); err != nil {
+	if err := checkParents(filepath.Dir(path), stop, rootOnly); err != nil {
 		return nil, err
 	}
 	f, err := os.Open(path)
@@ -259,7 +262,7 @@ func OpenBinary(path, stop string) (*os.File, error) {
 	return f, nil
 }
 
-func checkParents(dir, stop string) error {
+func checkParents(dir, stop string, rootOnly bool) error {
 	realDir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return err
@@ -273,7 +276,7 @@ func checkParents(dir, stop string) error {
 		if err != nil {
 			return err
 		}
-		if err := checkOwned(d, info, true); err != nil {
+		if err := checkOwned(d, info, true, rootOnly); err != nil {
 			return err
 		}
 		if d == realStop || d == filepath.Dir(d) {
@@ -282,10 +285,14 @@ func checkParents(dir, stop string) error {
 	}
 }
 
-// checkOwned requires path to be owned by root or the connector's user and
-// not writable by group or others. Root-owned sticky directories are
-// allowed.
-func checkOwned(path string, info fs.FileInfo, isDirCheck bool) error {
+// systemDirOwnUser lets tests, which do not run as root, use files they
+// own as a system plugin directory.
+var systemDirOwnUser = false
+
+// checkOwned requires path to be owned by root or the connector's user (by
+// root alone with rootOnly) and not writable by group or others. Root-owned
+// sticky directories are allowed.
+func checkOwned(path string, info fs.FileInfo, isDirCheck, rootOnly bool) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
@@ -293,7 +300,12 @@ func checkOwned(path string, info fs.FileInfo, isDirCheck bool) error {
 		return fmt.Errorf("%s is a symlink; point the config at the real file", path)
 	}
 	uid, _ := securefs.Owner(info)
-	if uid != 0 && uid != os.Geteuid() {
+	mine := uid == os.Geteuid()
+	switch {
+	case uid == 0:
+	case rootOnly && (!systemDirOwnUser || !mine):
+		return fmt.Errorf("%s is owned by uid %d, not root; everything in the system plugin directory must be owned by root", path, uid)
+	case !mine:
 		return fmt.Errorf("%s is owned by uid %d, not root or the user running the connector", path, uid)
 	}
 	if info.Mode().Perm()&0o022 != 0 {

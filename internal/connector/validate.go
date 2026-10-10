@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -12,8 +13,15 @@ import (
 	"github.com/krakenkey/connector/internal/api"
 	"github.com/krakenkey/connector/internal/certutil"
 	"github.com/krakenkey/connector/internal/config"
+	"github.com/krakenkey/connector/internal/pluginhost"
 	"github.com/krakenkey/connector/pkg/plugin"
 )
+
+// PluginChecker is implemented by resolvers that run external plugins.
+// CheckPlugin starts a plugin and says where it was found.
+type PluginChecker interface {
+	CheckPlugin(name string) (pluginhost.Location, error)
+}
 
 // CertGetter is the API call validate uses.
 type CertGetter interface {
@@ -33,10 +41,39 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 	fmt.Fprintf(w, "API:        %s\n", cfg.KrakenKey.APIURL)
 	fmt.Fprintf(w, "Data dir:   %s\n", cfg.DataDir)
 	fmt.Fprintf(w, "Audit log:  %s\n", cfg.AuditLog)
+	fmt.Fprintf(w, "Plugin dir: %s\n", cfg.PluginDir)
 	fmt.Fprintf(w, "Interval:   %s\n", cfg.CheckInterval)
 	for _, warn := range cfg.Warnings() {
 		warnings++
 		fmt.Fprintf(w, "WARNING: %s\n", warn)
+	}
+
+	if pc, ok := r.(PluginChecker); ok && len(cfg.Plugins) > 0 {
+		fmt.Fprintf(w, "\nPlugins\n")
+		names := make([]string, 0, len(cfg.Plugins))
+		for name := range cfg.Plugins {
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		for _, name := range names {
+			if v := cfg.Plugins[name].Version; v != "" && cfg.Plugins[name].Path == "" {
+				fmt.Fprintf(w, "  %s %s", name, v)
+			} else {
+				fmt.Fprintf(w, "  %s", name)
+			}
+			loc, err := pc.CheckPlugin(name)
+			if err != nil {
+				fmt.Fprintln(w)
+				bad("%v", err)
+				continue
+			}
+			fmt.Fprintf(w, ": %s (%s)\n", loc.Path, pluginSource(loc.Source))
+			if len(loc.PinnedBy) == 0 {
+				fmt.Fprintf(w, "    sha256 %s, not pinned (set sha256 to pin it)\n", loc.SHA256)
+			} else {
+				fmt.Fprintf(w, "    sha256 %s, matches %s\n", loc.SHA256, strings.Join(pinNames(loc.PinnedBy), " and "))
+			}
+		}
 	}
 
 	authFailed := false
@@ -167,6 +204,29 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 
 	fmt.Fprintf(w, "\n%d problem(s), %d warning(s)\n", problems, warnings)
 	return problems
+}
+
+func pluginSource(s pluginhost.Source) string {
+	switch s {
+	case pluginhost.SourcePath:
+		return "path from the config"
+	case pluginhost.SourceDataDir:
+		return "data dir"
+	case pluginhost.SourcePluginDir:
+		return "system plugin dir"
+	}
+	return string(s)
+}
+
+func pinNames(pins []string) []string {
+	out := make([]string, len(pins))
+	for i, p := range pins {
+		if p == pluginhost.PinConfig {
+			p = "the config's sha256"
+		}
+		out[i] = p
+	}
+	return out
 }
 
 func joinFormats(fs []plugin.KeyFormat) string {
