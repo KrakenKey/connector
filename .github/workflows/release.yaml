@@ -48,3 +48,6 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Build the connector from its own go.mod, not the go.work
+          # workspace that also holds the plugin modules.
+          GOWORK: 'off'

@@ -10,6 +10,10 @@ protocol and the KrakenKey API the connector uses.
 
 ### Added
 
+- `azure-keyvault` key store plugin (`plugins/azure-keyvault`): Azure Key
+  Vault creates the key and the CSR and keeps the issued certificate, so the
+  key leaves the vault only for exportable certificates whose targets need
+  PEM or PFX. Targets such as Application Gateway get the versioned secret id.
 - `aws-acm` target plugin (`plugins/aws-acm`, its own Go module): re-imports
   certificates into an existing imported ACM certificate, so load balancers,
   CloudFront and API Gateway keep using the same ARN. It checks the

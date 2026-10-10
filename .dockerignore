@@ -4,3 +4,6 @@ dist
 *.pem
 *.key
 coverage.out
+go.work
+go.work.sum
+plugins

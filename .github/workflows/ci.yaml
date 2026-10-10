@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# Every module builds against its own go.mod; go.work is for local development.
+env:
+  GOWORK: 'off'
+
 jobs:
   lint-test:
     name: Lint and Test
@@ -69,7 +73,9 @@ jobs:
           cache-dependency-path: ${{ matrix.dir }}/go.sum
 
       - name: Verify dependencies
-        run: GOWORK=off go mod verify
+        run: |
+          go mod verify
+          go mod tidy -diff
 
       - name: Run golangci-lint
         run: |
@@ -78,6 +84,9 @@ jobs:
 
       - name: Run tests
         run: go test ./... -race
+
+      - name: Build
+        run: CGO_ENABLED=0 go build -o /dev/null ./cmd/...
 
   # The aws-acm tests run against the fake ACM above; this job repeats the
   # end-to-end case against LocalStack. 4.14.0 is the last community image
