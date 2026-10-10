@@ -42,6 +42,7 @@ const (
 	OpGetPolicy     = "getPolicy"
 	OpGetCert       = "getCert"
 	OpGetSecret     = "getSecret"
+	OpGetDeleted    = "getDeleted"
 )
 
 // Token is the only bearer token the fake accepts.
@@ -71,6 +72,8 @@ type Server struct {
 	ignoreReuse bool
 	// base is the vault URL of the request being served.
 	base string
+	// deleted holds soft-deleted certificates.
+	deleted map[string]*certificate
 }
 
 type certificate struct {
@@ -81,6 +84,8 @@ type certificate struct {
 
 type version struct {
 	id          string
+	tags        map[string]*string
+	disabled    bool
 	key         crypto.Signer
 	certs       [][]byte
 	exportable  bool
@@ -95,13 +100,14 @@ type pendingOp struct {
 	status    string
 	hideCSR   int
 	issuer    string
+	tags      map[string]*string
 }
 
 // New starts a fake vault whose TLS certificate is valid for hosts (plus
 // 127.0.0.1 and localhost). resource is the challenge resource; empty
 // means the server's own URL.
 func New(hosts []string, resource string) (*Server, error) {
-	s := &Server{certs: map[string]*certificate{}, deny: map[string]bool{}, fail: map[string][]failure{}}
+	s := &Server{certs: map[string]*certificate{}, deleted: map[string]*certificate{}, deny: map[string]bool{}, fail: map[string][]failure{}}
 	tlsCfg, caPEM, err := serverTLS(append([]string{"127.0.0.1", "localhost"}, hosts...))
 	if err != nil {
 		return nil, err
@@ -140,17 +146,83 @@ func (s *Server) FailNext(op string, statuses ...int) {
 	s.mu.Unlock()
 }
 
-// FailNextWith makes the next call of op answer with status and a Key
-// Vault error message.
-func (s *Server) FailNextWith(op string, status int, message string) {
+// FailNextWith makes the next call of op answer with status, a Key Vault
+// error message and an inner error code (may be empty).
+func (s *Server) FailNextWith(op string, status int, message, innerCode string) {
 	s.mu.Lock()
-	s.fail[op] = append(s.fail[op], failure{status: status, message: message})
+	s.fail[op] = append(s.fail[op], failure{status: status, message: message, inner: innerCode})
 	s.mu.Unlock()
 }
 
 type failure struct {
 	status  int
 	message string
+	inner   string
+}
+
+// AddVersion adds a completed, self-signed version with the given tags,
+// as if someone created the certificate outside the connector.
+func (s *Server) AddVersion(name string, tags map[string]string) error {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	tmpl := &x509.Certificate{SerialNumber: serial(), Subject: pkix.Name{CommonName: name},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
+	if err != nil {
+		return err
+	}
+	t := map[string]*string{}
+	for k, v := range tags {
+		t[k] = &v
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.certs[name]
+	if c == nil {
+		self := "Self"
+		c = &certificate{policy: &azcertificates.CertificatePolicy{IssuerParameters: &azcertificates.IssuerParameters{Name: &self}}}
+		s.certs[name] = c
+	}
+	c.versions = append(c.versions, &version{id: randomHex(16), key: key, certs: [][]byte{der}, exportable: true,
+		contentType: "application/x-pkcs12", tags: t})
+	return nil
+}
+
+// SoftDelete moves a certificate to the deleted state: it is no longer
+// found, and its name cannot be reused until it is recovered or purged.
+func (s *Server) SoftDelete(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c := s.certs[name]; c != nil {
+		s.deleted[name] = c
+		delete(s.certs, name)
+	}
+}
+
+// DisableVersion disables a version: its secret can no longer be read.
+func (s *Server) DisableVersion(name, id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if v := s.certs[name].find(id); v != nil {
+		v.disabled = true
+	}
+}
+
+// Tags returns the tags of a certificate version ("" for the latest).
+func (s *Server) Tags(name, id string) map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.certs[name].find(id)
+	if v == nil {
+		return nil
+	}
+	out := map[string]string{}
+	for k, p := range v.tags {
+		out[k] = *p
+	}
+	return out
 }
 
 // HideCSR makes the next create leave the CSR out of its response and out
@@ -296,7 +368,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		if f[0].status == http.StatusTooManyRequests {
 			w.Header().Set("Retry-After", "0")
 		}
-		kvError(w, f[0].status, strings.ReplaceAll(http.StatusText(f[0].status), " ", ""), f[0].message)
+		kvErrorInner(w, f[0].status, strings.ReplaceAll(http.StatusText(f[0].status), " ", ""), f[0].message, f[0].inner)
 		return
 	}
 
@@ -325,6 +397,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.operation(name, p, true))
 	case OpMerge:
 		s.merge(w, name, c, body)
+	case OpGetDeleted:
+		if s.deleted[name] == nil {
+			kvError(w, http.StatusNotFound, "CertificateNotFound", "Deleted Certificate not found: "+name)
+			return
+		}
+		id := azcertificates.ID(s.base + "/certificates/" + name)
+		writeJSON(w, http.StatusOK, azcertificates.DeletedCertificate{ID: &id})
 	case OpGetPolicy:
 		if c == nil || c.policy == nil {
 			kvError(w, http.StatusNotFound, "CertificateNotFound", "A certificate with (name/id) "+name+" was not found in this key vault.")
@@ -342,6 +421,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		v := c.find(segment(parts, 2))
 		if v == nil {
 			kvError(w, http.StatusNotFound, "SecretNotFound", "A secret with (name/id) "+name+" was not found in this key vault.")
+			return
+		}
+		if v.disabled {
+			kvErrorInner(w, http.StatusForbidden, "Forbidden", "Operation get is not allowed on a disabled secret.", "SecretDisabled")
 			return
 		}
 		value, err := secretValue(v)
@@ -381,6 +464,8 @@ func route(method string, p []string) (op, name string) {
 		return OpGetCert, name
 	case p[0] == "secrets" && method == http.MethodGet:
 		return OpGetSecret, name
+	case p[0] == "deletedcertificates" && method == http.MethodGet:
+		return OpGetDeleted, name
 	}
 	return "", ""
 }
@@ -408,6 +493,10 @@ func (s *Server) create(w http.ResponseWriter, name string, c *certificate, body
 		kvError(w, http.StatusBadRequest, "BadParameter", "invalid create request")
 		return
 	}
+	if s.deleted[name] != nil {
+		kvErrorInner(w, http.StatusConflict, "Conflict", "Certificate "+name+" is currently in a deleted but recoverable state, and its name cannot be reused; in this state, the certificate can only be recovered or purged.", "ObjectIsDeletedButRecoverable")
+		return
+	}
 	if c == nil {
 		c = &certificate{}
 		s.certs[name] = c
@@ -424,7 +513,7 @@ func (s *Server) create(w http.ResponseWriter, name string, c *certificate, body
 	}
 	tmpl := &x509.CertificateRequest{}
 	if x := pol.X509CertificateProperties; x != nil {
-		if x.Subject != nil {
+		if x.Subject != nil && *x.Subject != "" {
 			tmpl.Subject = pkix.Name{CommonName: strings.TrimPrefix(*x.Subject, "CN=")}
 		}
 		if x.SubjectAlternativeNames != nil {
@@ -443,7 +532,7 @@ func (s *Server) create(w http.ResponseWriter, name string, c *certificate, body
 		issuer = *pol.IssuerParameters.Name
 	}
 	c.policy = pol
-	c.pending = &pendingOp{key: key, csr: csr, policy: pol, requestID: randomHex(16), status: "inProgress", issuer: issuer}
+	c.pending = &pendingOp{key: key, csr: csr, policy: pol, requestID: randomHex(16), status: "inProgress", issuer: issuer, tags: params.Tags}
 	show := true
 	if s.omitCSROnCreate {
 		show = false
@@ -508,7 +597,10 @@ func (s *Server) merge(w http.ResponseWriter, name string, c *certificate, body 
 		kvError(w, http.StatusBadRequest, "BadParameter", "Public key from x509 certificate and key of this instance doesn't match")
 		return
 	}
-	v := &version{id: randomHex(16), key: c.pending.key, certs: params.X509Certificates, exportable: true, contentType: "application/x-pkcs12"}
+	v := &version{id: randomHex(16), key: c.pending.key, certs: params.X509Certificates, exportable: true, contentType: "application/x-pkcs12", tags: c.pending.tags}
+	if params.Tags != nil {
+		v.tags = params.Tags
+	}
 	if kp := c.pending.policy.KeyProperties; kp != nil && kp.Exportable != nil {
 		v.exportable = *kp.Exportable
 	}
@@ -543,6 +635,7 @@ func (s *Server) certJSON(name string, c *certificate, v *version) azcertificate
 	return azcertificates.Certificate{
 		ID: &id, KID: &kid, SID: &sid,
 		CER:        v.certs[0],
+		Tags:       v.tags,
 		Policy:     c.policy,
 		Attributes: &azcertificates.CertificateAttributes{Enabled: &enabled},
 	}
@@ -599,7 +692,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func kvError(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message": msg}})
+	kvErrorInner(w, status, code, msg, "")
+}
+
+func kvErrorInner(w http.ResponseWriter, status int, code, msg, inner string) {
+	e := map[string]any{"code": code, "message": msg}
+	if inner != "" {
+		e["innererror"] = map[string]string{"code": inner}
+	}
+	writeJSON(w, status, map[string]any{"error": e})
 }
 
 func randomHex(n int) string {

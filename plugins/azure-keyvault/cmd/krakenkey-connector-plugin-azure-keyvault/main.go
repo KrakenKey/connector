@@ -14,13 +14,15 @@ import (
 )
 
 func main() {
+	// go-plugin forwards these stderr lines into the connector's log.
+	logger := hclog.New(&hclog.LoggerOptions{
+		Name:       "azure-keyvault",
+		Output:     os.Stderr,
+		Level:      hclog.Info,
+		JSONFormat: true,
+	})
 	plugin.Serve(plugin.ServeOpts{
-		KeyStore: keyvault.New(keyvault.Options{}),
-		Logger: hclog.New(&hclog.LoggerOptions{
-			Name:       "azure-keyvault",
-			Output:     os.Stderr,
-			Level:      hclog.Info,
-			JSONFormat: true,
-		}),
+		KeyStore: keyvault.New(keyvault.Options{Logger: logger}),
+		Logger:   logger,
 	})
 }

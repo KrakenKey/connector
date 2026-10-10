@@ -26,6 +26,10 @@ type Config struct {
 	// ReuseKey asks Key Vault to keep the same key pair for new versions.
 	// Default false.
 	ReuseKey bool `json:"reuse_key"`
+	// Adopt lets the connector take over a certificate it did not create
+	// (no ownership tag, or the tag of another KrakenKey certificate).
+	// Default false.
+	Adopt bool `json:"adopt"`
 }
 
 // settings is a parsed and checked Config.
@@ -34,6 +38,7 @@ type settings struct {
 	name       string
 	exportable bool
 	reuseKey   bool
+	adopt      bool
 }
 
 var (
@@ -58,7 +63,7 @@ func parseConfig(raw json.RawMessage) (settings, []string) {
 	}
 
 	var problems []string
-	s := settings{exportable: true, reuseKey: c.ReuseKey, name: c.CertificateName}
+	s := settings{exportable: true, reuseKey: c.ReuseKey, adopt: c.Adopt, name: c.CertificateName}
 	if c.Exportable != nil {
 		s.exportable = *c.Exportable
 	}
@@ -100,14 +105,14 @@ func vaultURL(s string) (string, error) {
 	switch {
 	case u.Scheme != "https":
 		return "", fmt.Errorf("%q must use https", s)
-	case u.Host == "" || u.Hostname() == "":
+	case u.Hostname() == "":
 		return "", fmt.Errorf("%q has no host", s)
 	case u.User != nil:
 		return "", fmt.Errorf("%q must not contain credentials", s)
 	case u.Path != "" && u.Path != "/", u.RawQuery != "", u.Fragment != "":
 		return "", fmt.Errorf("%q must be the vault URL alone, such as https://my-vault.vault.azure.net", s)
 	}
-	return "https://" + strings.ToLower(u.Host), nil
+	return "https://" + normHost(u), nil
 }
 
 // keyParams maps a connector key type to Key Vault key properties.

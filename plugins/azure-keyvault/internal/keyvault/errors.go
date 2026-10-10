@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
@@ -41,8 +40,85 @@ var (
 		"Microsoft.KeyVault/vaults/secrets/getSecret/action", "secret permission Get"}
 )
 
+// Key Vault error codes (error.code or error.innererror.code) that get
+// their own message.
+const (
+	codeDeletedButRecoverable = "ObjectIsDeletedButRecoverable"
+	codeSecretDisabled        = "SecretDisabled"
+	codeCertificateDisabled   = "CertificateDisabled"
+	codeKeyDisabled           = "KeyDisabled"
+)
+
+// kvError is the body of a Key Vault error response.
+type kvError struct {
+	Code    string
+	Inner   string
+	Message string
+}
+
+// hasCode reports whether the error or its inner error has code.
+func (e kvError) hasCode(code string) bool { return e.Code == code || e.Inner == code }
+
+// detail renders ", <code>: <message>" for error messages.
+func (e kvError) detail() string {
+	out := ""
+	if e.Code != "" {
+		out = ", " + e.Code
+	}
+	if e.Inner != "" {
+		out += "/" + e.Inner
+	}
+	if e.Message != "" {
+		out += ": " + e.Message
+	}
+	return out
+}
+
+func parseKVError(re *azcore.ResponseError) kvError {
+	e := kvError{Code: re.ErrorCode}
+	if re.RawResponse == nil {
+		return e
+	}
+	body, err := runtime.Payload(re.RawResponse)
+	if err != nil {
+		return e
+	}
+	var b struct {
+		Error struct {
+			Code       string `json:"code"`
+			Message    string `json:"message"`
+			InnerError *struct {
+				Code string `json:"code"`
+			} `json:"innererror"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &b) != nil {
+		return e
+	}
+	if b.Error.Code != "" {
+		e.Code = b.Error.Code
+	}
+	if b.Error.InnerError != nil {
+		e.Inner = b.Error.InnerError.Code
+	}
+	e.Message = b.Error.Message
+	if len(e.Message) > 300 {
+		e.Message = e.Message[:300] + "..."
+	}
+	return e
+}
+
+// responseError returns the Key Vault response error in err, if any.
+func responseError(err error) (*azcore.ResponseError, kvError, bool) {
+	var re *azcore.ResponseError
+	if !errors.As(err, &re) {
+		return nil, kvError{}, false
+	}
+	return re, parseKVError(re), true
+}
+
 // classify turns an error from the Azure SDK into one of the plugin error
-// kinds. It never includes response bodies beyond Key Vault's error code
+// kinds. It never includes response bodies beyond Key Vault's error codes
 // and message, which do not carry key material.
 func classify(op operation, name string, err error) error {
 	if err == nil {
@@ -58,9 +134,16 @@ func classify(op operation, name string, err error) error {
 		return fmt.Errorf("%w: %s: Azure rejected the identity: %v", plugin.ErrPermanent, prefix, err)
 	}
 
-	var re *azcore.ResponseError
-	if errors.As(err, &re) {
-		detail := kvMessage(re)
+	if re, kv, ok := responseError(err); ok {
+		detail := kv.detail()
+		switch {
+		case kv.hasCode(codeDeletedButRecoverable):
+			return fmt.Errorf("%w: %s: the certificate is soft-deleted in Key Vault (HTTP %d%s); recover or purge it, or use another certificate_name",
+				plugin.ErrPermanent, prefix, re.StatusCode, detail)
+		case kv.hasCode(codeSecretDisabled), kv.hasCode(codeCertificateDisabled), kv.hasCode(codeKeyDisabled):
+			return fmt.Errorf("%w: %s: this version is disabled in Key Vault (HTTP %d%s); enable it again while a target still uses it",
+				plugin.ErrPermanent, prefix, re.StatusCode, detail)
+		}
 		switch re.StatusCode {
 		case http.StatusUnauthorized:
 			return fmt.Errorf("%w: %s: Key Vault rejected the token (HTTP 401%s); check that the identity is in the vault's tenant",
@@ -71,10 +154,6 @@ func classify(op operation, name string, err error) error {
 		case http.StatusNotFound:
 			return fmt.Errorf("%w: %s: HTTP 404%s", plugin.ErrNotFound, prefix, detail)
 		case http.StatusConflict:
-			if strings.Contains(detail, "deleted but recoverable") {
-				return fmt.Errorf("%w: %s: the certificate is soft-deleted in Key Vault (HTTP 409%s); recover or purge it, or use another certificate_name",
-					plugin.ErrPermanent, prefix, detail)
-			}
 			return fmt.Errorf("%w: %s: conflict (HTTP 409%s)", plugin.ErrUnavailable, prefix, detail)
 		case http.StatusTooManyRequests, http.StatusRequestTimeout:
 			return fmt.Errorf("%w: %s: Key Vault is throttling requests (HTTP %d%s)", plugin.ErrUnavailable, prefix, re.StatusCode, detail)
@@ -97,38 +176,6 @@ func classify(op operation, name string, err error) error {
 	return fmt.Errorf("%w: %s: %v", plugin.ErrUnavailable, prefix, err)
 }
 
-// kvMessage returns ", <code>: <message>" from a Key Vault error body.
-func kvMessage(re *azcore.ResponseError) string {
-	out := ""
-	if re.ErrorCode != "" {
-		out = ", " + re.ErrorCode
-	}
-	if re.RawResponse == nil {
-		return out
-	}
-	body, err := runtime.Payload(re.RawResponse)
-	if err != nil {
-		return out
-	}
-	var e struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(body, &e) != nil || e.Error.Message == "" {
-		return out
-	}
-	msg := e.Error.Message
-	if len(msg) > 300 {
-		msg = msg[:300] + "..."
-	}
-	if out == "" {
-		return ": " + msg
-	}
-	return out + ": " + msg
-}
-
 func innermost(err error) error {
 	for {
 		next := errors.Unwrap(err)
@@ -139,7 +186,9 @@ func innermost(err error) error {
 	}
 }
 
-func isNotFound(err error) bool {
-	var re *azcore.ResponseError
-	return errors.As(err, &re) && re.StatusCode == http.StatusNotFound
+func hasStatus(err error, status int) bool {
+	re, _, ok := responseError(err)
+	return ok && re.StatusCode == status
 }
+
+func isNotFound(err error) bool { return hasStatus(err, http.StatusNotFound) }

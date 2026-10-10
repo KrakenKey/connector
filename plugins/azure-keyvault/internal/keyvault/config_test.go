@@ -21,6 +21,8 @@ func TestParseConfig(t *testing.T) {
 			vault: "https://my-vault1.vault.azure.net", exportable: true},
 		{name: "vault URL", config: `{"vault":"https://kv.vault.azure.cn/","certificate_name":"web"}`,
 			vault: "https://kv.vault.azure.cn", exportable: true},
+		{name: "vault URL with default port", config: `{"vault":"https://KV1.vault.azure.net:443","certificate_name":"web"}`,
+			vault: "https://kv1.vault.azure.net", exportable: true},
 		{name: "vault URL with port", config: `{"vault":"https://127.0.0.1:8443","certificate_name":"web"}`,
 			vault: "https://127.0.0.1:8443", exportable: true},
 		{name: "not exportable, reuse key", config: `{"vault":"kv1","certificate_name":"web","exportable":false,"reuse_key":true}`,
@@ -95,8 +97,8 @@ func TestCheckNames(t *testing.T) {
 
 func TestRefs(t *testing.T) {
 	spki := strings.Repeat("ab", 32)
-	pending := keyRef{vaultURL: "https://kv1.vault.azure.net", name: "web", spki: spki}
-	if got := pending.String(); got != "https://kv1.vault.azure.net/certificates/web/pending?spki_sha256="+spki {
+	pending := keyRef{vaultURL: "https://kv1.vault.azure.net", name: "web", spki: spki, certID: "1043"}
+	if got := pending.String(); got != "https://kv1.vault.azure.net/certificates/web/pending?certificate_id=1043&spki_sha256="+spki {
 		t.Errorf("pending ref = %s", got)
 	}
 	done := keyRef{vaultURL: "https://kv1.vault.azure.net", name: "web", version: "0123abcd"}
@@ -112,8 +114,14 @@ func TestRefs(t *testing.T) {
 			t.Errorf("parseRef(%s) = %+v, %v", r, back, err)
 		}
 	}
+	// Key Vault ids may carry the default port; refs compare without it.
+	if r, err := parseRef("https://KV1.vault.azure.net:443/certificates/web/0123abcd"); err != nil || r != done {
+		t.Errorf("parseRef with :443 = %+v, %v", r, err)
+	}
 	for _, bad := range []string{
-		"", "local/abc", "http://kv1.vault.azure.net/certificates/web/v1",
+		"", "local/abc",
+		"https://kv1.vault.azure.net/certificates/web/pending?spki_sha256=" + spki,
+		"https://kv1.vault.azure.net/certificates/web/pending?certificate_id=a%20b&spki_sha256=" + spki, "http://kv1.vault.azure.net/certificates/web/v1",
 		"https://kv1.vault.azure.net/secrets/web/v1",
 		"https://kv1.vault.azure.net/certificates/web",
 		"https://kv1.vault.azure.net/certificates/web/pending",

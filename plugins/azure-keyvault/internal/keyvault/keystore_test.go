@@ -20,6 +20,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/hashicorp/go-hclog"
 	pkcs12 "software.sslmate.com/src/go-pkcs12"
 
 	"github.com/krakenkey/connector/pkg/plugin"
@@ -143,7 +144,7 @@ func TestIssueAndExport(t *testing.T) {
 	if req.Subject.CommonName != "www.example.com" || !slices.Equal(req.DNSNames, []string{"www.example.com", "example.com"}) {
 		t.Errorf("CSR subject %q, names %v", req.Subject.CommonName, req.DNSNames)
 	}
-	if !strings.HasPrefix(csr.KeyRef, e.srv.URL+"/certificates/web/pending?spki_sha256=") {
+	if !strings.HasPrefix(csr.KeyRef, e.srv.URL+"/certificates/web/pending?certificate_id=7&spki_sha256=") {
 		t.Errorf("pending key ref = %s", csr.KeyRef)
 	}
 	spki, err := e.ks.PublicKey(e.ctx, plugin.PublicKeyRequest{Config: cfg, KeyRef: csr.KeyRef})
@@ -165,6 +166,9 @@ func TestIssueAndExport(t *testing.T) {
 	}
 	if e.srv.HasPending("web") {
 		t.Error("request still pending after Complete")
+	}
+	if tags := e.srv.Tags("web", ""); tags[tagCertificateID] != "7" {
+		t.Errorf("version tags = %v", tags)
 	}
 
 	spki, err = e.ks.PublicKey(e.ctx, plugin.PublicKeyRequest{Config: cfg, KeyRef: ref})
@@ -221,6 +225,7 @@ func TestIssueAndExport(t *testing.T) {
 
 func TestKeyTypes(t *testing.T) {
 	e := newEnv(t)
+	e.issue(t, e.config(""))
 	for _, kt := range plugin.AllKeyTypes {
 		t.Run(string(kt), func(t *testing.T) {
 			_, req := e.csr(t, e.config(""), kt)
@@ -254,7 +259,7 @@ func TestWildcardNames(t *testing.T) {
 			t.Errorf("%q: err = %v, want ErrInvalid", names, err)
 		}
 	}
-	if calls := e.srv.Calls(); len(calls) != 2 {
+	if calls := e.srv.Calls(); len(calls) != 4 {
 		t.Errorf("rejected names reached Key Vault: %v", calls)
 	}
 }
@@ -312,6 +317,7 @@ func TestExportErrors(t *testing.T) {
 func TestInterruptedPendingRequest(t *testing.T) {
 	e := newEnv(t)
 	cfg := e.config("")
+	e.issue(t, cfg)
 	first, _ := e.csr(t, cfg, plugin.KeyTypeECDSAP256)
 	// The connector stopped before recording first; the next run asks for
 	// a new CSR, which replaces the stale request.
@@ -353,9 +359,10 @@ func TestInterruptedPendingRequest(t *testing.T) {
 func TestPendingRequestFromAnotherIssuer(t *testing.T) {
 	e := newEnv(t)
 	cfg := e.config("")
+	e.issue(t, cfg)
 	e.csr(t, cfg, plugin.KeyTypeECDSAP256)
 	e.srv.SetPendingIssuer("web", "DigiCert")
-	_, err := e.ks.CreateCSR(e.ctx, plugin.CSRRequest{Config: cfg, Names: []string{"a.example"}, KeyType: plugin.KeyTypeECDSAP256})
+	_, err := e.ks.CreateCSR(e.ctx, plugin.CSRRequest{Config: cfg, CertificateID: "7", Names: []string{"a.example"}, KeyType: plugin.KeyTypeECDSAP256})
 	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "DigiCert") {
 		t.Errorf("err = %v, want ErrPermanent naming the issuer", err)
 	}
@@ -446,9 +453,25 @@ func TestRenewedWithSameKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A renewal of the connector's own is pending: wait for it rather
+	// than delete it.
+	pending, _ := e.csr(t, cfg, plugin.KeyTypeECDSAP256)
+	if _, err := e.ks.Complete(e.ctx, plugin.CompleteRequest{Config: cfg, KeyRef: ref, CertPEM: leaf, ChainPEM: chain}); !errors.Is(err, plugin.ErrUnavailable) {
+		t.Fatalf("Complete(renewed) with a pending request: %v, want ErrUnavailable", err)
+	}
+	if !e.srv.HasPending("web") {
+		t.Fatal("same-key renewal deleted the pending request")
+	}
+	if err := e.ks.Release(e.ctx, plugin.ReleaseRequest{Config: cfg, KeyRef: pending.KeyRef}); err != nil {
+		t.Fatal(err)
+	}
+
 	newRef, err := e.ks.Complete(e.ctx, plugin.CompleteRequest{Config: cfg, KeyRef: ref, CertPEM: leaf, ChainPEM: chain})
 	if err != nil {
 		t.Fatalf("Complete(renewed): %v", err)
+	}
+	if tags := e.srv.Tags("web", ""); tags[tagCertificateID] != "7" {
+		t.Errorf("renewed version tags = %v", tags)
 	}
 	versions := e.srv.Versions("web")
 	if newRef == ref || len(versions) != 2 || newRef != e.srv.URL+"/certificates/web/"+versions[1] {
@@ -486,7 +509,7 @@ func TestRenewedWithSameKeyNotReused(t *testing.T) {
 func TestCSRPolling(t *testing.T) {
 	e := newEnv(t)
 	e.srv.HideCSR(3)
-	_, req := e.csr(t, e.config(""), plugin.KeyTypeECDSAP256)
+	_, _, _, req := e.issue(t, e.config(""))
 	if req.Subject.CommonName != "www.example.com" {
 		t.Errorf("CN = %q", req.Subject.CommonName)
 	}
@@ -495,7 +518,7 @@ func TestCSRPolling(t *testing.T) {
 	e.srv.HideCSR(1 << 20)
 	ctx, cancel := context.WithTimeout(e.ctx, 100*time.Millisecond)
 	defer cancel()
-	_, err := e.ks.CreateCSR(ctx, plugin.CSRRequest{Config: e.config(""), Names: []string{"a.example"}, KeyType: plugin.KeyTypeECDSAP256})
+	_, err := e.ks.CreateCSR(ctx, plugin.CSRRequest{Config: e.config(""), CertificateID: "7", Names: []string{"a.example"}, KeyType: plugin.KeyTypeECDSAP256})
 	if !errors.Is(err, plugin.ErrUnavailable) || errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, want ErrUnavailable only", err)
 	}
@@ -535,7 +558,7 @@ func TestValidate(t *testing.T) {
 func TestErrorKinds(t *testing.T) {
 	type call func(e *env, cfg json.RawMessage, ref string) error
 	createCSR := func(e *env, cfg json.RawMessage, _ string) error {
-		_, err := e.ks.CreateCSR(e.ctx, plugin.CSRRequest{Config: cfg, Names: []string{"a.example"}, KeyType: plugin.KeyTypeECDSAP256})
+		_, err := e.ks.CreateCSR(e.ctx, plugin.CSRRequest{Config: cfg, CertificateID: "7", Names: []string{"a.example"}, KeyType: plugin.KeyTypeECDSAP256})
 		return err
 	}
 	publicKey := func(e *env, cfg json.RawMessage, ref string) error {
@@ -587,10 +610,156 @@ func TestErrorKinds(t *testing.T) {
 
 func TestSoftDeletedCertificate(t *testing.T) {
 	e := newEnv(t)
-	e.srv.FailNextWith(fakevault.OpCreate, http.StatusConflict, "Certificate web is currently in a deleted but recoverable state, and its name cannot be reused; in this state, the certificate can only be recovered or purged.")
-	_, err := e.ks.CreateCSR(e.ctx, plugin.CSRRequest{Config: e.config(""), Names: []string{"a.example"}, KeyType: plugin.KeyTypeECDSAP256})
+	cfg := e.config("")
+	e.issue(t, cfg)
+	e.srv.SoftDelete("web")
+	problems, err := e.ks.Validate(e.ctx, plugin.KeyStoreValidateRequest{Config: cfg, CertificateID: "7"})
+	if err != nil || len(problems) != 1 || !strings.Contains(problems[0], "soft-deleted") {
+		t.Errorf("Validate = %q, %v", problems, err)
+	}
+	_, err = e.ks.CreateCSR(e.ctx, plugin.CSRRequest{Config: cfg, CertificateID: "7", Names: []string{"a.example"}, KeyType: plugin.KeyTypeECDSAP256})
 	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "recover or purge") {
-		t.Errorf("err = %v", err)
+		t.Errorf("CreateCSR: %v", err)
+	}
+	// Detected by Key Vault's error code, whatever the message says.
+	e.srv.FailNextWith(fakevault.OpGetCert, http.StatusConflict, "something else", "ObjectIsDeletedButRecoverable")
+	_, err = e.ks.PublicKey(e.ctx, plugin.PublicKeyRequest{Config: cfg, KeyRef: e.srv.URL + "/certificates/web/abc"})
+	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "soft-deleted") {
+		t.Errorf("by code: %v", err)
+	}
+}
+
+func TestDisabledVersion(t *testing.T) {
+	e := newEnv(t)
+	cfg := e.config("")
+	ref, _, _, _ := e.issue(t, cfg)
+	e.srv.DisableVersion("web", "")
+	_, err := e.ks.Export(e.ctx, plugin.ExportRequest{Config: cfg, KeyRef: ref, Format: plugin.KeyFormatPEM})
+	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "disabled") || strings.Contains(err.Error(), "grant the identity") {
+		t.Errorf("err = %v, want a disabled-version error, not a permission hint", err)
+	}
+}
+
+func TestOwnership(t *testing.T) {
+	csr := func(e *env, cfg json.RawMessage) error {
+		_, err := e.ks.CreateCSR(e.ctx, plugin.CSRRequest{Config: cfg, CertificateID: "7", Names: []string{"a.example"}, KeyType: plugin.KeyTypeECDSAP256})
+		return err
+	}
+	validate := func(e *env, cfg json.RawMessage) []string {
+		p, err := e.ks.Validate(e.ctx, plugin.KeyStoreValidateRequest{Config: cfg, CertificateID: "7"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	changed := func(e *env) bool {
+		for _, c := range e.srv.Calls() {
+			if strings.HasPrefix(c, fakevault.OpCreate) || strings.HasPrefix(c, fakevault.OpDeletePending) {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("untagged", func(t *testing.T) {
+		e := newEnv(t)
+		if err := e.srv.AddVersion("web", nil); err != nil {
+			t.Fatal(err)
+		}
+		if p := validate(e, e.config("")); len(p) != 1 || !strings.Contains(p[0], "not created by the connector") {
+			t.Errorf("Validate = %q", p)
+		}
+		if err := csr(e, e.config("")); !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "adopt: true") {
+			t.Errorf("CreateCSR = %v", err)
+		}
+		if changed(e) {
+			t.Error("a certificate the connector does not own was changed")
+		}
+		if p := validate(e, e.config(`"adopt":true`)); len(p) != 0 {
+			t.Errorf("Validate(adopt) = %q", p)
+		}
+		if err := csr(e, e.config(`"adopt":true`)); err != nil {
+			t.Errorf("CreateCSR(adopt) = %v", err)
+		}
+	})
+	t.Run("other certificate", func(t *testing.T) {
+		e := newEnv(t)
+		if err := e.srv.AddVersion("web", map[string]string{tagCertificateID: "9"}); err != nil {
+			t.Fatal(err)
+		}
+		if p := validate(e, e.config("")); len(p) != 1 || !strings.Contains(p[0], "KrakenKey certificate 9") {
+			t.Errorf("Validate = %q", p)
+		}
+		if err := csr(e, e.config("")); !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "certificate 9") {
+			t.Errorf("CreateCSR = %v", err)
+		}
+		if changed(e) {
+			t.Error("another certificate's Key Vault certificate was changed")
+		}
+	})
+	t.Run("pending only", func(t *testing.T) {
+		e := newEnv(t)
+		// Another connector, or one interrupted before its first
+		// issuance, has a request pending and no version yet.
+		if err := csr(e, e.config("")); err != nil {
+			t.Fatal(err)
+		}
+		if err := csr(e, e.config("")); !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "cannot tell who started it") {
+			t.Errorf("CreateCSR = %v", err)
+		}
+		if !e.srv.HasPending("web") {
+			t.Error("pending request deleted")
+		}
+		if err := csr(e, e.config(`"adopt":true`)); err != nil {
+			t.Errorf("CreateCSR(adopt) = %v", err)
+		}
+	})
+	t.Run("missing certificate id", func(t *testing.T) {
+		e := newEnv(t)
+		_, err := e.ks.CreateCSR(e.ctx, plugin.CSRRequest{Config: e.config(""), Names: []string{"a.example"}, KeyType: plugin.KeyTypeECDSAP256})
+		if !errors.Is(err, plugin.ErrInvalid) {
+			t.Errorf("err = %v", err)
+		}
+	})
+}
+
+func TestLongNames(t *testing.T) {
+	long := strings.Repeat("a", 60) + ".example.com" // 72 characters
+	e := newEnv(t)
+	e.issue(t, e.config(""))
+	_, req := e.csr(t, e.config(""), plugin.KeyTypeECDSAP256, long, "short.example.com")
+	if req.Subject.CommonName != "short.example.com" || !slices.Equal(req.DNSNames, []string{long, "short.example.com"}) {
+		t.Errorf("CN %q, names %v", req.Subject.CommonName, req.DNSNames)
+	}
+	_, req = e.csr(t, e.config(""), plugin.KeyTypeECDSAP256, long)
+	if req.Subject.CommonName != "" || !slices.Equal(req.DNSNames, []string{long}) {
+		t.Errorf("CN %q, names %v", req.Subject.CommonName, req.DNSNames)
+	}
+}
+
+func TestValidateSecretAccess(t *testing.T) {
+	var logs bytes.Buffer
+	e := newEnv(t)
+	e.ks.opts.Logger = hclog.New(&hclog.LoggerOptions{Output: &logs})
+	e.srv.Deny(fakevault.OpGetSecret)
+	if p, err := e.ks.Validate(e.ctx, plugin.KeyStoreValidateRequest{Config: e.config(""), CertificateID: "7"}); err != nil || len(p) != 0 {
+		t.Fatalf("Validate = %q, %v", p, err)
+	}
+	if !strings.Contains(logs.String(), "cannot read Key Vault secrets") {
+		t.Errorf("no warning logged: %q", logs.String())
+	}
+	logs.Reset()
+	if _, err := e.ks.Validate(e.ctx, plugin.KeyStoreValidateRequest{Config: e.config(`"exportable":false`)}); err != nil {
+		t.Fatal(err)
+	}
+	if logs.Len() != 0 {
+		t.Errorf("warned for a non-exportable certificate: %q", logs.String())
+	}
+	// The probe never reads an existing secret.
+	for _, c := range e.srv.Calls() {
+		if strings.HasPrefix(c, fakevault.OpGetSecret) && c != fakevault.OpGetSecret+" web" {
+			t.Errorf("unexpected call %q", c)
+		}
 	}
 }
 

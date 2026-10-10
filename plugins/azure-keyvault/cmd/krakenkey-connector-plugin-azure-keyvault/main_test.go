@@ -123,7 +123,7 @@ func TestPluginOverGRPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateCSR: %v", err)
 	}
-	if !strings.HasPrefix(csr.KeyRef, "https://"+vaultHost+"/certificates/web/pending?spki_sha256=") {
+	if !strings.HasPrefix(csr.KeyRef, "https://"+vaultHost+"/certificates/web/pending?certificate_id=7&spki_sha256=") {
 		t.Errorf("key ref = %s", csr.KeyRef)
 	}
 	b, _ := pem.Decode([]byte(csr.PEM))
@@ -173,7 +173,7 @@ func TestPluginOverGRPC(t *testing.T) {
 	}
 
 	// An abandoned key is released; a completed one is kept.
-	stale, err := ks.CreateCSR(ctx, plugin.CSRRequest{Config: config, Names: names, KeyType: plugin.KeyTypeECDSAP384})
+	stale, err := ks.CreateCSR(ctx, plugin.CSRRequest{Config: config, CertificateID: "7", Names: names, KeyType: plugin.KeyTypeECDSAP384})
 	if err != nil {
 		t.Fatal(err)
 	}

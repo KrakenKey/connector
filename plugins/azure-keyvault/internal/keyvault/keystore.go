@@ -13,11 +13,13 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/hashicorp/go-hclog"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azcertificates"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets"
@@ -36,6 +38,14 @@ const (
 	contentTypePEM    = "application/x-pem-file"
 
 	statusInProgress = "inProgress"
+
+	// probeVersion is a secret version that never exists. Reading it
+	// answers 404 with permission to read secrets and 403 without, so
+	// Validate can check access without fetching a private key.
+	probeVersion = "00000000000000000000000000000000"
+
+	// maxCNLength is the X.509 upper bound for a common name.
+	maxCNLength = 64
 )
 
 // Options configure a KeyStore. The zero value uses
@@ -52,6 +62,8 @@ type Options struct {
 	// PollInterval is how often CreateCSR polls for the CSR when Key Vault
 	// does not return it right away. Default 2s.
 	PollInterval time.Duration
+	// Logger receives warnings. Default: discard.
+	Logger hclog.Logger
 }
 
 // KeyStore implements plugin.KeyStore on Azure Key Vault.
@@ -76,6 +88,9 @@ var _ plugin.KeyStore = (*KeyStore)(nil)
 func New(opts Options) *KeyStore {
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = 2 * time.Second
+	}
+	if opts.Logger == nil {
+		opts.Logger = hclog.NewNullLogger()
 	}
 	return &KeyStore{opts: opts, cred: opts.Credential, clients: map[string]*vaultClients{}}
 }
@@ -126,8 +141,10 @@ func (k *KeyStore) Describe(context.Context) (plugin.KeyStoreCapabilities, error
 	}, nil
 }
 
-// Validate checks the settings, that the vault answers, and that the
-// identity can read the certificate's policy.
+// Validate checks the settings, that the vault answers, that the identity
+// can read the certificate's policy, and that the certificate is one the
+// connector may use: not soft-deleted, and created by the connector for
+// this KrakenKey certificate (or adopt: true).
 func (k *KeyStore) Validate(ctx context.Context, req plugin.KeyStoreValidateRequest) ([]string, error) {
 	s, problems := parseConfig(req.Config)
 	if len(problems) > 0 {
@@ -137,14 +154,33 @@ func (k *KeyStore) Validate(ctx context.Context, req plugin.KeyStoreValidateRequ
 	if err != nil {
 		return nil, err
 	}
+	if s.exportable {
+		k.checkSecretAccess(ctx, c, s)
+	}
 	resp, err := c.certs.GetCertificatePolicy(ctx, s.name, nil)
 	if isNotFound(err) {
 		// The certificate is created on first issuance. A 404 rather than
-		// a 403 also shows the identity may read certificates.
-		return nil, nil
+		// a 403 also shows the identity may read certificates. A
+		// soft-deleted certificate also answers 404 here, but blocks
+		// creating one with the same name.
+		if _, err := c.certs.GetDeletedCertificate(ctx, s.name, nil); err == nil {
+			problems = append(problems, fmt.Sprintf(
+				"certificate %q in %s is soft-deleted, so a new one cannot be created with that name; recover or purge it, or use another certificate_name",
+				s.name, s.vaultURL))
+		}
+		return problems, nil
 	}
 	if err != nil {
 		return nil, classify(opGetPolicy, s.name, err)
+	}
+	if req.CertificateID != "" {
+		own, err := checkOwner(ctx, c, s.name, req.CertificateID)
+		if err != nil {
+			return nil, err
+		}
+		if p := own.problem(s); p != "" {
+			problems = append(problems, p)
+		}
 	}
 	if ip := resp.IssuerParameters; ip != nil && ip.Name != nil {
 		switch name := *ip.Name; {
@@ -158,9 +194,23 @@ func (k *KeyStore) Validate(ctx context.Context, req plugin.KeyStoreValidateRequ
 	return problems, nil
 }
 
+// checkSecretAccess warns when the identity cannot read the certificate's
+// secret. It is not a problem for Validate: a target that takes a vault
+// reference (Application Gateway) needs an exportable certificate but not
+// the connector reading the secret, and Validate does not know the targets.
+func (k *KeyStore) checkSecretAccess(ctx context.Context, c *vaultClients, s settings) {
+	_, err := c.secrets.GetSecret(ctx, s.name, probeVersion, nil)
+	if hasStatus(err, http.StatusForbidden) {
+		k.opts.Logger.Warn("the identity cannot read Key Vault secrets; exporting the key as PEM or PFX will fail (vault references still work)",
+			"vault", s.vaultURL, "certificate_name", s.name,
+			"grant", opGetSecret.rbac+" (Azure RBAC) or "+opGetSecret.accessPolicy+" (access policy)")
+	}
+}
+
 // CreateCSR starts a new certificate version with issuer Unknown and
-// returns the CSR Key Vault made for it. Any request already pending for
-// the certificate is deleted first (see deleteStalePending).
+// returns the CSR Key Vault made for it. The certificate must be absent or
+// carry this KrakenKey certificate's tag (or adopt: true). Any request
+// already pending for it is deleted first (see deleteStalePending).
 func (k *KeyStore) CreateCSR(ctx context.Context, req plugin.CSRRequest) (plugin.CSR, error) {
 	s, problems := parseConfig(req.Config)
 	if len(problems) > 0 {
@@ -173,9 +223,19 @@ func (k *KeyStore) CreateCSR(ctx context.Context, req plugin.CSRRequest) (plugin
 	if err != nil {
 		return plugin.CSR{}, err
 	}
+	if !certIDRE.MatchString(req.CertificateID) {
+		return plugin.CSR{}, fmt.Errorf("%w: certificate id %q is missing or not usable in a tag", plugin.ErrInvalid, req.CertificateID)
+	}
 	c, err := k.clientsFor(s.vaultURL)
 	if err != nil {
 		return plugin.CSR{}, err
+	}
+	own, err := checkOwner(ctx, c, s.name, req.CertificateID)
+	if err != nil {
+		return plugin.CSR{}, err
+	}
+	if p := own.problem(s); p != "" {
+		return plugin.CSR{}, fmt.Errorf("%w: %s", plugin.ErrPermanent, p)
 	}
 	if err := k.deleteStalePending(ctx, c, s.name); err != nil {
 		return plugin.CSR{}, err
@@ -183,7 +243,7 @@ func (k *KeyStore) CreateCSR(ctx context.Context, req plugin.CSRRequest) (plugin
 
 	kp.Exportable = &s.exportable
 	kp.ReuseKey = &s.reuseKey
-	op, err := k.create(ctx, c, s.name, newPolicy(req.Names, kp))
+	op, err := k.create(ctx, c, s.name, newPolicy(req.Names, kp), tagsFor(req.CertificateID))
 	if err != nil {
 		return plugin.CSR{}, err
 	}
@@ -194,7 +254,7 @@ func (k *KeyStore) CreateCSR(ctx context.Context, req plugin.CSRRequest) (plugin
 	if err := csr.CheckSignature(); err != nil {
 		return plugin.CSR{}, fmt.Errorf("%w: Key Vault returned a CSR with a bad signature: %v", plugin.ErrPermanent, err)
 	}
-	ref := keyRef{vaultURL: s.vaultURL, name: s.name, spki: spkiHash(csr.RawSubjectPublicKeyInfo)}
+	ref := keyRef{vaultURL: s.vaultURL, name: s.name, spki: spkiHash(csr.RawSubjectPublicKeyInfo), certID: req.CertificateID}
 	return plugin.CSR{
 		PEM:    string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csr.Raw})),
 		KeyRef: ref.String(),
@@ -202,13 +262,13 @@ func (k *KeyStore) CreateCSR(ctx context.Context, req plugin.CSRRequest) (plugin
 }
 
 // newPolicy is the certificate policy for a new version: issuer Unknown,
-// subject CN the first name, every name as a DNS SAN, stored as PFX.
+// every name as a DNS SAN, stored as PFX, with the subject from
+// subjectFor.
 func newPolicy(names []string, kp *azcertificates.KeyProperties) *azcertificates.CertificatePolicy {
 	sans := make([]*string, len(names))
 	for i := range names {
 		sans[i] = &names[i]
 	}
-	subject := "CN=" + names[0]
 	issuer := issuerUnknown
 	ct := contentTypePKCS12
 	return &azcertificates.CertificatePolicy{
@@ -216,10 +276,23 @@ func newPolicy(names []string, kp *azcertificates.KeyProperties) *azcertificates
 		KeyProperties:    kp,
 		SecretProperties: &azcertificates.SecretProperties{ContentType: &ct},
 		X509CertificateProperties: &azcertificates.X509CertificateProperties{
-			Subject:                 &subject,
+			Subject:                 subjectFor(names),
 			SubjectAlternativeNames: &azcertificates.SubjectAlternativeNames{DNSNames: sans},
 		},
 	}
+}
+
+// subjectFor returns "CN=<name>" for the first name that fits in a common
+// name (64 characters), or nil for a subject without a common name when no
+// name fits. Clients match DNS SANs, not the common name.
+func subjectFor(names []string) *string {
+	for _, n := range names {
+		if len(n) <= maxCNLength {
+			subject := "CN=" + n
+			return &subject
+		}
+	}
+	return nil
 }
 
 // deleteStalePending removes a request left pending on the certificate.
@@ -235,7 +308,9 @@ func newPolicy(names []string, kp *azcertificates.KeyProperties) *azcertificates
 // save one key generation.
 //
 // Requests with an issuer other than Unknown were not started by the
-// connector, so they are left alone and reported.
+// connector, so they are left alone and reported. Callers check first that
+// the certificate is the connector's (checkOwner), so requests on
+// certificates someone else manages are never deleted.
 func (k *KeyStore) deleteStalePending(ctx context.Context, c *vaultClients, name string) error {
 	resp, err := c.certs.GetCertificateOperation(ctx, name, nil)
 	if isNotFound(err) {
@@ -262,8 +337,8 @@ func (k *KeyStore) deleteStalePending(ctx context.Context, c *vaultClients, name
 }
 
 // create starts a new version and waits until its CSR is available.
-func (k *KeyStore) create(ctx context.Context, c *vaultClients, name string, pol *azcertificates.CertificatePolicy) (azcertificates.CertificateOperation, error) {
-	resp, err := c.certs.CreateCertificate(ctx, name, azcertificates.CreateCertificateParameters{CertificatePolicy: pol}, nil)
+func (k *KeyStore) create(ctx context.Context, c *vaultClients, name string, pol *azcertificates.CertificatePolicy, tags map[string]*string) (azcertificates.CertificateOperation, error) {
+	resp, err := c.certs.CreateCertificate(ctx, name, azcertificates.CreateCertificateParameters{CertificatePolicy: pol, Tags: tags}, nil)
 	if err != nil {
 		return azcertificates.CertificateOperation{}, classify(opCreate, name, err)
 	}
@@ -437,7 +512,7 @@ func (k *KeyStore) Complete(ctx context.Context, req plugin.CompleteRequest) (st
 			}
 			return "", fmt.Errorf("%w: no pending request of %q holds this key any more", plugin.ErrNotFound, r.name)
 		}
-		return k.merge(ctx, c, r.name, x5c)
+		return k.merge(ctx, c, r.name, x5c, tagsFor(r.certID))
 	}
 
 	// A completed version: the certificate was renewed with the same key.
@@ -458,14 +533,20 @@ func (k *KeyStore) Complete(ctx context.Context, req plugin.CompleteRequest) (st
 	if latest != nil && latest.Equal(leaf) {
 		return idRef(latestCert)
 	}
-	return k.renewSameKey(ctx, c, s, r, leaf, x5c)
+	return k.renewSameKey(ctx, c, s, r, cert.Tags, leaf, x5c)
 }
 
 // renewSameKey attaches a certificate renewed with an existing key: it
 // creates a version with reuse_key set, which makes Key Vault sign the CSR
 // with the latest version's key, and merges the certificate into it. This
-// works for keys that cannot be exported.
-func (k *KeyStore) renewSameKey(ctx context.Context, c *vaultClients, s settings, r keyRef, leaf *x509.Certificate, x5c [][]byte) (string, error) {
+// works for keys that cannot be exported. The new version gets the tags of
+// the version it renews.
+//
+// A request already pending on the certificate is most likely the
+// connector's own renewal in progress, so it is not deleted: the call
+// returns "unavailable" and is tried again once that request is completed
+// or released.
+func (k *KeyStore) renewSameKey(ctx context.Context, c *vaultClients, s settings, r keyRef, tags map[string]*string, leaf *x509.Certificate, x5c [][]byte) (string, error) {
 	pol, err := c.certs.GetCertificatePolicy(ctx, r.name, nil)
 	if err != nil {
 		return "", classify(opGetPolicy, r.name, err)
@@ -485,10 +566,10 @@ func (k *KeyStore) renewSameKey(ctx context.Context, c *vaultClients, s settings
 	if pol.X509CertificateProperties != nil && pol.X509CertificateProperties.Subject != nil {
 		newPol.X509CertificateProperties.Subject = pol.X509CertificateProperties.Subject
 	}
-	if err := k.deleteStalePending(ctx, c, r.name); err != nil {
+	if err := pendingBlocks(ctx, c, r.name); err != nil {
 		return "", err
 	}
-	op, err := k.create(ctx, c, r.name, newPol)
+	op, err := k.create(ctx, c, r.name, newPol, tags)
 	if err != nil {
 		return "", err
 	}
@@ -498,11 +579,34 @@ func (k *KeyStore) renewSameKey(ctx context.Context, c *vaultClients, s settings
 		return "", fmt.Errorf("%w: Key Vault did not reuse the key of %s for the renewed certificate (it reuses the latest version's key only); renew with a new key instead",
 			plugin.ErrPermanent, r)
 	}
-	return k.merge(ctx, c, r.name, x5c)
+	return k.merge(ctx, c, r.name, x5c, tags)
 }
 
-func (k *KeyStore) merge(ctx context.Context, c *vaultClients, name string, x5c [][]byte) (string, error) {
-	resp, err := c.certs.MergeCertificate(ctx, name, azcertificates.MergeCertificateParameters{X509Certificates: x5c}, nil)
+// pendingBlocks returns an error if a request is pending on the
+// certificate.
+func pendingBlocks(ctx context.Context, c *vaultClients, name string) error {
+	op, err := c.certs.GetCertificateOperation(ctx, name, nil)
+	if isNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return classify(opGetPending, name, err)
+	}
+	if deref(op.Status) != statusInProgress {
+		return nil
+	}
+	if ip := op.IssuerParameters; ip != nil && ip.Name != nil && strings.EqualFold(*ip.Name, issuerUnknown) {
+		return fmt.Errorf("%w: certificate %q has a request pending (a renewal in progress); the renewed certificate is attached once it is completed or released",
+			plugin.ErrUnavailable, name)
+	}
+	return fmt.Errorf("%w: certificate %q has a pending request that the connector did not start; complete or delete it in Key Vault first",
+		plugin.ErrPermanent, name)
+}
+
+// merge merges x5c into the pending request. The tags are set on the new
+// version so later calls can tell the connector created it.
+func (k *KeyStore) merge(ctx context.Context, c *vaultClients, name string, x5c [][]byte, tags map[string]*string) (string, error) {
+	resp, err := c.certs.MergeCertificate(ctx, name, azcertificates.MergeCertificateParameters{X509Certificates: x5c, Tags: tags}, nil)
 	if err != nil {
 		return "", classify(opMerge, name, err)
 	}
