@@ -32,6 +32,60 @@ jobs:
       - name: Build
         run: CGO_ENABLED=0 go build -o /dev/null ./cmd/krakenkey-connector
 
+  plugin-dirs:
+    name: Find plugin modules
+    runs-on: ubuntu-latest
+    outputs:
+      dirs: ${{ steps.list.outputs.dirs }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: list
+        run: |
+          dirs=$(find plugins -mindepth 2 -maxdepth 2 -name go.mod -printf '%h\n' 2>/dev/null | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "dirs=${dirs:-[]}" >> "$GITHUB_OUTPUT"
+
+  # Each plugin under plugins/ is its own Go module. Test it on its own,
+  # without the workspace, the way it is built for release.
+  plugins:
+    name: Plugin (${{ matrix.dir }})
+    needs: plugin-dirs
+    if: needs.plugin-dirs.outputs.dirs != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.plugin-dirs.outputs.dirs) }}
+    env:
+      GOWORK: 'off'
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: ${{ matrix.dir }}/go.sum
+
+      - name: Verify dependencies
+        run: |
+          go mod verify
+          go mod tidy -diff
+
+      - name: Run golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+          golangci-lint run ./...
+
+      - name: Run tests
+        run: go test ./... -race
+
+      - name: Build
+        run: CGO_ENABLED=0 go build -o /dev/null ./cmd/...
+
   release-snapshot:
     name: Release build (snapshot)
     runs-on: ubuntu-latest
