@@ -126,7 +126,9 @@ together under one version.
   ETag checks so a concurrent change is never overwritten, and rollback
   refuses when it could not truly restore the earlier state (a versionless
   secret on the same name, a replaced uploaded certificate, or an entry
-  someone changed since). (#10)
+  someone changed since). It accepts the gateway's managed identity type in
+  any case (`userAssigned` from the Azure CLI, `UserAssigned` from
+  templates). (#10, #14)
 - Release pipeline: archives for Linux and macOS (amd64 and arm64) of the
   connector and of each plugin, a `checksums.txt` covering all of them signed
   with Sigstore, and a signed multi-arch container image at
