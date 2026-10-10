@@ -8,6 +8,8 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+## [v0.1.0] - 2026-10-10
+
 First release.
 
 ### Added
@@ -55,3 +57,6 @@ First release.
 - Release pipeline: archives for Linux and macOS (amd64 and arm64), a
   `checksums.txt` signed with Sigstore, and a signed multi-arch container
   image at `ghcr.io/krakenkey/connector`. No Windows builds yet.
+
+[Unreleased]: https://github.com/KrakenKey/connector/compare/v0.1.0...HEAD
+[v0.1.0]: https://github.com/KrakenKey/connector/releases/tag/v0.1.0
