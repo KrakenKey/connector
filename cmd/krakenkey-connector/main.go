@@ -28,6 +28,7 @@ import (
 	"github.com/krakenkey/connector/internal/procsec"
 	"github.com/krakenkey/connector/internal/securefs"
 	"github.com/krakenkey/connector/internal/verify"
+	"github.com/krakenkey/connector/pkg/plugin"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -305,7 +306,13 @@ func cmdRun(args []string, stderr io.Writer) int {
 		}
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	installID, err := identity.InstallID(cfg.DataDir, ident)
+	if err != nil {
+		log.Error("cannot load the install id", "error", err)
+		return exitFailed
+	}
+
+	ctx, stop := signal.NotifyContext(plugin.WithInstallID(context.Background(), installID), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	log.Info("krakenkey-connector starting", "version", version, "api_url", cfg.KrakenKey.APIURL,
@@ -605,6 +612,16 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	default:
 		fmt.Fprintf(stdout, "API key:    set (%s)\n", keySource)
 		client = api.NewClient(cfg.KrakenKey.APIURL, apiKey, userAgent())
+	}
+	switch installID, err := identity.ReadInstallID(cfg.DataDir, ident); {
+	case err != nil:
+		fmt.Fprintf(stdout, "Install id: PROBLEM: %v\n", err)
+		extra++
+	case installID == "":
+		fmt.Fprintln(stdout, "Install id: not created yet; the first run creates it")
+	default:
+		fmt.Fprintf(stdout, "Install id: %s (given to plugins)\n", installID)
+		ctx = plugin.WithInstallID(ctx, installID)
 	}
 	if connector.Validate(ctx, cfg, host, client, stdout)+extra > 0 {
 		return exitFailed

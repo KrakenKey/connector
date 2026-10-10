@@ -145,6 +145,16 @@ type fakeTarget struct {
 	broken       bool
 	failActivate error
 	noCurrent    bool
+	// rollbackReqs records every Rollback request, for targets that need
+	// the previous material (caps.RollbackNeedsMaterial).
+	rollbackReqs []plugin.RollbackRequest
+	// applyThenFail makes Activate install the certificate and still
+	// return this error, like a lost answer.
+	applyThenFail error
+	// failRollback makes Rollback fail without changing anything.
+	failRollback error
+	// rollbackBudget is the time left on the context Rollback got.
+	rollbackBudget time.Duration
 }
 
 func newFakeTarget() *fakeTarget {
@@ -193,15 +203,33 @@ func (f *fakeTarget) Activate(_ context.Context, req plugin.ActivateRequest) (st
 	if !f.broken {
 		f.live = f.installed
 	}
+	if f.applyThenFail != nil {
+		return "", f.applyThenFail
+	}
 	return prevRef, nil
 }
 
-func (f *fakeTarget) Rollback(_ context.Context, req plugin.RollbackRequest) error {
+func (f *fakeTarget) Rollback(ctx context.Context, req plugin.RollbackRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if d, ok := ctx.Deadline(); ok {
+		f.rollbackBudget = time.Until(d)
+	}
+	if f.failRollback != nil {
+		return f.failRollback
+	}
 	old, ok := f.prev[req.PreviousRef]
 	if !ok {
 		return fmt.Errorf("%w: ref %s", plugin.ErrNotFound, req.PreviousRef)
+	}
+	if f.caps.RollbackNeedsMaterial {
+		f.rollbackReqs = append(f.rollbackReqs, req)
+		if !req.HasPreviousMaterial() {
+			return fmt.Errorf("%w: previous certificate and key required", plugin.ErrPermanent)
+		}
+		if req.PreviousSerial != old {
+			return fmt.Errorf("%w: material for %s, but %s was live", plugin.ErrPermanent, req.PreviousSerial, old)
+		}
 	}
 	f.rollbacks++
 	f.installed = old
@@ -889,7 +917,7 @@ func (c *crashAtVerify) restore() {
 		c.t.Fatal(err)
 	}
 	tg := c.e.targets["a"]
-	tg.live, tg.installed, tg.prev, tg.rollbacks = c.live, c.inst, c.prev, 0
+	tg.live, tg.installed, tg.prev, tg.rollbacks, tg.rollbackReqs = c.live, c.inst, c.prev, 0, nil
 }
 
 func maps(m map[string]string) map[string]string {

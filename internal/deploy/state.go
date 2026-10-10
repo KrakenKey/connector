@@ -37,8 +37,50 @@ type State struct {
 	Targets map[string]TargetState `json:"targets"`
 	// RetiredKeys are earlier keys that some target may still use. They
 	// are released once every target serves the current certificate.
-	RetiredKeys []string  `json:"retired_keys,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	RetiredKeys []string `json:"retired_keys,omitempty"`
+	// PreviousCerts are earlier certificates that some target still
+	// serves, with the key store's reference to their key. A target that
+	// cannot keep the previous certificate and key itself
+	// (plugin.TargetCapabilities.RollbackNeedsMaterial) is handed them on
+	// rollback. Each is dropped once no target serves it, which is also
+	// when its key is released.
+	PreviousCerts []CertRecord `json:"previous_certs,omitempty"`
+	UpdatedAt     time.Time    `json:"updated_at"`
+}
+
+// CertRecord is an issued certificate and the key store's reference to its
+// key. It holds no key material.
+type CertRecord struct {
+	Serial       string    `json:"serial"`
+	NotAfter     time.Time `json:"not_after"`
+	KeyRef       string    `json:"key_ref"`
+	CertPEM      string    `json:"cert_pem"`
+	ChainPEM     string    `json:"chain_pem"`
+	FullChainPEM string    `json:"fullchain_pem"`
+}
+
+// current returns the current certificate as a record.
+func (st *State) current() CertRecord {
+	return CertRecord{
+		Serial: st.Serial, NotAfter: st.NotAfter, KeyRef: st.KeyRef,
+		CertPEM: st.CertPEM, ChainPEM: st.ChainPEM, FullChainPEM: st.FullChainPEM,
+	}
+}
+
+// certRecord finds the current or an earlier certificate by serial.
+func (st *State) certRecord(serial string) (CertRecord, bool) {
+	if serial == "" {
+		return CertRecord{}, false
+	}
+	if serial == st.Serial {
+		return st.current(), true
+	}
+	for _, c := range st.PreviousCerts {
+		if c.Serial == serial {
+			return c, true
+		}
+	}
+	return CertRecord{}, false
 }
 
 // PendingKey is a key with a renewal in flight.
@@ -77,6 +119,10 @@ type TargetState struct {
 	DeployingSerial string `json:"deploying_serial,omitempty"`
 	StagedRef       string `json:"staged_ref,omitempty"`
 	PreviousRef     string `json:"previous_ref,omitempty"`
+	// LiveBefore is the serial the target reported (Current) just before
+	// Activate, for targets that need the previous certificate handed back
+	// on rollback. Empty when the target could not tell.
+	LiveBefore string `json:"live_before,omitempty"`
 	// Failures counts failed deployments in a row; NextAttempt is the
 	// earliest time the next one is tried.
 	Failures    int       `json:"failures,omitempty"`
@@ -86,6 +132,11 @@ type TargetState struct {
 	// for state written before it was recorded.
 	Outcome   string    `json:"outcome,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// endDeployment clears what describes a deployment in progress.
+func (ts *TargetState) endDeployment() {
+	ts.Phase, ts.StagedRef, ts.DeployingSerial, ts.LiveBefore = "", "", "", ""
 }
 
 // StateStore keeps State files under <data_dir>/state, mode 0600.

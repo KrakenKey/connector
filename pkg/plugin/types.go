@@ -93,6 +93,12 @@ type TargetCapabilities struct {
 	// schedule. The core reports verification failures for them but does not
 	// roll them back.
 	PropagatesAsync bool
+	// RollbackNeedsMaterial is true when Rollback needs the previous
+	// certificate and its private key handed back, because the target
+	// cannot keep them itself (for example a cloud service that never
+	// returns an imported key). The core then fills the Previous* fields of
+	// RollbackRequest when it still holds that material.
+	RollbackNeedsMaterial bool
 }
 
 // KeyMaterial is a private key, or a reference to one, in a given format.
@@ -132,6 +138,34 @@ type KeyStoreValidateRequest struct {
 	// Config is the key store's settings from the connector config, as JSON.
 	Config        json.RawMessage
 	CertificateID string
+}
+
+// KeyStoreValidation is a key store's answer to ValidateCapabilities.
+type KeyStoreValidation struct {
+	// Problems are human readable; empty means the settings are usable.
+	Problems []string
+	// Capabilities, when set, replace what Describe reports for these
+	// settings (for example keys that are exportable or not depending on
+	// a setting). Nil means use Describe's.
+	Capabilities *KeyStoreCapabilities
+}
+
+// KeyStoreCapabilityValidator is implemented by key stores whose
+// capabilities depend on their settings. The SDK calls ValidateCapabilities
+// instead of Validate when it is implemented, so the connector matches
+// targets against the capabilities for each certificate's settings.
+type KeyStoreCapabilityValidator interface {
+	ValidateCapabilities(ctx context.Context, req KeyStoreValidateRequest) (KeyStoreValidation, error)
+}
+
+// ValidateKeyStore validates ks's settings, with per-settings capabilities
+// when ks implements KeyStoreCapabilityValidator.
+func ValidateKeyStore(ctx context.Context, ks KeyStore, req KeyStoreValidateRequest) (KeyStoreValidation, error) {
+	if v, ok := ks.(KeyStoreCapabilityValidator); ok {
+		return v.ValidateCapabilities(ctx, req)
+	}
+	problems, err := ks.Validate(ctx, req)
+	return KeyStoreValidation{Problems: problems}, err
 }
 
 // CSRRequest asks a key store for a new key and CSR.
@@ -253,12 +287,72 @@ type ActivateRequest struct {
 }
 
 // RollbackRequest restores what was live before an Activate.
+//
+// The Previous* fields are set only for targets with
+// RollbackNeedsMaterial, and only when the core still holds the
+// certificate it last deployed to the target successfully and can export
+// its key. A target that needs them and gets none returns an error
+// wrapping ErrPermanent. Its String, LogValue and MarshalJSON methods leave
+// out the key and the certificates.
 type RollbackRequest struct {
 	Config        json.RawMessage
 	PreviousRef   string
 	CertificateID string
 	Label         string
+	// PreviousCertPEM is the leaf that was live before, PreviousChainPEM
+	// its intermediates and PreviousFullChainPEM both.
+	PreviousCertPEM      string
+	PreviousChainPEM     string
+	PreviousFullChainPEM string
+	// PreviousKey is the previous leaf's private key, in the same format
+	// as StageRequest.Key.
+	PreviousKey KeyMaterial
+	// PreviousSerial is the previous leaf's serial number in lowercase hex.
+	PreviousSerial string
 }
+
+// HasPreviousMaterial reports whether the core handed back the previous
+// certificate and key.
+func (r RollbackRequest) HasPreviousMaterial() bool {
+	return r.PreviousCertPEM != "" && (len(r.PreviousKey.Data) > 0 || r.PreviousKey.Ref != "")
+}
+
+// rollbackSummary is what String, LogValue and MarshalJSON show.
+type rollbackSummary struct {
+	PreviousRef       string    `json:"previous_ref"`
+	CertificateID     string    `json:"certificate_id"`
+	Label             string    `json:"label"`
+	PreviousSerial    string    `json:"previous_serial,omitempty"`
+	PreviousKeyFormat KeyFormat `json:"previous_key_format,omitempty"`
+}
+
+func (r RollbackRequest) summary() rollbackSummary {
+	return rollbackSummary{r.PreviousRef, r.CertificateID, r.Label, r.PreviousSerial, r.PreviousKey.Format}
+}
+
+// String describes the request without the key or certificates.
+func (r RollbackRequest) String() string {
+	s := r.summary()
+	return fmt.Sprintf("RollbackRequest{PreviousRef: %q, CertificateID: %q, Label: %q, PreviousSerial: %q, PreviousKey: %d bytes redacted}",
+		s.PreviousRef, s.CertificateID, s.Label, s.PreviousSerial, len(r.PreviousKey.Data))
+}
+
+// GoString is the same as String.
+func (r RollbackRequest) GoString() string { return r.String() }
+
+// LogValue implements slog.LogValuer without the key or certificates.
+func (r RollbackRequest) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("certificate_id", r.CertificateID),
+		slog.String("label", r.Label),
+		slog.String("previous_ref", r.PreviousRef),
+		slog.String("previous_serial", r.PreviousSerial),
+		slog.String("previous_key_format", string(r.PreviousKey.Format)),
+	)
+}
+
+// MarshalJSON writes the same fields as LogValue.
+func (r RollbackRequest) MarshalJSON() ([]byte, error) { return json.Marshal(r.summary()) }
 
 // DiscardRequest drops staged material that will not be activated.
 type DiscardRequest struct {

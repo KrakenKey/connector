@@ -6,10 +6,7 @@ on:
   pull_request:
     branches: [main]
 
-# go.work ties the core and the plugin modules together for local
-# development. CI builds each module on its own go.mod, so the connector is
-# built with exactly the dependency versions it declares, not ones raised by
-# a plugin's dependencies.
+# Every module builds against its own go.mod; go.work is for local development.
 env:
   GOWORK: 'off'
 
@@ -47,24 +44,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Find plugin modules
-        id: list
+      - id: list
         run: |
-          plugins=$(find plugins -mindepth 2 -maxdepth 2 -name go.mod -printf '%h\n' | xargs -rn1 basename | sort | jq -Rcs 'split("\n") | map(select(length > 0))')
+          plugins=$(find plugins -mindepth 2 -maxdepth 2 -name go.mod -printf '%h\n' | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
 
-  plugins:
-    name: Plugin ${{ matrix.plugin }}
+  # Each plugin is its own Go module, so the root job above does not cover
+  # it.
+  plugin:
+    name: Plugin ${{ matrix.dir }}
     needs: plugin-list
     if: needs.plugin-list.outputs.plugins != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        plugin: ${{ fromJSON(needs.plugin-list.outputs.plugins) }}
+        dir: ${{ fromJSON(needs.plugin-list.outputs.plugins) }}
     defaults:
       run:
-        working-directory: plugins/${{ matrix.plugin }}
+        working-directory: ${{ matrix.dir }}
     steps:
       - uses: actions/checkout@v7
 
@@ -72,7 +70,7 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
-          cache-dependency-path: plugins/${{ matrix.plugin }}/go.sum
+          cache-dependency-path: ${{ matrix.dir }}/go.sum
 
       - name: Verify dependencies
         run: |
@@ -82,13 +80,48 @@ jobs:
       - name: Run golangci-lint
         run: |
           go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
-          golangci-lint run
+          golangci-lint run --config "$GITHUB_WORKSPACE/.golangci.yml"
 
       - name: Run tests
         run: go test ./... -race
 
       - name: Build
-        run: CGO_ENABLED=0 go build -o /dev/null ./cmd/krakenkey-connector-plugin-${{ matrix.plugin }}
+        run: CGO_ENABLED=0 go build -o /dev/null ./cmd/...
+
+  # The aws-acm tests run against the fake ACM above; this job repeats the
+  # end-to-end case against LocalStack. 4.14.0 is the last community image
+  # that starts without a LocalStack account token.
+  aws-acm-localstack:
+    name: aws-acm against LocalStack
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        image: localstack/localstack:4.14.0
+        env:
+          SERVICES: acm
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    defaults:
+      run:
+        working-directory: plugins/aws-acm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: plugins/aws-acm/go.sum
+
+      - name: Run LocalStack tests
+        env:
+          KK_TEST_LOCALSTACK_ENDPOINT: http://localhost:4566
+        run: go test ./internal/acmtarget/ -run LocalStack -v -count=1
 
   release-snapshot:
     name: Release build (snapshot)
