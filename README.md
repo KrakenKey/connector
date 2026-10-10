@@ -63,7 +63,7 @@ plugins, places such as key vaults and cloud load balancers.
 ### Release binaries
 
 Each [release](https://github.com/KrakenKey/connector/releases) has archives
-for Linux, macOS and Windows (amd64 and arm64), a `checksums.txt` covering
+for Linux and macOS (amd64 and arm64), a `checksums.txt` covering
 them, and `checksums.txt.sigstore.json`, a [Sigstore](https://www.sigstore.dev/)
 signature for the checksums made by this repository's release workflow. There
 is no long-lived signing key: the signature is tied to the workflow and the
@@ -94,13 +94,9 @@ sudo install -m 0755 krakenkey-connector /usr/local/bin/krakenkey-connector
 krakenkey-connector version
 ```
 
-Windows archives are `.zip` files with `krakenkey-connector.exe`; verify them
-the same way. The connector's file safety checks are Unix only, so on Windows
-it does not check the ownership or permissions of the data directory, key
-files, the API key file or plugin binaries, the data directory lock does not
-stop a second connector, and the `file` target cannot set `owner`. Restrict
-the data directory with NTFS permissions yourself and run one connector per
-data directory.
+Windows builds are not published yet: the connector's file permission,
+plugin ownership and key mode checks are not implemented on Windows.
+Building from source for Windows works, but is unsupported.
 
 Packages for Homebrew, apt and dnf are planned for later releases.
 

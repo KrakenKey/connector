@@ -41,6 +41,6 @@ progress and will follow in a later release.
 - Pending certificates: a certificate created in KrakenKey with names only
   (status `awaiting_csr`) is issued by the connector on its next pass, after
   checking that the configured names match the requested names. (#5)
-- Release pipeline: archives for Linux, macOS and Windows (amd64 and
-  arm64), a `checksums.txt` signed with Sigstore, and a signed multi-arch
-  container image at `ghcr.io/krakenkey/connector`.
+- Release pipeline: archives for Linux and macOS (amd64 and arm64), a
+  `checksums.txt` signed with Sigstore, and a signed multi-arch container
+  image at `ghcr.io/krakenkey/connector`. No Windows builds yet.
