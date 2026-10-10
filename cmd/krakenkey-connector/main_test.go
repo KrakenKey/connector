@@ -417,7 +417,7 @@ func TestRotateIdentityCommand(t *testing.T) {
 func TestRunReportsStatusWhenEnrolled(t *testing.T) {
 	srv := fakekk.New(t)
 	srv.Fallback = certsNeedConnectorKey(srv)
-	enrolEnv(t, srv)
+	enrollEnv(t, srv)
 	cfg := writeConfig(t)
 
 	// With a plain API key, nothing is reported.
@@ -426,12 +426,12 @@ func TestRunReportsStatusWhenEnrolled(t *testing.T) {
 	var out, errOut bytes.Buffer
 	_ = run([]string{"run", "--once", "--log-level", "debug", "--config", cfg}, &out, &errOut)
 	if len(srv.Reports()) != 0 || !strings.Contains(errOut.String(), "not enrolled") {
-		t.Errorf("reported without enrolment\n%s", errOut.String())
+		t.Errorf("reported without enrollment\n%s", errOut.String())
 	}
 
 	srv.Fallback = certsNeedConnectorKey(srv)
 	t.Setenv("KK_API_KEY", "")
-	enrolOK(t, srv, cfg)
+	enrollOK(t, srv, cfg)
 	errOut.Reset()
 	// Certificate 7 does not exist, so the pass fails; the report still goes out.
 	if code := run([]string{"run", "--once", "--config", cfg}, &out, &errOut); code != exitFailed {

@@ -118,10 +118,10 @@ func TestReportMapsState(t *testing.T) {
 func TestSanitizeError(t *testing.T) {
 	dataDir := "/var/lib/krakenkey-connector"
 	in := "exec: exit 1: -----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMG\n-----END PRIVATE KEY-----\n" +
-		"bearer kk_secretsecret123 token kkce_enrolenrol456 file " + filepath.Join(dataDir, "exec", "1043", "key.pem") +
+		"bearer kk_secretsecret123 token kkce_enrollenroll456 file " + filepath.Join(dataDir, "exec", "1043", "key.pem") +
 		"\r\n\tdone\x00"
 	out := SanitizeError(in, dataDir)
-	for _, leak := range []string{"MIGHAgEAMBMG", "secretsecret123", "enrolenrol456", dataDir, "\n", "\t", "\x00"} {
+	for _, leak := range []string{"MIGHAgEAMBMG", "secretsecret123", "enrollenroll456", dataDir, "\n", "\t", "\x00"} {
 		if strings.Contains(out, leak) {
 			t.Errorf("%q survived: %q", leak, out)
 		}

@@ -235,7 +235,7 @@ them, or the one given with `--cert`). For each of their targets it sends:
   propagates on its own schedule), `failed` or `rolled_back`;
 - the serial number of the certificate the target has;
 - for failures, a short error message: private keys, API keys and
-  enrolment tokens removed, paths under the data directory shortened, at
+  enrollment tokens removed, paths under the data directory shortened, at
   most 200 characters;
 - when that state was recorded.
 
@@ -256,7 +256,7 @@ logged as a warning; it never changes the outcome or exit code of a pass.
 When the pass stopped because KrakenKey refused the credentials or asked
 the connector to back off, no report is sent.
 
-Connectors that use an API key instead of enrolment do not report.
+Connectors that use an API key instead of enrollment do not report.
 
 ## Configuration
 

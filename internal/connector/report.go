@@ -178,7 +178,7 @@ func (r *Reporter) target(st *deploy.State, tc config.Target, certErr error) api
 var serialRe = regexp.MustCompile(`^[0-9a-fA-F]{0,64}$`)
 
 // SanitizeError makes error text fit for the status report: secrets
-// removed (private keys, API keys, enrolment tokens), paths under the
+// removed (private keys, API keys, enrollment tokens), paths under the
 // data directory shortened, control characters and runs of white space
 // collapsed, and at most api.MaxReportError characters (UTF-16 code units,
 // as the API counts them).
