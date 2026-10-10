@@ -236,10 +236,10 @@ func TestCapabilitiesSurviveTheWire(t *testing.T) {
 	// Every field of TargetCapabilities must round-trip; a target that
 	// forgets one would break matching in the core.
 	want := plugin.TargetCapabilities{
-		Accepts:             []plugin.KeyFormat{plugin.KeyFormatVaultRef, plugin.KeyFormatPFX},
-		NeedsExportableKey:  true,
-		SupportsRollback:    true,
-		KeyTypes:            []plugin.KeyType{plugin.KeyTypeRSA3072, plugin.KeyTypeECDSAP384},
+		Accepts:               []plugin.KeyFormat{plugin.KeyFormatVaultRef, plugin.KeyFormatPFX},
+		NeedsExportableKey:    true,
+		SupportsRollback:      true,
+		KeyTypes:              []plugin.KeyType{plugin.KeyTypeRSA3072, plugin.KeyTypeECDSAP384},
 		DefaultVerifyWindow:   45 * time.Minute,
 		PropagatesAsync:       true,
 		RollbackNeedsMaterial: true,

@@ -130,11 +130,11 @@ func pbTargetCaps(c TargetCapabilities) *pb.TargetCapabilities {
 
 func goTargetCaps(c *pb.TargetCapabilities) TargetCapabilities {
 	return TargetCapabilities{
-		Accepts:             goFormats(c.GetAccepts()),
-		NeedsExportableKey:  c.GetNeedsExportableKey(),
-		SupportsRollback:    c.GetSupportsRollback(),
-		KeyTypes:            goKeyTypes(c.GetKeyTypes()),
-		DefaultVerifyWindow: time.Duration(c.GetDefaultVerifyWindowSeconds()) * time.Second,
+		Accepts:               goFormats(c.GetAccepts()),
+		NeedsExportableKey:    c.GetNeedsExportableKey(),
+		SupportsRollback:      c.GetSupportsRollback(),
+		KeyTypes:              goKeyTypes(c.GetKeyTypes()),
+		DefaultVerifyWindow:   time.Duration(c.GetDefaultVerifyWindowSeconds()) * time.Second,
 		PropagatesAsync:       c.GetPropagatesAsync(),
 		RollbackNeedsMaterial: c.GetRollbackNeedsMaterial(),
 	}

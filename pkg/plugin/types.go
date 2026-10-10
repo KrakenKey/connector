@@ -291,10 +291,10 @@ func (r RollbackRequest) HasPreviousMaterial() bool {
 
 // rollbackSummary is what String, LogValue and MarshalJSON show.
 type rollbackSummary struct {
-	PreviousRef     string    `json:"previous_ref"`
-	CertificateID   string    `json:"certificate_id"`
-	Label           string    `json:"label"`
-	PreviousSerial  string    `json:"previous_serial,omitempty"`
+	PreviousRef       string    `json:"previous_ref"`
+	CertificateID     string    `json:"certificate_id"`
+	Label             string    `json:"label"`
+	PreviousSerial    string    `json:"previous_serial,omitempty"`
 	PreviousKeyFormat KeyFormat `json:"previous_key_format,omitempty"`
 }
 

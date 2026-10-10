@@ -24,7 +24,9 @@ type capsKeyStore struct {
 	caps plugin.KeyStoreCapabilities
 }
 
-func (k capsKeyStore) Describe(context.Context) (plugin.KeyStoreCapabilities, error) { return k.caps, nil }
+func (k capsKeyStore) Describe(context.Context) (plugin.KeyStoreCapabilities, error) {
+	return k.caps, nil
+}
 
 type capsTarget struct {
 	plugin.UnimplementedTarget
