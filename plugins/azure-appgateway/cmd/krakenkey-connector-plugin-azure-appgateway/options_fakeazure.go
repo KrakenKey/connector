@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"net"
+	"net/url"
 	"os"
 	"time"
 
@@ -15,9 +17,12 @@ import (
 	"github.com/krakenkey/connector/plugins/azure-appgateway/internal/appgw"
 )
 
-// FakeEndpointEnv names the fake ARM endpoint for test builds. Built only
-// with -tags fakeazure, for the go-plugin harness test; release builds
-// never contain this file.
+// This file is compiled only with -tags fakeazure, for the go-plugin
+// harness test. Release builds must never use that tag (a test checks the
+// release configs). As a second guard, a fakeazure build only talks to a
+// loopback address and refuses to start otherwise.
+
+// FakeEndpointEnv names the fake ARM endpoint for test builds.
 const FakeEndpointEnv = "KRAKENKEY_AGW_FAKE_ARM_ENDPOINT"
 
 type staticToken struct{}
@@ -28,8 +33,9 @@ func (staticToken) GetToken(context.Context, policy.TokenRequestOptions) (azcore
 
 func options() appgw.Options {
 	endpoint := os.Getenv(FakeEndpointEnv)
-	if endpoint == "" {
-		panic(FakeEndpointEnv + " must be set in a fakeazure build")
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme != "http" || !isLoopback(u.Hostname()) {
+		panic("fakeazure build: " + FakeEndpointEnv + " must be an http:// loopback URL")
 	}
 	return appgw.Options{
 		Credential: staticToken{},
@@ -43,4 +49,9 @@ func options() appgw.Options {
 		PollFrequency: 20 * time.Millisecond,
 		ReportReserve: 500 * time.Millisecond,
 	}
+}
+
+func isLoopback(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

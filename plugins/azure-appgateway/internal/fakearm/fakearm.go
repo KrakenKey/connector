@@ -87,6 +87,9 @@ type Server struct {
 	// ConcurrentWrites bumps the ETag before the next N PUTs, as if
 	// someone else changed the gateway between our read and write.
 	ConcurrentWrites int
+	// OnConcurrentWrite, if set, is that other writer's change to the
+	// stored gateway body.
+	OnConcurrentWrite func(g map[string]any)
 }
 
 // New starts a fake ARM server. Close it when done.
@@ -166,6 +169,21 @@ func (s *Server) Gateway(sub, rg, name string) map[string]any {
 		return nil
 	}
 	return clone(g)
+}
+
+// SetSecretID points a stored gateway's sslCertificates entry at id, as
+// an operator would.
+func (s *Server) SetSecretID(sub, rg, name, sslCert, id string) {
+	g := s.Gateway(sub, rg, name)
+	SetEntrySecretID(g, sslCert, id)
+	s.PutGateway(sub, rg, name, g)
+}
+
+// SetEntrySecretID changes a gateway body's sslCertificates entry in place.
+func SetEntrySecretID(g map[string]any, sslCert, id string) {
+	if c := findCert(g, sslCert); c != nil {
+		c["properties"] = map[string]any{"keyVaultSecretId": id}
+	}
 }
 
 // SecretID returns the keyVaultSecretId of a gateway's sslCertificates
@@ -273,6 +291,11 @@ func (s *Server) servePut(w http.ResponseWriter, r *http.Request, key string, bo
 	if s.ConcurrentWrites > 0 {
 		s.ConcurrentWrites--
 		s.etags[key]++
+		if s.OnConcurrentWrite != nil {
+			s.OnConcurrentWrite(old)
+			old = s.decorate(old, key)
+			s.gateways[key] = old
+		}
 		old["etag"] = s.etag(key)
 	}
 	if im := r.Header.Get("If-Match"); im != "" && im != "*" && im != s.etag(key) {

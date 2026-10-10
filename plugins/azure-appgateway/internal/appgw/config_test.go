@@ -19,15 +19,15 @@ import (
 )
 
 func TestParseConfig(t *testing.T) {
-	c, err := ParseConfig(cfg(map[string]any{"create_if_missing": true}))
+	c, err := ParseConfig(cfg(map[string]any{"replace_uploaded_certificate": true}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.SubscriptionID != sub || c.ResourceGroup != rg || c.Gateway != gwName || c.SSLCertificate != certName || !c.CreateIfMissing {
+	if c.SubscriptionID != sub || c.ResourceGroup != rg || c.Gateway != gwName || c.SSLCertificate != certName || !c.ReplaceUploadedCertificate {
 		t.Errorf("parsed %+v", c)
 	}
-	if c, err := ParseConfig(cfg(nil)); err != nil || c.CreateIfMissing {
-		t.Errorf("create_if_missing should default to false: %+v %v", c, err)
+	if c, err := ParseConfig(cfg(nil)); err != nil || c.ReplaceUploadedCertificate {
+		t.Errorf("replace_uploaded_certificate should default to false: %+v %v", c, err)
 	}
 
 	bad := []struct {
@@ -44,7 +44,9 @@ func TestParseConfig(t *testing.T) {
 		{"bad gateway", cfg(map[string]any{"gateway": "-agw"}), "not a valid Application Gateway name"},
 		{"no cert", cfg(map[string]any{"ssl_certificate": nil}), "ssl_certificate is required"},
 		{"bad cert", cfg(map[string]any{"ssl_certificate": "a/b"}), "not a valid certificate name"},
-		{"wrong type", cfg(map[string]any{"create_if_missing": "yes"}), "create_if_missing"},
+		{"wrong type", cfg(map[string]any{"replace_uploaded_certificate": "yes"}), "replace_uploaded_certificate"},
+		// Dropped: a new entry has no listener, so verification could never pass.
+		{"create_if_missing", cfg(map[string]any{"create_if_missing": true}), `unknown field "create_if_missing"`},
 		{"not an object", []byte(`[]`), "settings"},
 	}
 	for _, tc := range bad {
@@ -71,7 +73,6 @@ func TestParseSecretID(t *testing.T) {
 		{"https://kv-test.vault.azure.net:443/secrets/app-cert/" + verNew, secret(verNew), true},
 		{"https://kv-test.vault.azure.net/secrets/app-cert/", "https://kv-test.vault.azure.net/secrets/app-cert/", false},
 		{"https://kv-test.vault.azure.net/secrets/app-cert", "https://kv-test.vault.azure.net/secrets/app-cert/", false},
-		{"https://kv-gov.vault.usgovcloudapi.net/secrets/c/" + verNew, "https://kv-gov.vault.usgovcloudapi.net/secrets/c/" + verNew, true},
 	}
 	for _, tc := range good {
 		id, err := ParseSecretID(tc.in)
@@ -96,6 +97,9 @@ func TestParseSecretID(t *testing.T) {
 		"https://user@kv-test.vault.azure.net/secrets/app-cert/" + verNew,
 		"https://kv-test.vault.azure.net:8443/secrets/app-cert/" + verNew,
 		"https://x.vault.azure.net/secrets/app-cert/" + verNew,
+		// Public cloud only.
+		"https://kv-gov.vault.usgovcloudapi.net/secrets/app-cert/" + verNew,
+		"https://kv-cn.vault.azure.cn/secrets/app-cert/" + verNew,
 	}
 	for _, in := range bad {
 		if _, err := ParseSecretID(in); err == nil {

@@ -112,7 +112,8 @@ func TestPluginOverGRPC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prev != oldID {
+	var ref struct{ Restore, Over string }
+	if err := json.Unmarshal([]byte(prev), &ref); err != nil || ref.Restore != oldID || ref.Over != newID {
 		t.Errorf("previous ref %q", prev)
 	}
 	if err := tg.Discard(ctx, plugin.DiscardRequest{Config: settings, StagedRef: staged}); err != nil {

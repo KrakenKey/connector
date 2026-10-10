@@ -21,9 +21,11 @@ type Config struct {
 	// SSLCertificate is the name of the gateway's sslCertificates entry that
 	// the listeners use.
 	SSLCertificate string `json:"ssl_certificate"`
-	// CreateIfMissing adds the sslCertificates entry on the first
-	// activation when the gateway does not have it yet. Default false.
-	CreateIfMissing bool `json:"create_if_missing"`
+	// ReplaceUploadedCertificate allows the first activation to replace an
+	// entry that holds a PFX uploaded to the gateway. Azure never returns
+	// uploaded certificates, so that activation cannot be rolled back.
+	// Default false.
+	ReplaceUploadedCertificate bool `json:"replace_uploaded_certificate"`
 }
 
 var (

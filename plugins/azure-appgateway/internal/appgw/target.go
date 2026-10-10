@@ -23,6 +23,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	armnetwork "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v12"
+	"github.com/hashicorp/go-hclog"
 
 	"github.com/krakenkey/connector/pkg/plugin"
 )
@@ -54,6 +55,8 @@ type Options struct {
 	// polling, so the gateway can be read again to report what state it is
 	// in when the operation does not finish in time. Default 20s.
 	ReportReserve time.Duration
+	// Logger receives warnings the protocol has no field for. Default: none.
+	Logger hclog.Logger
 }
 
 // Target implements plugin.Target for Application Gateway.
@@ -82,6 +85,9 @@ func New(opts Options) *Target {
 	}
 	if opts.ReportReserve <= 0 {
 		opts.ReportReserve = DefaultReportReserve
+	}
+	if opts.Logger == nil {
+		opts.Logger = hclog.NewNullLogger()
 	}
 	return &Target{opts: opts, clients: map[string]*armnetwork.ApplicationGatewaysClient{}}
 }
@@ -128,8 +134,22 @@ func (t *Target) Validate(ctx context.Context, req plugin.TargetValidateRequest)
 	if p := identityProblem(&gw); p != "" {
 		problems = append(problems, p)
 	}
-	if _, c := findCert(&gw, cfg.SSLCertificate); c == nil && !cfg.CreateIfMissing {
-		problems = append(problems, fmt.Sprintf("the gateway has no ssl certificate named %q; create it or set create_if_missing: true", cfg.SSLCertificate))
+	cur := readSlot(&gw, cfg.SSLCertificate)
+	switch cur.kind {
+	case slotAbsent:
+		problems = append(problems, missingEntryProblem(cfg.SSLCertificate))
+	case slotInline:
+		if !cfg.ReplaceUploadedCertificate {
+			problems = append(problems, uploadedProblem(cfg.SSLCertificate))
+		}
+	case slotKeyVault:
+		if id, err := ParseSecretID(cur.secretID); err == nil && !id.Versioned() {
+			// Not a problem: the first activation pins a version. But if this
+			// is the secret the key store writes to, it already resolves to
+			// the new version, so that first activation cannot be rolled back.
+			t.opts.Logger.Warn("ssl certificate uses a versionless Key Vault secret ID; if the key store writes to the same secret, "+
+				"the first activation cannot be rolled back", "gateway", cfg.Gateway, "ssl_certificate", cfg.SSLCertificate, "secret_id", cur.secretID)
+		}
 	}
 	return problems, nil
 }
@@ -182,8 +202,10 @@ func (t *Target) Stage(_ context.Context, req plugin.StageRequest) (string, erro
 	return id.String(), nil
 }
 
-// Activate points the entry at the staged secret version and returns the
-// entry's previous state as the previous ref.
+// Activate points the entry at the staged secret version and returns a
+// previous ref recording what the entry held before and what it installed.
+// When what was there before cannot be put back, the previous ref says so
+// and Rollback refuses it.
 func (t *Target) Activate(ctx context.Context, req plugin.ActivateRequest) (string, error) {
 	cfg, err := ParseConfig(req.Config)
 	if err != nil {
@@ -193,48 +215,70 @@ func (t *Target) Activate(ctx context.Context, req plugin.ActivateRequest) (stri
 	if err != nil || !id.Versioned() {
 		return "", fmt.Errorf("%w: staged ref is not a versioned Key Vault secret ID from Stage", plugin.ErrInvalid)
 	}
-	before, err := t.transition(ctx, cfg, slot{kind: slotKeyVault, secretID: id.String()}, cfg.CreateIfMissing, true)
+	want := keyVaultSlot(id.String())
+	before, err := t.transition(ctx, cfg, want, nil, true)
 	if err != nil {
 		return "", err
 	}
-	return before.ref(), nil
+	ref := previousRef{V: 1, Over: want.secretID}
+	switch {
+	case before.equal(want):
+		ref.Unrestorable = reasonAlreadyActive
+		t.opts.Logger.Warn("the gateway already pointed at the staged secret version; what was live before is unknown, so this activation cannot be rolled back",
+			"gateway", cfg.Gateway, "ssl_certificate", cfg.SSLCertificate, "secret_id", want.secretID)
+	case before.kind == slotInline:
+		ref.Unrestorable = reasonUploaded
+	case sameSecret(before.secretID, id):
+		ref.Unrestorable = reasonVersionlessSameSecret
+		t.opts.Logger.Warn("the gateway used a versionless ID of the same secret, which now resolves to the new version; this activation cannot be rolled back",
+			"gateway", cfg.Gateway, "ssl_certificate", cfg.SSLCertificate, "previous_secret_id", before.secretID)
+	default:
+		ref.Restore = before.secretID
+	}
+	return ref.encode(), nil
 }
 
-// Rollback restores the entry's state from before Activate: the previous
-// secret ID exactly as it was (versioned or not), or no entry at all if
-// Activate created it. An uploaded certificate cannot be restored.
+// Rollback puts back the secret ID the entry held before Activate, exactly
+// as it was, provided the gateway still shows what Activate installed. If
+// someone changed the entry since, it refuses rather than overwrite that.
 func (t *Target) Rollback(ctx context.Context, req plugin.RollbackRequest) error {
 	cfg, err := ParseConfig(req.Config)
 	if err != nil {
 		return err
 	}
-	want, err := parsePreviousRef(req.PreviousRef)
+	ref, err := parsePreviousRef(req.PreviousRef)
 	if err != nil {
 		return err
 	}
-	if want.kind == slotInline {
-		return errInlineNotRestorable
+	if ref.Unrestorable != "" {
+		return unrestorableError(ref.Unrestorable)
 	}
-	_, err = t.transition(ctx, cfg, want, true, false)
+	expect := keyVaultSlot(ref.Over)
+	_, err = t.transition(ctx, cfg, keyVaultSlot(ref.Restore), &expect, false)
 	return err
 }
 
 // Discard has nothing to delete: Stage creates nothing.
 func (t *Target) Discard(context.Context, plugin.DiscardRequest) error { return nil }
 
-// transition makes the configured entry hold want. It reads the gateway,
-// changes the model and writes it back with If-Match on the ETag it read,
-// retrying from the read when the gateway changed in between. It returns
-// the entry's state before the change.
+// transition points the configured entry at want and returns what the
+// entry held when it was first read. It reads the gateway, changes the
+// model and writes it back with If-Match on the ETag it read, reading again
+// and retrying when the gateway changed in between (HTTP 412). If the entry
+// already shows want, nothing is written.
 //
-// If the long-running update fails, the gateway is read again; when it
-// shows the new state and revert is set, the old state is written back so
-// a failed Activate leaves what was live before.
-func (t *Target) transition(ctx context.Context, cfg Config, want slot, allowCreate, revert bool) (slot, error) {
+// expect, if set, is what the entry must show before it is changed;
+// anything else is refused.
+//
+// If the long-running update fails or its outcome is unknown, the gateway
+// is read again; when it shows the new state and revert is set, the old
+// state is written back so a failed Activate leaves what was live before.
+func (t *Target) transition(ctx context.Context, cfg Config, want slot, expect *slot, revert bool) (slot, error) {
 	client, err := t.client(cfg.SubscriptionID)
 	if err != nil {
 		return slot{}, err
 	}
+	var first *slot
 	for attempt := 1; ; attempt++ {
 		resp, err := client.Get(ctx, cfg.ResourceGroup, cfg.Gateway, nil)
 		if err != nil {
@@ -244,23 +288,37 @@ func (t *Target) transition(ctx context.Context, cfg Config, want slot, allowCre
 		if p := skuProblem(&gw); p != "" {
 			return slot{}, fmt.Errorf("%w: %s", plugin.ErrPermanent, p)
 		}
-		if want.kind == slotKeyVault {
-			if p := identityProblem(&gw); p != "" {
-				return slot{}, fmt.Errorf("%w: %s", plugin.ErrPermanent, p)
-			}
+		if p := identityProblem(&gw); p != "" {
+			return slot{}, fmt.Errorf("%w: %s", plugin.ErrPermanent, p)
 		}
-		before := readSlot(&gw, cfg.SSLCertificate)
-		if before.equal(want) {
-			return before, nil
+		cur := readSlot(&gw, cfg.SSLCertificate)
+		if first == nil {
+			first = &cur
 		}
-		if err := writeSlot(&gw, cfg.SSLCertificate, want, allowCreate); err != nil {
+		switch {
+		case cur.equal(want):
+			// Already there (on a retry: someone else, or a write of ours
+			// that went through). Report the state from the first read.
+			return *first, nil
+		case cur.kind == slotAbsent:
+			return slot{}, missingEntryError(cfg.SSLCertificate)
+		case expect != nil && !cur.equal(*expect):
+			return slot{}, fmt.Errorf("%w: ssl certificate %q now shows %s, not %s as left by the activation; it was changed since, so it is not overwritten",
+				plugin.ErrPermanent, cfg.SSLCertificate, cur, *expect)
+		case !cur.equal(*first):
+			return slot{}, fmt.Errorf("%w: ssl certificate %q changed from %s to %s while it was being updated; nothing was changed",
+				plugin.ErrUnavailable, cfg.SSLCertificate, *first, cur)
+		case cur.kind == slotInline && !cfg.ReplaceUploadedCertificate:
+			return slot{}, fmt.Errorf("%w: %s", plugin.ErrPermanent, uploadedProblem(cfg.SSLCertificate))
+		}
+		if err := writeSlot(&gw, cfg.SSLCertificate, want); err != nil {
 			return slot{}, err
 		}
 
 		err = t.put(ctx, client, cfg, gw)
 		switch {
 		case err == nil:
-			return before, nil
+			return *first, nil
 		case errors.Is(err, errPreconditionFailed):
 			if attempt < t.opts.MaxAttempts {
 				continue
@@ -268,10 +326,10 @@ func (t *Target) transition(ctx context.Context, cfg Config, want slot, allowCre
 			return slot{}, fmt.Errorf("%w: application gateway %s/%s changed while it was being updated, %d times in a row; nothing was changed",
 				plugin.ErrUnavailable, cfg.ResourceGroup, cfg.Gateway, attempt)
 		case errors.As(err, new(notStartedError)):
-			// The PUT was refused, so the gateway is as it was.
+			// ARM refused the PUT, so the gateway is as it was.
 			return slot{}, err
 		default:
-			return slot{}, t.afterFailedUpdate(ctx, client, cfg, before, want, revert, err)
+			return slot{}, t.afterFailedUpdate(ctx, client, cfg, *first, want, revert, err)
 		}
 	}
 }
@@ -284,26 +342,39 @@ type notStartedError struct{ err error }
 func (e notStartedError) Error() string { return e.err.Error() }
 func (e notStartedError) Unwrap() error { return e.err }
 
+// unknownOutcomeError is a PUT without a clear answer (a transport error,
+// a timeout or a 408 or 5xx from the front door): ARM may or may not have
+// accepted it.
+type unknownOutcomeError struct{ err error }
+
+func (e unknownOutcomeError) Error() string {
+	return "the update request got no clear answer: " + describe(e.err)
+}
+func (e unknownOutcomeError) Unwrap() error { return e.err }
+
 // put writes the gateway with If-Match and waits for the long-running
-// operation. It returns errPreconditionFailed for a 412, a notStartedError
-// (wrapping a plugin error kind) when ARM refused the PUT, and otherwise an
-// error describing a failed or unfinished operation.
+// operation. The PUT is sent once: the SDK's retries are off for it, since
+// a retry after a lost response would be refused with 412 and hide that
+// the first attempt went through. It returns errPreconditionFailed for a
+// 412, a notStartedError (wrapping a plugin error kind) for any other 4xx
+// except 408, an unknownOutcomeError when the PUT got no clear answer, and
+// otherwise an error describing a failed or unfinished operation.
 func (t *Target) put(ctx context.Context, client *armnetwork.ApplicationGatewaysClient, cfg Config, gw armnetwork.ApplicationGateway) error {
-	putCtx := ctx
+	putCtx := policy.WithRetryOptions(ctx, policy.RetryOptions{MaxRetries: -1})
 	if gw.Etag != nil && *gw.Etag != "" {
-		putCtx = policy.WithHTTPHeader(ctx, http.Header{"If-Match": []string{*gw.Etag}})
+		putCtx = policy.WithHTTPHeader(putCtx, http.Header{"If-Match": []string{*gw.Etag}})
 	}
 	poller, err := client.BeginCreateOrUpdate(putCtx, cfg.ResourceGroup, cfg.Gateway, gw, nil)
 	if err != nil {
-		if _, ok := responseError(err); !ok {
-			// No answer from ARM (network error or deadline): the PUT may
-			// or may not have been accepted.
-			return err
-		}
-		if isStatus(err, http.StatusPreconditionFailed) {
+		ae, ok := responseError(err)
+		switch {
+		case ok && ae.Status == http.StatusPreconditionFailed:
 			return errPreconditionFailed
+		case ok && ae.Status >= 400 && ae.Status < 500 && ae.Status != http.StatusRequestTimeout:
+			return notStartedError{classify(opUpdate, cfg, err)}
+		default:
+			return unknownOutcomeError{err}
 		}
-		return notStartedError{classify(opUpdate, cfg, err)}
 	}
 	return t.wait(ctx, poller)
 }
@@ -401,7 +472,7 @@ func (t *Target) afterFailedUpdate(ctx context.Context, client *armnetwork.Appli
 	switch {
 	case errors.Is(opErr, errStillRunning):
 		cause = "the update did not finish before the call deadline and is still running in Azure"
-	case errors.As(opErr, new(pollError)):
+	case errors.As(opErr, new(pollError)), errors.As(opErr, new(unknownOutcomeError)):
 		cause = opErr.Error()
 	default:
 		cause = "the update failed: " + describe(opErr)
@@ -434,7 +505,7 @@ func (t *Target) afterFailedUpdate(ctx context.Context, client *armnetwork.Appli
 			return fmt.Errorf("%w: %s: %s; the gateway now shows %s (provisioning state %s) and the uploaded certificate it had before cannot be restored",
 				plugin.ErrPermanent, where, cause, want, state)
 		}
-		if err := writeSlot(&gw, cfg.SSLCertificate, before, true); err != nil {
+		if err := writeSlot(&gw, cfg.SSLCertificate, before); err != nil {
 			return fmt.Errorf("%w: %s: %s; restoring %s failed: %v", plugin.ErrUnavailable, where, cause, before, err)
 		}
 		if err := t.put(ctx, client, cfg, gw); err != nil {
@@ -533,11 +604,4 @@ func (t *Target) credential() (azcore.TokenCredential, error) {
 		return nil, fmt.Errorf("%w: no usable Azure credential: %v", plugin.ErrPermanent, t.credErr)
 	}
 	return t.cred, nil
-}
-
-func deref(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }

@@ -7,8 +7,9 @@ import (
 	"strings"
 )
 
-// vaultSuffixes are the Key Vault DNS suffixes of the Azure clouds.
-var vaultSuffixes = []string{".vault.azure.net", ".vault.azure.cn", ".vault.usgovcloudapi.net"}
+// vaultSuffixes are the Key Vault DNS suffixes accepted. Only Azure's
+// public cloud is supported (the ARM client targets it too).
+var vaultSuffixes = []string{".vault.azure.net"}
 
 var (
 	vaultNameRE   = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]$`)

@@ -2,11 +2,18 @@ package appgw
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 
 	"github.com/krakenkey/connector/pkg/plugin"
 	"github.com/krakenkey/connector/plugins/azure-appgateway/internal/fakearm"
@@ -91,9 +98,25 @@ func TestValidate(t *testing.T) {
 		if err != nil || len(problems) != 1 || !strings.Contains(problems[0], `no ssl certificate named "other"`) {
 			t.Fatalf("problems %v, err %v", problems, err)
 		}
-		problems, err = f.tg.Validate(ctxT(t), plugin.TargetValidateRequest{Config: cfg(map[string]any{"ssl_certificate": "other", "create_if_missing": true})})
+	})
+	t.Run("uploaded certificate", func(t *testing.T) {
+		f := newFixture(t)
+		f.setGateway(uploadedGateway())
+		problems, err := f.tg.Validate(ctxT(t), plugin.TargetValidateRequest{Config: cfg(nil)})
+		if err != nil || len(problems) != 1 || !strings.Contains(problems[0], "replace_uploaded_certificate") {
+			t.Fatalf("problems %v, err %v", problems, err)
+		}
+		problems, err = f.tg.Validate(ctxT(t), plugin.TargetValidateRequest{Config: cfg(map[string]any{"replace_uploaded_certificate": true})})
 		if err != nil || len(problems) != 0 {
-			t.Fatalf("with create_if_missing: problems %v, err %v", problems, err)
+			t.Fatalf("with replace_uploaded_certificate: problems %v, err %v", problems, err)
+		}
+	})
+	t.Run("versionless entry is not a problem", func(t *testing.T) {
+		f := newFixture(t)
+		f.setGateway(fakearm.V2Gateway(sub, rg, gwName, certName, "https://kv-test.vault.azure.net/secrets/app-cert/"))
+		problems, err := f.tg.Validate(ctxT(t), plugin.TargetValidateRequest{Config: cfg(nil)})
+		if err != nil || len(problems) != 0 {
+			t.Fatalf("problems %v, err %v", problems, err)
 		}
 	})
 	t.Run("gateway not found", func(t *testing.T) {
@@ -172,6 +195,27 @@ func activate(t *testing.T, f *fixture, extra map[string]any, version string) (s
 	return f.tg.Activate(ctxT(t), plugin.ActivateRequest{Config: cfg(extra), StagedRef: secret(version)})
 }
 
+func decodeRef(t *testing.T, ref string) previousRef {
+	t.Helper()
+	var p previousRef
+	if err := json.Unmarshal([]byte(ref), &p); err != nil {
+		t.Fatalf("previous ref %q is not JSON: %v", ref, err)
+	}
+	return p
+}
+
+func rollback(t *testing.T, f *fixture, ref string) error {
+	t.Helper()
+	return f.tg.Rollback(ctxT(t), plugin.RollbackRequest{Config: cfg(nil), PreviousRef: ref})
+}
+
+// uploadedGateway has the app-cert entry holding an uploaded PFX.
+func uploadedGateway() map[string]any {
+	g := fakearm.V2Gateway(sub, rg, gwName, certName, "")
+	props(g)["sslCertificates"] = []any{map[string]any{"name": certName, "properties": map[string]any{"publicCertData": "AAAA"}}}
+	return g
+}
+
 func TestActivateAndRollback(t *testing.T) {
 	f := newFixture(t)
 	// A second, uploaded certificate on the gateway must survive the PUT.
@@ -186,8 +230,8 @@ func TestActivateAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prev != secret(verOld) {
-		t.Errorf("previous ref %q, want %q", prev, secret(verOld))
+	if p := decodeRef(t, prev); p.Restore != secret(verOld) || p.Over != secret(verNew) || p.Unrestorable != "" {
+		t.Errorf("previous ref %+v", p)
 	}
 	if got := f.secretID(t); got != secret(verNew) {
 		t.Errorf("gateway points at %s", got)
@@ -225,30 +269,168 @@ func TestActivateAndRollback(t *testing.T) {
 		t.Errorf("Current after activate = %q", s)
 	}
 
-	// Activating the same version again changes nothing.
-	puts := f.srv.Count(http.MethodPut)
-	prev2, err := activate(t, f, nil, verNew)
-	if err != nil || prev2 != secret(verNew) || f.srv.Count(http.MethodPut) != puts {
-		t.Errorf("re-activate: prev %q err %v puts %d->%d", prev2, err, puts, f.srv.Count(http.MethodPut))
-	}
-
-	if err := f.tg.Rollback(ctxT(t), plugin.RollbackRequest{Config: cfg(nil), PreviousRef: prev}); err != nil {
+	if err := rollback(t, f, prev); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.secretID(t); got != secret(verOld) {
 		t.Errorf("after rollback the gateway points at %s", got)
 	}
+	// Rolling back again finds the old version in place and changes nothing.
+	puts := f.srv.Count(http.MethodPut)
+	if err := rollback(t, f, prev); err != nil || f.srv.Count(http.MethodPut) != puts {
+		t.Errorf("second rollback: err %v, PUTs %d -> %d", err, puts, f.srv.Count(http.MethodPut))
+	}
 }
 
-func TestRollbackRestoresVersionlessIDExactly(t *testing.T) {
+// Activating a version the gateway already shows must not record it as the
+// previous state: a rollback would then write the new version back and
+// report success.
+func TestActivateWhenAlreadyActiveCannotBeRolledBack(t *testing.T) {
 	f := newFixture(t)
-	versionless := "https://KV-Test.vault.azure.net/secrets/app-cert"
+	f.srv.SetSecretID(sub, rg, gwName, certName, secret(verNew))
+	prev, err := activate(t, f, nil, verNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.srv.Count(http.MethodPut) != 0 {
+		t.Error("activating the version already in place wrote to the gateway")
+	}
+	if p := decodeRef(t, prev); p.Unrestorable != reasonAlreadyActive || p.Restore != "" {
+		t.Fatalf("previous ref %+v", p)
+	}
+	if err := rollback(t, f, prev); !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("rollback err = %v", err)
+	}
+}
+
+// lossyTransport forwards the first PUT to the server, then answers 502 as
+// if the response was lost at the ARM front door.
+type lossyTransport struct {
+	mu   sync.Mutex
+	done bool
+}
+
+func (l *lossyTransport) Do(req *http.Request) (*http.Response, error) {
+	resp, err := http.DefaultClient.Do(req)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err == nil && req.Method == http.MethodPut && !l.done {
+		l.done = true
+		_ = resp.Body.Close()
+		return &http.Response{StatusCode: http.StatusBadGateway, Header: http.Header{},
+			Body: io.NopCloser(strings.NewReader(`{"error":{"code":"BadGateway","message":"lost"}}`)), Request: req}, nil
+	}
+	return resp, err
+}
+
+// Regression: with SDK retries on, a PUT whose response was lost was
+// retried with the old If-Match, got 412, and the re-read then reported
+// the new secret as the previous state.
+func TestActivateLostPutResponse(t *testing.T) {
+	f := newFixture(t)
+	f.srv.HangOps = true // the accepted update is still running when we look
+	tg := New(Options{
+		Credential: fakeCred{},
+		ClientOptions: &arm.ClientOptions{ClientOptions: policy.ClientOptions{
+			Cloud: cloud.Configuration{Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+				cloud.ResourceManager: {Endpoint: f.srv.URL, Audience: "https://management.core.windows.net/"},
+			}},
+			InsecureAllowCredentialWithHTTP: true,
+			// SDK retries on, as in production: the plugin must turn them
+			// off for the PUT.
+			Retry:     policy.RetryOptions{RetryDelay: time.Millisecond, MaxRetryDelay: time.Millisecond},
+			Transport: &lossyTransport{},
+		}},
+		PollFrequency: time.Millisecond, ReportReserve: 200 * time.Millisecond,
+	})
+	prev, err := tg.Activate(ctxT(t), plugin.ActivateRequest{Config: cfg(nil), StagedRef: secret(verNew)})
+	if err == nil {
+		t.Fatalf("Activate succeeded with previous ref %q after a lost response", prev)
+	}
+	if !errors.Is(err, plugin.ErrUnavailable) || !strings.Contains(err.Error(), "no clear answer") || !strings.Contains(err.Error(), "Updating") {
+		t.Errorf("err = %v", err)
+	}
+	if n := f.srv.Count(http.MethodPut); n != 1 {
+		t.Errorf("%d PUTs; the PUT must not be retried by the SDK", n)
+	}
+
+	// The update finishes later. Activating again must not claim the new
+	// version was live before.
+	f.srv.HangOps = false
+	g := f.gateway()
+	props(g)["provisioningState"] = "Succeeded"
+	f.setGateway(g)
+	prev, err = tg.Activate(ctxT(t), plugin.ActivateRequest{Config: cfg(nil), StagedRef: secret(verNew)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := decodeRef(t, prev); p.Restore == secret(verNew) || p.Unrestorable != reasonAlreadyActive {
+		t.Errorf("previous ref %+v", p)
+	}
+	if err := tg.Rollback(ctxT(t), plugin.RollbackRequest{Config: cfg(nil), PreviousRef: prev}); !errors.Is(err, plugin.ErrPermanent) {
+		t.Errorf("rollback err = %v", err)
+	}
+}
+
+// Regression: retrying after an activation that timed out but finished in
+// Azure returned the new secret as the previous ref.
+func TestActivateAgainAfterStillRunning(t *testing.T) {
+	f := newFixture(t)
+	f.srv.HangOps = true
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := f.tg.Activate(ctx, plugin.ActivateRequest{Config: cfg(nil), StagedRef: secret(verNew)}); !errors.Is(err, plugin.ErrUnavailable) {
+		t.Fatalf("first activate err = %v", err)
+	}
+	f.srv.HangOps = false
+	g := f.gateway()
+	props(g)["provisioningState"] = "Succeeded"
+	f.setGateway(g)
+	prev, err := activate(t, f, nil, verNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := decodeRef(t, prev); p.Restore == secret(verNew) || p.Unrestorable != reasonAlreadyActive {
+		t.Errorf("previous ref %+v", p)
+	}
+	if err := rollback(t, f, prev); !errors.Is(err, plugin.ErrPermanent) {
+		t.Errorf("rollback err = %v", err)
+	}
+	if got := f.secretID(t); got != secret(verNew) {
+		t.Errorf("refused rollback changed the gateway to %s", got)
+	}
+}
+
+func TestRollbackRefusesWhenChangedSinceActivation(t *testing.T) {
+	f := newFixture(t)
+	prev, err := activate(t, f, nil, verNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := secret(strings.Repeat("c", 32))
+	f.srv.SetSecretID(sub, rg, gwName, certName, other) // an operator's change
+	puts := f.srv.Count(http.MethodPut)
+	err = rollback(t, f, prev)
+	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "changed since") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := f.secretID(t); got != other || f.srv.Count(http.MethodPut) != puts {
+		t.Errorf("rollback overwrote the operator's change: %s", got)
+	}
+}
+
+func TestRollbackRestoresVersionlessIDOfAnotherSecret(t *testing.T) {
+	f := newFixture(t)
+	versionless := "https://KV-Test.vault.azure.net/secrets/old-cert"
 	f.setGateway(fakearm.V2Gateway(sub, rg, gwName, certName, versionless))
 	prev, err := activate(t, f, nil, verNew)
-	if err != nil || prev != versionless {
-		t.Fatalf("prev %q, err %v", prev, err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := f.tg.Rollback(ctxT(t), plugin.RollbackRequest{Config: cfg(nil), PreviousRef: prev}); err != nil {
+	if p := decodeRef(t, prev); p.Restore != versionless {
+		t.Fatalf("previous ref %+v", p)
+	}
+	if err := rollback(t, f, prev); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.secretID(t); got != versionless {
@@ -256,17 +438,39 @@ func TestRollbackRestoresVersionlessIDExactly(t *testing.T) {
 	}
 }
 
+// A versionless ID of the secret the key store writes to already resolves
+// to the new version, so putting it back would change nothing.
+func TestRollbackRefusesVersionlessIDOfTheSameSecret(t *testing.T) {
+	f := newFixture(t)
+	f.setGateway(fakearm.V2Gateway(sub, rg, gwName, certName, "https://KV-Test.vault.azure.net/secrets/App-Cert/"))
+	prev, err := activate(t, f, nil, verNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := decodeRef(t, prev); p.Unrestorable != reasonVersionlessSameSecret || p.Restore != "" {
+		t.Fatalf("previous ref %+v", p)
+	}
+	if err := rollback(t, f, prev); !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "versionless") {
+		t.Fatalf("rollback err = %v", err)
+	}
+}
+
 func TestRollbackRefs(t *testing.T) {
 	f := newFixture(t)
+	over := secret(verNew)
 	cases := map[string]error{
-		"":                      plugin.ErrPermanent,
-		"inline":                plugin.ErrPermanent,
+		"": plugin.ErrPermanent,
+		previousRef{V: 1, Unrestorable: reasonUploaded, Over: over}.encode(): plugin.ErrPermanent,
 		"garbage":               plugin.ErrNotFound,
 		"https://example.com/x": plugin.ErrNotFound,
+		secret(verOld):          plugin.ErrNotFound, // the old plain form
+		`{"v":2,"restore":"x","over":"` + over + `"}`:           plugin.ErrNotFound,
+		`{"v":1,"restore":"x"}`:                                 plugin.ErrNotFound,
+		`{"v":1,"over":"` + over + `"}`:                         plugin.ErrNotFound,
+		`{"v":1,"restore":"x","over":"` + over + `","extra":1}`: plugin.ErrNotFound,
 	}
 	for ref, want := range cases {
-		err := f.tg.Rollback(ctxT(t), plugin.RollbackRequest{Config: cfg(nil), PreviousRef: ref})
-		if !errors.Is(err, want) {
+		if err := rollback(t, f, ref); !errors.Is(err, want) {
 			t.Errorf("Rollback(%q) = %v, want %v", ref, err, want)
 		}
 	}
@@ -275,53 +479,41 @@ func TestRollbackRefs(t *testing.T) {
 	}
 }
 
-func TestActivateCreateIfMissing(t *testing.T) {
+func TestActivateMissingEntry(t *testing.T) {
 	f := newFixture(t)
 	g := fakearm.V2Gateway(sub, rg, gwName, certName, "")
 	props(g)["httpListeners"] = []any{}
 	f.setGateway(g)
-
-	if _, err := activate(t, f, nil, verNew); !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "create_if_missing") {
-		t.Fatalf("without create_if_missing: %v", err)
-	}
-	prev, err := activate(t, f, map[string]any{"create_if_missing": true}, verNew)
-	if err != nil || prev != "absent" {
-		t.Fatalf("prev %q, err %v", prev, err)
-	}
-	if got := f.secretID(t); got != secret(verNew) {
-		t.Errorf("created entry points at %s", got)
-	}
-	if err := f.tg.Rollback(ctxT(t), plugin.RollbackRequest{Config: cfg(nil), PreviousRef: prev}); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := f.srv.SecretID(sub, rg, gwName, certName); ok {
-		t.Error("rollback left the created entry in place")
-	}
-	// Removing it again is a no-op.
-	if err := f.tg.Rollback(ctxT(t), plugin.RollbackRequest{Config: cfg(nil), PreviousRef: prev}); err != nil {
-		t.Errorf("second rollback: %v", err)
-	}
-}
-
-func TestRollbackAbsentRefusesWhenInUse(t *testing.T) {
-	f := newFixture(t) // the listener uses app-cert
-	err := f.tg.Rollback(ctxT(t), plugin.RollbackRequest{Config: cfg(nil), PreviousRef: "absent"})
-	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "listener https") {
+	if _, err := activate(t, f, nil, verNew); !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "no ssl certificate named") {
 		t.Fatalf("err = %v", err)
+	}
+	if f.srv.Count(http.MethodPut) != 0 {
+		t.Error("wrote to the gateway")
 	}
 }
 
 func TestActivateOverUploadedCertificate(t *testing.T) {
 	f := newFixture(t)
-	g := fakearm.V2Gateway(sub, rg, gwName, certName, "")
-	props(g)["sslCertificates"] = []any{map[string]any{"name": certName, "properties": map[string]any{"publicCertData": "AAAA"}}}
-	f.setGateway(g)
-	prev, err := activate(t, f, nil, verNew)
-	if err != nil || prev != "inline" {
-		t.Fatalf("prev %q, err %v", prev, err)
+	f.setGateway(uploadedGateway())
+	_, err := activate(t, f, nil, verNew)
+	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "replace_uploaded_certificate") {
+		t.Fatalf("without replace_uploaded_certificate: %v", err)
 	}
-	err = f.tg.Rollback(ctxT(t), plugin.RollbackRequest{Config: cfg(nil), PreviousRef: prev})
-	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "cannot be restored") {
+	if f.srv.Count(http.MethodPut) != 0 {
+		t.Fatal("replaced the uploaded certificate without replace_uploaded_certificate")
+	}
+
+	prev, err := activate(t, f, map[string]any{"replace_uploaded_certificate": true}, verNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := decodeRef(t, prev); p.Unrestorable != reasonUploaded {
+		t.Fatalf("previous ref %+v", p)
+	}
+	if got := f.secretID(t); got != secret(verNew) {
+		t.Errorf("gateway points at %s", got)
+	}
+	if err := rollback(t, f, prev); !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "uploaded") {
 		t.Fatalf("rollback err = %v", err)
 	}
 }
@@ -393,6 +585,35 @@ func TestActivateGivesUpAfterRepeatedPreconditionFailures(t *testing.T) {
 	}
 }
 
+// If the concurrent writer already set the staged version, the previous
+// state is still the one first read, not the staged version.
+func TestActivateRetryFindsStagedVersion(t *testing.T) {
+	f := newFixture(t)
+	f.srv.ConcurrentWrites = 1
+	f.srv.OnConcurrentWrite = func(g map[string]any) { fakearm.SetEntrySecretID(g, certName, secret(verNew)) }
+	prev, err := activate(t, f, nil, verNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := decodeRef(t, prev); p.Restore != secret(verOld) {
+		t.Errorf("previous ref %+v, want restore %s", p, secret(verOld))
+	}
+}
+
+func TestActivateRetryFindsEntryChanged(t *testing.T) {
+	f := newFixture(t)
+	other := secret(strings.Repeat("c", 32))
+	f.srv.ConcurrentWrites = 1
+	f.srv.OnConcurrentWrite = func(g map[string]any) { fakearm.SetEntrySecretID(g, certName, other) }
+	_, err := activate(t, f, nil, verNew)
+	if !errors.Is(err, plugin.ErrUnavailable) || !strings.Contains(err.Error(), "changed from") {
+		t.Fatalf("err = %v", err)
+	}
+	if got := f.secretID(t); got != other {
+		t.Errorf("gateway points at %s", got)
+	}
+}
+
 func TestActivateOperationFailsAndIsUndone(t *testing.T) {
 	f := newFixture(t)
 	f.srv.NextOpFailure = &fakearm.OpFailure{Code: "ApplicationGatewayKeyVaultSecretException", Message: "Access denied to the secret", Keep: true}
@@ -460,6 +681,8 @@ func TestErrorMapping(t *testing.T) {
 		{"write 429", fakearm.Fault{Method: http.MethodPut, Status: 429, Code: "TooManyRequests"}, plugin.ErrUnavailable, "429"},
 		{"write 409", fakearm.Fault{Method: http.MethodPut, Status: 409, Code: "AnotherOperationInProgress"}, plugin.ErrUnavailable, "AnotherOperationInProgress"},
 		{"write 400", fakearm.Fault{Method: http.MethodPut, Status: 400, Code: "ApplicationGatewaySslCertificateInvalidKeyVaultSecretId"}, plugin.ErrPermanent, "InvalidKeyVaultSecretId"},
+		{"write 502", fakearm.Fault{Method: http.MethodPut, Status: 502, Code: "BadGateway"}, plugin.ErrUnavailable, "nothing was changed"},
+		{"write 408", fakearm.Fault{Method: http.MethodPut, Status: 408, Code: "RequestTimeout"}, plugin.ErrUnavailable, "no clear answer"},
 		{"read 500", fakearm.Fault{Method: http.MethodGet, Status: 500, Code: "InternalServerError"}, plugin.ErrUnavailable, "500"},
 		{"read 401", fakearm.Fault{Method: http.MethodGet, Status: 401, Code: "InvalidAuthenticationToken"}, plugin.ErrPermanent, "credential"},
 		{"poll 500", fakearm.Fault{Method: http.MethodGet, PathContains: "/operations/", Status: 500, Code: "InternalServerError", Times: maxPollErrors}, plugin.ErrUnavailable, "status failed: HTTP 500"},
