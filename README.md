@@ -44,16 +44,22 @@ plugins, places such as key vaults and cloud load balancers.
   never sees private keys or credentials for your systems.
 - The connector holds private keys and the access needed to deploy (file
   permissions, vault credentials). Run it where that access already lives.
-- The API key only needs access to the certificates the connector manages.
-  Give it to the connector as a file (`KK_API_KEY_FILE`) or a systemd
-  credential (`LoadCredential=kk_api_key:/etc/krakenkey-connector/api-key`)
-  rather than in the environment: a process's original environment stays
-  readable in `/proc/<pid>/environ` for its lifetime. If `KK_API_KEY` is
-  used, it is removed from the environment that plugins and commands
-  inherit, and on Linux the connector marks itself non-dumpable, so other
-  processes running as the same user (plugins and deployment commands
-  included) cannot read its environment or memory through `/proc`. Root
-  still can. The key is never logged.
+- An enrolled connector holds no long-lived API key. It has its own
+  Ed25519 identity key, created on the machine at enrollment, and trades a
+  signed request for an API key that lasts an hour. That key stays in
+  memory and is limited to the scopes and certificates set for the
+  connector in the dashboard. See [Enrollment](#enrollment).
+- Without enrollment, the connector uses an API key, which only needs access
+  to the certificates the connector manages. Give it to the connector as a
+  file (`KK_API_KEY_FILE`) or a systemd credential
+  (`LoadCredential=kk_api_key:/etc/krakenkey-connector/api-key`) rather
+  than in the environment: a process's original environment stays readable
+  in `/proc/<pid>/environ` for its lifetime. If `KK_API_KEY` is used, it is
+  removed from the environment that plugins and commands inherit, and on
+  Linux the connector marks itself non-dumpable, so other processes running
+  as the same user (plugins and deployment commands included) cannot read
+  its environment or memory through `/proc`. Root still can. Keys, tokens
+  and the identity key are never logged.
 - Plugins and deployment commands run with the connector's permissions. Only
   install plugins you trust. Plugins installed by version must have their
   `sha256` pinned in the config.
@@ -122,7 +128,9 @@ See [Docker](#docker) for how to run it.
 
 ## Quick start
 
-1. Create an API key in the KrakenKey dashboard.
+1. Create a connector in the KrakenKey dashboard and copy its enrollment
+   token (`kkce_...`, shown once, valid for 24 hours). Alternatively, create
+   an API key and skip step 3.
 2. Write `/etc/krakenkey-connector/config.yaml`:
 
    ```yaml
@@ -146,17 +154,28 @@ See [Docker](#docker) for how to run it.
            verify: { host: api.example.com, port: 443, window: 10m }
    ```
 
-3. Check it. `validate` loads the config, starts the plugins, checks that each
-   key store and target can work together, asks KrakenKey about each
-   certificate, and exits non-zero if anything is wrong:
+3. Enroll the connector, as the user it will run as:
 
    ```sh
-   install -m 0600 /dev/null /etc/krakenkey-connector/api-key   # then paste the kk_... key into it
-   export KK_API_KEY_FILE=/etc/krakenkey-connector/api-key
+   install -m 0600 /dev/null /etc/krakenkey-connector/enrollment-token   # then paste the kkce_... token into it
+   KK_ENROLLMENT_TOKEN_FILE=/etc/krakenkey-connector/enrollment-token \
+     krakenkey-connector enroll --config /etc/krakenkey-connector/config.yaml
+   rm /etc/krakenkey-connector/enrollment-token   # it works only once
+   ```
+
+   With an API key instead, put the key in a file and
+   `export KK_API_KEY_FILE=/etc/krakenkey-connector/api-key`.
+
+4. Check it. `validate` loads the config, starts the plugins, checks that each
+   key store and target can work together, checks the connector's identity
+   (or API key), asks KrakenKey about each certificate, and exits non-zero
+   if anything is wrong:
+
+   ```sh
    krakenkey-connector validate --config /etc/krakenkey-connector/config.yaml
    ```
 
-4. Run a single pass, for example from cron or a systemd timer:
+5. Run a single pass, for example from cron or a systemd timer:
 
    ```sh
    krakenkey-connector run --once --config /etc/krakenkey-connector/config.yaml
@@ -198,6 +217,8 @@ krakenkey-connector run --once --force --cert 1043
 
 | Command | What it does |
 |---------|--------------|
+| `enroll [--force]` | Enroll with a one-time token. See [Enrollment](#enrollment). |
+| `rotate-identity` | Replace the connector's identity key. |
 | `run` | Run a pass now, then every `check_interval`, until stopped. |
 | `run --once` | Run a single pass and exit. Exit code 0 only if every certificate and target succeeded. |
 | `run --once --force [--cert ID]` | Renew even if not due, and retry failed targets without waiting; `--cert` limits the pass to one configured certificate. |
@@ -214,20 +235,62 @@ Exit codes, so cron and systemd can alert:
 |------|---------|
 | `0` | Every certificate and target succeeded. |
 | `1` | A certificate or target failed. The log and the audit log say which. |
-| `2` | Usage or config error, including a missing API key. |
-| `3` | The API rejected the key. The pass stopped. |
+| `2` | Usage or config error, including missing credentials, or `enroll` on an enrolled connector without `--force`. |
+| `3` | The API rejected the API key, or `enroll` was given a token KrakenKey refused. The pass stopped. |
 | `4` | KrakenKey asked the connector to back off (`429`) for longer than it waits. The pass stopped. |
+| `5` | KrakenKey refused the connector's identity: the connector was revoked, its identity key is not the one KrakenKey has, or the clock is more than five minutes off. The pass stopped. |
 
 After a `401` the connector stops calling the API; a bad key would otherwise
 get locked out. On a `429` it waits for `Retry-After` (up to 5 minutes) before
 trying again, and otherwise stops the pass. `run` mode keeps running after
-`1` and `4` and tries again at the next interval; it exits on `3`.
+`1` and `4` and tries again at the next interval; it exits on `3` and `5`.
 
 The API key is read from the file named by `KK_API_KEY_FILE`, then from the
 systemd credential `kk_api_key` (`$CREDENTIALS_DIRECTORY/kk_api_key`), then
-from `KK_API_KEY`. A key file must not be readable by other users.
+from `KK_API_KEY`. A key file must not be readable by other users. An
+enrolled connector ignores the API key and logs a warning if one is set.
 
 Only one connector process can use a data directory at a time.
+
+## Enrollment
+
+Enrollment gives the connector its own identity, so that no long-lived API
+key has to be stored on the machine.
+
+1. In the dashboard, create a connector: give it a name, the scopes it
+   needs (`certs:read`, and `certs:renew` to renew), and the certificates or
+   domains it may manage. You get an enrollment token (`kkce_...`). It is
+   shown once, works once, and expires after 24 hours.
+2. Run `krakenkey-connector enroll`. The token is read from the file named
+   by `KK_ENROLLMENT_TOKEN_FILE`, then from the systemd credential
+   `kk_enrollment_token`, then from `KK_ENROLLMENT_TOKEN`, with the same rules
+   as the API key. The connector creates an Ed25519 key pair, sends the
+   public key with the token, and stores the private key and the connector
+   id it gets back in `<data_dir>/identity/` (files `0600` in a `0700`
+   directory, checked like the key store's files).
+
+On each pass, the connector signs a request with its identity key and gets
+an API key that is valid for an hour. It keeps that key in memory, never on
+disk, and gets a new one five minutes before it expires. The signed request
+carries the current time, so the machine's clock must be within five
+minutes of KrakenKey's.
+
+If KrakenKey refuses the identity (the connector was revoked in the
+dashboard, for example), the pass stops at once with exit code `5`, and the
+connector does not retry. To bring it back, create a new connector or
+enrollment token and run `enroll --force`.
+
+`enroll` refuses to run when the connector is already enrolled. With
+`--force` it enrolls again and keeps the old identity files next to the new
+ones with a `.bak-<time>` suffix; delete them once you no longer need them.
+
+`rotate-identity` replaces the identity key. The new key is written to
+`identity.key.next` first and becomes `identity.key` only after KrakenKey
+has accepted it. If the connector stops in between, the next run tries the
+current key, then the new one, and keeps whichever KrakenKey accepts.
+
+`validate` shows whether the connector is enrolled, its id, and whether a
+token exchange works.
 
 ## Configuration
 
@@ -235,7 +298,7 @@ Only one connector process can use a data directory at a time.
 |-----|---------|---------|
 | `krakenkey.api_url` | `https://api.krakenkey.io` | API base URL. `KK_API_URL` overrides it. |
 | `check_interval` | `6h` | Time between passes in `run` mode (minimum `1m`). |
-| `data_dir` | `/var/lib/krakenkey-connector` | Keys, state and plugin binaries. Must be owned by the connector's user, mode `0700`. |
+| `data_dir` | `/var/lib/krakenkey-connector` | Keys, identity, state and plugin binaries. Must be owned by the connector's user, mode `0700`. |
 | `audit_log` | `<data_dir>/audit.jsonl` | Audit log, one JSON object per line. Must be mode `0600`. |
 | `plugins` | | External plugins, by name. See [Plugins](#external-plugins). |
 | `certificates[].id` | | KrakenKey certificate id. |
@@ -394,6 +457,20 @@ Pin a version tag (or `X.Y`) rather than `latest`, so an upgrade happens when
 you choose. To build the image from source instead, run
 `docker build -t krakenkey-connector .` and use `krakenkey-connector` as the
 image name.
+
+To enroll the container's connector, run `enroll` once with the same config
+and data volume:
+
+```sh
+docker run --rm \
+  -e KK_ENROLLMENT_TOKEN_FILE=/run/secrets/kk_enrollment_token \
+  -v /etc/krakenkey-connector/enrollment-token:/run/secrets/kk_enrollment_token:ro \
+  -v /etc/krakenkey-connector/config.yaml:/etc/krakenkey-connector/config.yaml:ro \
+  -v krakenkey-connector-data:/var/lib/krakenkey-connector \
+  ghcr.io/krakenkey/connector:v${VERSION} enroll --config /etc/krakenkey-connector/config.yaml
+```
+
+and then start it as above without the API key.
 
 The image runs as a non-root user (uid 10001). Give that user write access to
 the target directories you mount, and make the key file readable by it (and

@@ -223,11 +223,15 @@ func (c *Connector) RunOnce(ctx context.Context, opts RunOptions) error {
 }
 
 // Run runs a pass now and then every check_interval until ctx is done or
-// the API rejects the key.
+// the API rejects the key or the connector's identity.
 func (c *Connector) Run(ctx context.Context) error {
 	for {
 		err := c.RunOnce(ctx, RunOptions{})
 		var authErr *api.AuthError
+		var connAuthErr *api.ConnectorAuthError
+		if errors.As(err, &connAuthErr) {
+			return connAuthErr
+		}
 		if errors.As(err, &authErr) {
 			return authErr
 		}
@@ -243,12 +247,14 @@ func (c *Connector) Run(ctx context.Context) error {
 	}
 }
 
-// stopsPass reports whether err should end the pass: the API key was
-// rejected, or KrakenKey asked the connector to back off.
+// stopsPass reports whether err should end the pass: the API key or the
+// connector's identity was rejected, or KrakenKey asked the connector to
+// back off.
 func stopsPass(err error) bool {
 	var authErr *api.AuthError
+	var connAuthErr *api.ConnectorAuthError
 	var rl *api.RateLimitError
-	return errors.As(err, &authErr) || errors.As(err, &rl)
+	return errors.As(err, &authErr) || errors.As(err, &connAuthErr) || errors.As(err, &rl)
 }
 
 func firstProblem(r *CertReport) string {

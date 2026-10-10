@@ -14,11 +14,29 @@ import (
 	"time"
 )
 
+// KeySource supplies the API key for each request: a fixed key, or a
+// short-lived key the connector gets by proving its identity.
+type KeySource interface {
+	APIKey(ctx context.Context) (string, error)
+}
+
+// StaticKey is a KeySource for a fixed API key.
+type StaticKey string
+
+// APIKey returns the key.
+func (k StaticKey) APIKey(context.Context) (string, error) { return string(k), nil }
+
+// KeySourceFunc adapts a function to KeySource.
+type KeySourceFunc func(ctx context.Context) (string, error)
+
+// APIKey calls f.
+func (f KeySourceFunc) APIKey(ctx context.Context) (string, error) { return f(ctx) }
+
 // Client calls the KrakenKey API with an API key. It is safe for
 // concurrent use.
 type Client struct {
 	baseURL    string
-	apiKey     string
+	keys       KeySource
 	userAgent  string
 	httpClient *http.Client
 
@@ -39,9 +57,15 @@ type Client struct {
 // NewClient returns a client for baseURL. The key is sent as a bearer
 // token and never logged or included in errors.
 func NewClient(baseURL, apiKey, userAgent string) *Client {
+	return NewClientWithKeys(baseURL, StaticKey(apiKey), userAgent)
+}
+
+// NewClientWithKeys returns a client that asks keys for the bearer token
+// before each request.
+func NewClientWithKeys(baseURL string, keys KeySource, userAgent string) *Client {
 	return &Client{
 		baseURL:   strings.TrimRight(baseURL, "/"),
-		apiKey:    apiKey,
+		keys:      keys,
 		userAgent: userAgent,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -60,8 +84,17 @@ func NewClient(baseURL, apiKey, userAgent string) *Client {
 // defaultRetryAfter is used when a 429 has no usable Retry-After header.
 const defaultRetryAfter = 60 * time.Second
 
+// do sends an authenticated request.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
-	if prev := c.authFailed.Load(); prev != nil {
+	return c.send(ctx, method, path, body, out, true)
+}
+
+// send sends a request, with the bearer token when auth is true. A 401 on
+// an authenticated request is remembered and ends every later call; on an
+// unauthenticated one (the connector enrollment and token routes) it is
+// returned as an *APIError and not remembered.
+func (c *Client) send(ctx context.Context, method, path string, body, out any, auth bool) error {
+	if prev := c.authFailed.Load(); prev != nil && auth {
 		return prev
 	}
 	var data []byte
@@ -81,7 +114,13 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		if err != nil {
 			return fmt.Errorf("build request: %w", err)
 		}
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		if auth {
+			key, err := c.keys.APIKey(ctx)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
 		req.Header.Set("User-Agent", c.userAgent)
 		req.Header.Set("Accept", "application/json")
 		if data != nil {
@@ -120,14 +159,16 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 			return apiErr
 		}
 
-		switch resp.StatusCode {
-		case http.StatusUnauthorized:
+		switch {
+		case resp.StatusCode == http.StatusUnauthorized && !auth:
+			return apiErr
+		case resp.StatusCode == http.StatusUnauthorized:
 			authErr := &AuthError{Message: apiErr.Message()}
 			c.authFailed.Store(authErr)
 			return authErr
-		case http.StatusNotFound:
+		case resp.StatusCode == http.StatusNotFound:
 			return &NotFoundError{Message: apiErr.Message()}
-		case http.StatusTooManyRequests:
+		case resp.StatusCode == http.StatusTooManyRequests:
 			wait := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 			if attempt >= c.MaxRateLimitRetries || wait > c.MaxRateLimitWait {
 				return &RateLimitError{Message: apiErr.Message(), RetryAfter: wait}

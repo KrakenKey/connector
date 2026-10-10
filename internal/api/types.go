@@ -122,7 +122,7 @@ func (e *APIError) Error() string {
 type AuthError struct{ Message string }
 
 func (e *AuthError) Error() string {
-	return "KrakenKey API rejected the API key (401): " + e.Message + "; check KK_API_KEY"
+	return "KrakenKey API rejected the API key (401): " + e.Message
 }
 
 // NotFoundError is a 404.
@@ -145,9 +145,10 @@ func (e *RateLimitError) Error() string {
 func IsClientError(err error) bool {
 	var nf *NotFoundError
 	var auth *AuthError
+	var connAuth *ConnectorAuthError
 	var apiErr *APIError
 	switch {
-	case errors.As(err, &nf), errors.As(err, &auth):
+	case errors.As(err, &nf), errors.As(err, &auth), errors.As(err, &connAuth):
 		return true
 	case errors.As(err, &apiErr):
 		return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != 429

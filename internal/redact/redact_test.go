@@ -17,6 +17,9 @@ func TestString(t *testing.T) {
 	if !strings.Contains(out, "before") || !strings.Contains(out, "after") {
 		t.Errorf("too much removed: %s", out)
 	}
+	if out := String("token kkce_Zm9vYmFyYmF6cXV4 used"); strings.Contains(out, "Zm9vYmFy") || !strings.Contains(out, "kkce_[removed]") {
+		t.Errorf("enrollment token survived: %s", out)
+	}
 	if got := Limit("abcdef", 3); got != "abc... (truncated)" {
 		t.Errorf("Limit = %q", got)
 	}

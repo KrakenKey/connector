@@ -8,12 +8,18 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
-First release. Enrollment with a one-time token (short-lived keys instead
-of a stored API key) and reporting deployment status to KrakenKey are in
-progress and will follow in a later release.
+First release. Reporting deployment status to KrakenKey is in progress and
+will follow in a later release.
 
 ### Added
 
+- `krakenkey-connector enroll` and `rotate-identity`: the connector enrolls
+  once with a one-time token from the KrakenKey dashboard, keeps an Ed25519
+  identity key in `<data_dir>/identity/`, and exchanges a signed assertion
+  for a one-hour API key on each pass, so no long-lived key is stored. The
+  API key settings stay as a fallback for connectors that are not enrolled.
+  Exit code 5 means KrakenKey refused the connector's identity (for example
+  after it was revoked). (#3)
 - Plugin protocol (`krakenkey.connector.plugin.v1`) and Go SDK in
   `pkg/plugin`. Key stores and targets are separate executables run over
   gRPC with hashicorp/go-plugin. The protocol defines error kinds mapped to
