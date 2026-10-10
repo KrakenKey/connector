@@ -50,6 +50,7 @@ For example, for `ecdsa-p256` and `api.example.com`:
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 7 \
   -subj /CN=api.example.com -addext subjectAltName=DNS:api.example.com \
+  -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=serverAuth \
   -keyout placeholder.key -out placeholder.pem
 aws acm import-certificate --region eu-west-1 \
   --certificate fileb://placeholder.pem --private-key fileb://placeholder.key \
@@ -57,7 +58,12 @@ aws acm import-certificate --region eu-west-1 \
 rm placeholder.key
 ```
 
-For RSA use `-newkey rsa:2048` instead. The command prints the ARN. Attach
+For RSA use `-newkey rsa:2048` instead. Keep the `keyUsage` and
+`extendedKeyUsage` options: ACM records a certificate without them as
+allowing any usage (`ANY`) and then refuses to re-import a certificate that
+restricts usage, which every certificate KrakenKey issues does. If you are
+unsure, compare with `openssl x509 -noout -ext keyUsage,extendedKeyUsage` on
+a certificate KrakenKey issued for you. The command prints the ARN. Attach
 the certificate to your load balancer listener, distribution or domain name,
 then run the connector; its first pass replaces the placeholder.
 

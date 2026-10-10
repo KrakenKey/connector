@@ -136,11 +136,11 @@ func TestLocalStack(t *testing.T) {
 	}
 }
 
-// normalizeLocalStack rewrites the two DescribeCertificate fields where
+// normalizeLocalStack rewrites the DescribeCertificate serial, where
 // LocalStack differs from ACM, so the plugin's ACM parsing is tested
 // unchanged: LocalStack writes the serial in decimal ("6493...") where ACM
-// writes colon-separated hex, and the key algorithm with a dash
-// ("EC-prime256v1") where ACM uses an underscore.
+// writes colon-separated hex. The key algorithm is left as LocalStack writes
+// it ("EC-prime256v1"), which is also how real ACM reports it.
 func normalizeLocalStack(stack *middleware.Stack) error {
 	return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("NormalizeLocalStack",
 		func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
@@ -157,7 +157,6 @@ func normalizeLocalStack(stack *middleware.Stack) error {
 						d.Serial = aws.String(strings.Join(parts, ":"))
 					}
 				}
-				d.KeyAlgorithm = types.KeyAlgorithm(strings.ReplaceAll(string(d.KeyAlgorithm), "-", "_"))
 			}
 			return out, md, err
 		}), middleware.After)
