@@ -273,13 +273,19 @@ func main() {
 }
 ```
 
-A plugin can be a **key store** (`Describe`, `CreateCSR`, `Complete`,
-`Export`, `Release`), a **target** (`Describe`, `Validate`, `Current`,
-`Stage`, `Activate`, `Rollback`), or both. Each reports its capabilities, and
-the connector checks every key store and target pair before deploying
-(`plugin.Match`). For example, a key store that keeps keys non-exportable
-cannot feed a target that needs the key as a PEM file, and an ECDSA key
-cannot go to a target that only serves RSA.
+A plugin can be a **key store** (`Describe`, `Validate`, `CreateCSR`,
+`PublicKey`, `Complete`, `Export`, `Release`), a **target** (`Describe`,
+`Validate`, `Current`, `Stage`, `Activate`, `Rollback`, `Discard`), or both.
+Embed `plugin.UnimplementedKeyStore` or `plugin.UnimplementedTarget` and
+override the calls you support. Wrap the error kinds in
+[`pkg/plugin/errors.go`](pkg/plugin/errors.go) (`ErrPermanent`, `ErrNotFound`,
+`ErrUnavailable`, ...) so the connector knows whether retrying makes sense; the
+proto file lists the matching gRPC codes and the contract of each call.
+
+Each plugin reports its capabilities, and the connector checks every key
+store and target pair before deploying (`plugin.Match`). For example, a key
+store that keeps keys non-exportable cannot feed a target that needs the key
+as a PEM file, and an ECDSA key cannot go to a target that only serves RSA.
 
 ## Development
 

@@ -12,6 +12,14 @@
 // DispenseKeyStore or DispenseTarget to get an implementation that forwards
 // calls over gRPC. Built-in key stores and targets implement the same
 // interfaces in process.
+//
+// Errors: wrap ErrPermanent, ErrNotFound, ErrUnavailable, ErrInvalid or
+// ErrUnsupported (see errors.go) so the core knows whether to retry. Embed
+// UnimplementedKeyStore or UnimplementedTarget for calls you do not support.
+//
+// Secrets: KeyMaterial and StageRequest redact the private key when
+// formatted, logged or JSON encoded. The generated protobuf messages do
+// not, so never log them.
 package plugin
 
 import (
@@ -27,8 +35,10 @@ import (
 	pb "github.com/krakenkey/connector/proto/krakenkey/connector/plugin/v1"
 )
 
-// ProtocolVersion is the plugin protocol version. It changes only on
-// breaking changes to the gRPC services.
+// ProtocolVersion is the plugin protocol version this SDK speaks. It
+// changes only on breaking changes to the gRPC services. Plugins and the
+// connector negotiate it through go-plugin's versioned plugin sets, so a
+// later connector can serve more than one version.
 const ProtocolVersion = 1
 
 // Plugin names used when dispensing.
@@ -124,10 +134,10 @@ func Serve(opts ServeOpts) {
 		panic("plugin.Serve: ServeOpts needs a KeyStore, a Target, or both")
 	}
 	goplugin.Serve(&goplugin.ServeConfig{
-		HandshakeConfig: Handshake,
-		Plugins:         set,
-		GRPCServer:      goplugin.DefaultGRPCServer,
-		Logger:          opts.Logger,
+		HandshakeConfig:  Handshake,
+		VersionedPlugins: map[int]goplugin.PluginSet{ProtocolVersion: set},
+		GRPCServer:       goplugin.DefaultGRPCServer,
+		Logger:           opts.Logger,
 	})
 }
 
@@ -146,7 +156,7 @@ func HostPluginSet() goplugin.PluginSet {
 func ClientConfig(cmd *exec.Cmd, logger hclog.Logger) *goplugin.ClientConfig {
 	return &goplugin.ClientConfig{
 		HandshakeConfig:  Handshake,
-		Plugins:          HostPluginSet(),
+		VersionedPlugins: map[int]goplugin.PluginSet{ProtocolVersion: HostPluginSet()},
 		Cmd:              cmd,
 		AllowedProtocols: []goplugin.Protocol{goplugin.ProtocolGRPC},
 		AutoMTLS:         true,

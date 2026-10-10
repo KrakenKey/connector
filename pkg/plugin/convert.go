@@ -1,13 +1,7 @@
 package plugin
 
 import (
-	"context"
-	"errors"
-	"fmt"
 	"time"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	pb "github.com/krakenkey/connector/proto/krakenkey/connector/plugin/v1"
 )
@@ -139,42 +133,4 @@ func goTargetCaps(c *pb.TargetCapabilities) TargetCapabilities {
 		DefaultVerifyWindow: time.Duration(c.GetDefaultVerifyWindowSeconds()) * time.Second,
 		PropagatesAsync:     c.GetPropagatesAsync(),
 	}
-}
-
-// toStatus turns an implementation error into a gRPC status. Context errors
-// keep their meaning; everything else crosses the wire as its message.
-func toStatus(err error) error {
-	if err == nil {
-		return nil
-	}
-	switch {
-	case errors.Is(err, context.Canceled):
-		return status.Error(codes.Canceled, err.Error())
-	case errors.Is(err, context.DeadlineExceeded):
-		return status.Error(codes.DeadlineExceeded, err.Error())
-	}
-	return status.Error(codes.Unknown, err.Error())
-}
-
-// fromStatus turns a gRPC error back into a plain error carrying the
-// plugin's message, without the "rpc error: code = ..." prefix.
-func fromStatus(op string, err error) error {
-	if err == nil {
-		return nil
-	}
-	st, ok := status.FromError(err)
-	if !ok {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	switch st.Code() {
-	case codes.Canceled:
-		return fmt.Errorf("%s: %w", op, context.Canceled)
-	case codes.DeadlineExceeded:
-		return fmt.Errorf("%s: %w", op, context.DeadlineExceeded)
-	case codes.Unimplemented:
-		return fmt.Errorf("%s: plugin does not implement this call: %s", op, st.Message())
-	case codes.Unavailable:
-		return fmt.Errorf("%s: plugin unavailable: %s", op, st.Message())
-	}
-	return fmt.Errorf("%s: %s", op, st.Message())
 }

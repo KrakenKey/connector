@@ -2,7 +2,6 @@ package plugin
 
 import (
 	"context"
-	"encoding/json"
 
 	pb "github.com/krakenkey/connector/proto/krakenkey/connector/plugin/v1"
 )
@@ -21,16 +20,20 @@ func (s *targetGRPCServer) Describe(ctx context.Context, _ *pb.TargetServiceDesc
 	return &pb.TargetServiceDescribeResponse{Capabilities: pbTargetCaps(caps)}, nil
 }
 
-func (s *targetGRPCServer) Validate(ctx context.Context, req *pb.ValidateRequest) (*pb.ValidateResponse, error) {
-	problems, err := s.impl.Validate(ctx, req.GetConfigJson())
+func (s *targetGRPCServer) Validate(ctx context.Context, req *pb.TargetServiceValidateRequest) (*pb.TargetServiceValidateResponse, error) {
+	problems, err := s.impl.Validate(ctx, TargetValidateRequest{
+		Config: req.GetConfigJson(), CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
+	})
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	return &pb.ValidateResponse{Problems: problems}, nil
+	return &pb.TargetServiceValidateResponse{Problems: problems}, nil
 }
 
 func (s *targetGRPCServer) Current(ctx context.Context, req *pb.CurrentRequest) (*pb.CurrentResponse, error) {
-	serial, err := s.impl.Current(ctx, req.GetConfigJson())
+	serial, err := s.impl.Current(ctx, CurrentRequest{
+		Config: req.GetConfigJson(), CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
+	})
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -55,7 +58,10 @@ func (s *targetGRPCServer) Stage(ctx context.Context, req *pb.StageRequest) (*pb
 }
 
 func (s *targetGRPCServer) Activate(ctx context.Context, req *pb.ActivateRequest) (*pb.ActivateResponse, error) {
-	prev, err := s.impl.Activate(ctx, req.GetConfigJson(), req.GetStagedRef())
+	prev, err := s.impl.Activate(ctx, ActivateRequest{
+		Config: req.GetConfigJson(), StagedRef: req.GetStagedRef(),
+		CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
+	})
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -63,10 +69,25 @@ func (s *targetGRPCServer) Activate(ctx context.Context, req *pb.ActivateRequest
 }
 
 func (s *targetGRPCServer) Rollback(ctx context.Context, req *pb.RollbackRequest) (*pb.RollbackResponse, error) {
-	if err := s.impl.Rollback(ctx, req.GetConfigJson(), req.GetPreviousRef()); err != nil {
+	err := s.impl.Rollback(ctx, RollbackRequest{
+		Config: req.GetConfigJson(), PreviousRef: req.GetPreviousRef(),
+		CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
+	})
+	if err != nil {
 		return nil, toStatus(err)
 	}
 	return &pb.RollbackResponse{}, nil
+}
+
+func (s *targetGRPCServer) Discard(ctx context.Context, req *pb.DiscardRequest) (*pb.DiscardResponse, error) {
+	err := s.impl.Discard(ctx, DiscardRequest{
+		Config: req.GetConfigJson(), StagedRef: req.GetStagedRef(),
+		CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
+	})
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &pb.DiscardResponse{}, nil
 }
 
 // targetGRPCClient implements Target over a gRPC connection.
@@ -84,16 +105,20 @@ func (c *targetGRPCClient) Describe(ctx context.Context) (TargetCapabilities, er
 	return goTargetCaps(resp.GetCapabilities()), nil
 }
 
-func (c *targetGRPCClient) Validate(ctx context.Context, config json.RawMessage) ([]string, error) {
-	resp, err := c.client.Validate(ctx, &pb.ValidateRequest{ConfigJson: config})
+func (c *targetGRPCClient) Validate(ctx context.Context, req TargetValidateRequest) ([]string, error) {
+	resp, err := c.client.Validate(ctx, &pb.TargetServiceValidateRequest{
+		ConfigJson: req.Config, CertificateId: req.CertificateID, Label: req.Label,
+	})
 	if err != nil {
 		return nil, fromStatus("target validate", err)
 	}
 	return resp.GetProblems(), nil
 }
 
-func (c *targetGRPCClient) Current(ctx context.Context, config json.RawMessage) (string, error) {
-	resp, err := c.client.Current(ctx, &pb.CurrentRequest{ConfigJson: config})
+func (c *targetGRPCClient) Current(ctx context.Context, req CurrentRequest) (string, error) {
+	resp, err := c.client.Current(ctx, &pb.CurrentRequest{
+		ConfigJson: req.Config, CertificateId: req.CertificateID, Label: req.Label,
+	})
 	if err != nil {
 		return "", fromStatus("target current", err)
 	}
@@ -117,15 +142,26 @@ func (c *targetGRPCClient) Stage(ctx context.Context, req StageRequest) (string,
 	return resp.GetStagedRef(), nil
 }
 
-func (c *targetGRPCClient) Activate(ctx context.Context, config json.RawMessage, stagedRef string) (string, error) {
-	resp, err := c.client.Activate(ctx, &pb.ActivateRequest{ConfigJson: config, StagedRef: stagedRef})
+func (c *targetGRPCClient) Activate(ctx context.Context, req ActivateRequest) (string, error) {
+	resp, err := c.client.Activate(ctx, &pb.ActivateRequest{
+		ConfigJson: req.Config, StagedRef: req.StagedRef, CertificateId: req.CertificateID, Label: req.Label,
+	})
 	if err != nil {
 		return "", fromStatus("target activate", err)
 	}
 	return resp.GetPreviousRef(), nil
 }
 
-func (c *targetGRPCClient) Rollback(ctx context.Context, config json.RawMessage, previousRef string) error {
-	_, err := c.client.Rollback(ctx, &pb.RollbackRequest{ConfigJson: config, PreviousRef: previousRef})
+func (c *targetGRPCClient) Rollback(ctx context.Context, req RollbackRequest) error {
+	_, err := c.client.Rollback(ctx, &pb.RollbackRequest{
+		ConfigJson: req.Config, PreviousRef: req.PreviousRef, CertificateId: req.CertificateID, Label: req.Label,
+	})
 	return fromStatus("target rollback", err)
+}
+
+func (c *targetGRPCClient) Discard(ctx context.Context, req DiscardRequest) error {
+	_, err := c.client.Discard(ctx, &pb.DiscardRequest{
+		ConfigJson: req.Config, StagedRef: req.StagedRef, CertificateId: req.CertificateID, Label: req.Label,
+	})
+	return fromStatus("target discard", err)
 }

@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -94,6 +95,17 @@ func TestKeyStoreRoundTrip(t *testing.T) {
 		t.Errorf("CSR names = %s", got)
 	}
 
+	if problems, err := ks.Validate(ctx, plugin.KeyStoreValidateRequest{Config: json.RawMessage(`{"x":1}`)}); err != nil || len(problems) != 1 {
+		t.Errorf("Validate = %v, %v", problems, err)
+	}
+	spki, err := ks.PublicKey(ctx, plugin.PublicKeyRequest{KeyRef: csr.KeyRef})
+	if err != nil || string(spki) != string(req.RawSubjectPublicKeyInfo) {
+		t.Errorf("PublicKey = %x, %v; want the CSR's SPKI", spki, err)
+	}
+	if _, err := ks.PublicKey(ctx, plugin.PublicKeyRequest{KeyRef: "nope"}); !errors.Is(err, plugin.ErrNotFound) {
+		t.Errorf("PublicKey of an unknown key: %v, want ErrNotFound", err)
+	}
+
 	ref, err := ks.Complete(ctx, plugin.CompleteRequest{KeyRef: csr.KeyRef, CertPEM: "leaf", ChainPEM: "chain"})
 	if err != nil || ref != csr.KeyRef {
 		t.Fatalf("Complete = %q, %v", ref, err)
@@ -132,9 +144,12 @@ func TestKeyStoreErrorsCarryPluginMessage(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	want := `key store create CSR: unsupported key type "rsa-2048"`
+	want := `key store create CSR: permanent failure: unsupported key type "rsa-2048"`
 	if err.Error() != want {
 		t.Errorf("error = %q, want %q", err, want)
+	}
+	if !plugin.IsPermanent(err) {
+		t.Error("error kind lost on the wire")
 	}
 }
 
@@ -150,13 +165,17 @@ func TestTargetRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected capabilities: %+v", caps)
 	}
 
-	problems, err := tg.Validate(ctx, json.RawMessage(`{}`))
+	problems, err := tg.Validate(ctx, plugin.TargetValidateRequest{Config: json.RawMessage(`{}`)})
 	if err != nil || len(problems) != 1 || problems[0] != "name is required" {
 		t.Fatalf("Validate = %v, %v", problems, err)
 	}
 	cfg := json.RawMessage(`{"name":"x"}`)
-	if problems, err := tg.Validate(ctx, cfg); err != nil || len(problems) != 0 {
+	if problems, err := tg.Validate(ctx, plugin.TargetValidateRequest{Config: cfg}); err != nil || len(problems) != 0 {
 		t.Fatalf("Validate = %v, %v", problems, err)
+	}
+	current := func() string {
+		s, _ := tg.Current(ctx, plugin.CurrentRequest{Config: cfg})
+		return s
 	}
 
 	stage := func(serial string) string {
@@ -173,25 +192,42 @@ func TestTargetRoundTrip(t *testing.T) {
 		return ref
 	}
 
-	if _, err := tg.Activate(ctx, cfg, stage("01")); err != nil {
+	activate := func(ref string) (string, error) {
+		return tg.Activate(ctx, plugin.ActivateRequest{Config: cfg, StagedRef: ref, CertificateID: "1", Label: "l"})
+	}
+	if _, err := activate(stage("01")); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
-	prev, err := tg.Activate(ctx, cfg, stage("02"))
+	prev, err := activate(stage("02"))
 	if err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
-	if s, _ := tg.Current(ctx, cfg); s != "02" {
+	if s := current(); s != "02" {
 		t.Fatalf("Current = %q, want 02", s)
 	}
-	if err := tg.Rollback(ctx, cfg, prev); err != nil {
+	if err := tg.Rollback(ctx, plugin.RollbackRequest{Config: cfg, PreviousRef: prev}); err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
-	if s, _ := tg.Current(ctx, cfg); s != "01" {
+	if s := current(); s != "01" {
 		t.Fatalf("Current after rollback = %q, want 01", s)
+	}
+	if err := tg.Rollback(ctx, plugin.RollbackRequest{Config: cfg, PreviousRef: "nope"}); !errors.Is(err, plugin.ErrNotFound) {
+		t.Errorf("Rollback of unknown ref: %v, want ErrNotFound", err)
+	}
+
+	staged := stage("03")
+	if err := tg.Discard(ctx, plugin.DiscardRequest{Config: cfg, StagedRef: staged}); err != nil {
+		t.Fatalf("Discard: %v", err)
+	}
+	if err := tg.Discard(ctx, plugin.DiscardRequest{Config: cfg, StagedRef: staged}); err != nil {
+		t.Fatalf("second Discard: %v", err)
+	}
+	if _, err := activate(staged); !errors.Is(err, plugin.ErrNotFound) {
+		t.Errorf("Activate of a discarded ref: %v", err)
 	}
 
 	_, err = tg.Stage(ctx, plugin.StageRequest{Key: plugin.KeyMaterial{Format: plugin.KeyFormatVaultRef, Ref: "v"}})
-	if err == nil || err.Error() != "target stage: PEM key material required" {
+	if err == nil || err.Error() != "target stage: permanent failure: PEM key material required" {
 		t.Errorf("Stage error = %v", err)
 	}
 }
@@ -231,13 +267,86 @@ func (f fixedTarget) Describe(context.Context) (plugin.TargetCapabilities, error
 
 func TestKeyMaterialIsNotPrinted(t *testing.T) {
 	k := plugin.KeyMaterial{Format: plugin.KeyFormatPEM, Data: []byte("-----BEGIN PRIVATE KEY-----secret"), Password: "hunter2"}
+	req := plugin.StageRequest{CertificateID: "1", Label: "web", Serial: "0a", Key: k}
 	var logged strings.Builder
-	slog.New(slog.NewTextHandler(&logged, nil)).Info("x", "key", k)
-	for _, s := range []string{fmt.Sprint(k), fmt.Sprintf("%v %+v %#v", k, k, k), logged.String()} {
+	l := slog.New(slog.NewTextHandler(&logged, nil))
+	l.Info("x", "key", k, "req", req)
+	slog.New(slog.NewJSONHandler(&logged, nil)).Info("x", "key", k, "req", req)
+	kj, _ := json.Marshal(k)
+	rj, _ := json.Marshal(req)
+	for _, s := range []string{
+		fmt.Sprint(k), fmt.Sprintf("%v %+v %#v", k, k, k), fmt.Sprintf("%v %+v", req, req),
+		logged.String(), string(kj), string(rj),
+	} {
 		if strings.Contains(s, "secret") || strings.Contains(s, "hunter2") {
 			t.Errorf("key material leaked: %s", s)
 		}
 	}
+	if !strings.Contains(logged.String(), "req.serial=0a") {
+		t.Errorf("StageRequest log value missing fields: %s", logged.String())
+	}
+}
+
+func TestErrorKindsCrossTheWire(t *testing.T) {
+	kinds := []error{plugin.ErrPermanent, plugin.ErrInvalid, plugin.ErrNotFound, plugin.ErrUnavailable, plugin.ErrUnsupported}
+	for _, kind := range kinds {
+		client, _ := goplugin.TestPluginGRPCConn(t, false, plugin.ServeOpts{Target: failingTarget{err: fmt.Errorf("%w: details", kind)}}.PluginSet())
+		tg, _ := plugin.DispenseTarget(client)
+		err := tg.Rollback(context.Background(), plugin.RollbackRequest{PreviousRef: "x"})
+		if !errors.Is(err, kind) {
+			t.Errorf("%v: got %v", kind, err)
+		}
+		if !strings.Contains(err.Error(), "details") {
+			t.Errorf("message lost: %v", err)
+		}
+		_ = client.Close()
+	}
+	// Plain errors are transient, not permanent.
+	client, _ := goplugin.TestPluginGRPCConn(t, false, plugin.ServeOpts{Target: failingTarget{err: errors.New("boom")}}.PluginSet())
+	defer func() { _ = client.Close() }()
+	tg, _ := plugin.DispenseTarget(client)
+	err := tg.Rollback(context.Background(), plugin.RollbackRequest{})
+	if err == nil || plugin.IsPermanent(err) || plugin.IsUnsupported(err) || err.Error() != "target rollback: boom" {
+		t.Errorf("plain error = %v", err)
+	}
+}
+
+type failingTarget struct {
+	plugin.UnimplementedTarget
+	err error
+}
+
+func (f failingTarget) Rollback(context.Context, plugin.RollbackRequest) error { return f.err }
+
+func TestUnimplementedEmbedding(t *testing.T) {
+	// A target that implements only Describe still serves every call; the
+	// rest report ErrUnsupported on the host side.
+	client, _ := goplugin.TestPluginGRPCConn(t, false, plugin.ServeOpts{Target: describeOnly{}, KeyStore: plugin.UnimplementedKeyStore{}}.PluginSet())
+	defer func() { _ = client.Close() }()
+	tg, _ := plugin.DispenseTarget(client)
+	ks, _ := plugin.DispenseKeyStore(client)
+	ctx := context.Background()
+	if _, err := tg.Describe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tg.Discard(ctx, plugin.DiscardRequest{}); !plugin.IsUnsupported(err) {
+		t.Errorf("Discard: %v", err)
+	}
+	if _, err := tg.Current(ctx, plugin.CurrentRequest{}); !plugin.IsUnsupported(err) {
+		t.Errorf("Current: %v", err)
+	}
+	if _, err := ks.Validate(ctx, plugin.KeyStoreValidateRequest{}); !plugin.IsUnsupported(err) {
+		t.Errorf("key store Validate: %v", err)
+	}
+	if _, err := ks.PublicKey(ctx, plugin.PublicKeyRequest{}); !plugin.IsUnsupported(err) {
+		t.Errorf("PublicKey: %v", err)
+	}
+}
+
+type describeOnly struct{ plugin.UnimplementedTarget }
+
+func (describeOnly) Describe(context.Context) (plugin.TargetCapabilities, error) {
+	return plugin.TargetCapabilities{Accepts: []plugin.KeyFormat{plugin.KeyFormatPEM}}, nil
 }
 
 func TestSubprocessPlugin(t *testing.T) {
@@ -288,7 +397,7 @@ func TestSubprocessPlugin(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = ks.Describe(ctx)
-	if err == nil || !strings.Contains(err.Error(), "plugin does not implement this call") {
+	if err == nil || !strings.Contains(err.Error(), "plugin does not implement this call") || !plugin.IsUnsupported(err) {
 		t.Errorf("Describe on missing service: %v", err)
 	}
 }

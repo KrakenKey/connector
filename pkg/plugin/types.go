@@ -96,8 +96,9 @@ type TargetCapabilities struct {
 }
 
 // KeyMaterial is a private key, or a reference to one, in a given format.
-// Its String and LogValue methods never include Data or Password, so it is
-// safe to pass to a logger by mistake.
+// Its String, GoString, LogValue and MarshalJSON methods never include Data
+// or Password, so passing it to a logger or encoder by mistake does not leak
+// the key. Never log the protobuf messages that carry it either.
 type KeyMaterial struct {
 	Format   KeyFormat
 	Data     []byte // PEM or PFX bytes; empty for KeyFormatVaultRef
@@ -118,9 +119,23 @@ func (k KeyMaterial) LogValue() slog.Value {
 	return slog.GroupValue(slog.String("format", string(k.Format)), slog.String("ref", k.Ref))
 }
 
+// MarshalJSON writes only the format and reference.
+func (k KeyMaterial) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Format KeyFormat `json:"format"`
+		Ref    string    `json:"ref,omitempty"`
+	}{k.Format, k.Ref})
+}
+
+// KeyStoreValidateRequest asks a key store to check its settings.
+type KeyStoreValidateRequest struct {
+	// Config is the key store's settings from the connector config, as JSON.
+	Config        json.RawMessage
+	CertificateID string
+}
+
 // CSRRequest asks a key store for a new key and CSR.
 type CSRRequest struct {
-	// Config is the key store's settings from the connector config, as JSON.
 	Config json.RawMessage
 	// CertificateID is the KrakenKey certificate id, for naming keys.
 	CertificateID string
@@ -134,6 +149,12 @@ type CSR struct {
 	// PEM is the PKCS#10 certificate request.
 	PEM string
 	// KeyRef is an opaque reference to the new key.
+	KeyRef string
+}
+
+// PublicKeyRequest asks for the public half of a key.
+type PublicKeyRequest struct {
+	Config json.RawMessage
 	KeyRef string
 }
 
@@ -159,19 +180,44 @@ type ReleaseRequest struct {
 }
 
 // KeyStore owns private keys. Implementations must be safe for concurrent
-// use.
+// use. Embed UnimplementedKeyStore to get "not supported" answers for calls
+// you do not implement. Return errors wrapping the sentinels in errors.go
+// (ErrPermanent, ErrNotFound, ...) so the core can tell what to do next.
 type KeyStore interface {
 	// Describe reports the key store's capabilities.
 	Describe(ctx context.Context) (KeyStoreCapabilities, error)
+	// Validate checks the settings without changing anything and returns
+	// the problems found. Optional.
+	Validate(ctx context.Context, req KeyStoreValidateRequest) ([]string, error)
 	// CreateCSR creates a new key and a CSR signed by it.
 	CreateCSR(ctx context.Context, req CSRRequest) (CSR, error)
+	// PublicKey returns the key's DER encoded SubjectPublicKeyInfo, or an
+	// error wrapping ErrNotFound if the key is gone. Optional.
+	PublicKey(ctx context.Context, req PublicKeyRequest) ([]byte, error)
 	// Complete attaches the issued certificate to the key and returns the
 	// key reference to use from now on (often unchanged).
 	Complete(ctx context.Context, req CompleteRequest) (string, error)
-	// Export returns key material in the requested format.
+	// Export returns key material in the requested format. PEM and PFX need
+	// an exportable key store; otherwise return an error wrapping
+	// ErrPermanent.
 	Export(ctx context.Context, req ExportRequest) (KeyMaterial, error)
 	// Release tells the key store no target uses the key any more.
+	// Releasing an unknown key is not an error.
 	Release(ctx context.Context, req ReleaseRequest) error
+}
+
+// TargetValidateRequest asks a target to check its settings.
+type TargetValidateRequest struct {
+	Config        json.RawMessage
+	CertificateID string
+	Label         string
+}
+
+// CurrentRequest asks a target what it serves now.
+type CurrentRequest struct {
+	Config        json.RawMessage
+	CertificateID string
+	Label         string
 }
 
 // StageRequest carries an issued certificate to a target.
@@ -188,25 +234,66 @@ type StageRequest struct {
 	Serial string
 }
 
+// LogValue implements slog.LogValuer without the certificate or key.
+func (r StageRequest) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("certificate_id", r.CertificateID),
+		slog.String("label", r.Label),
+		slog.String("serial", r.Serial),
+		slog.String("key_format", string(r.Key.Format)),
+	)
+}
+
+// ActivateRequest makes a staged certificate live.
+type ActivateRequest struct {
+	Config        json.RawMessage
+	StagedRef     string
+	CertificateID string
+	Label         string
+}
+
+// RollbackRequest restores what was live before an Activate.
+type RollbackRequest struct {
+	Config        json.RawMessage
+	PreviousRef   string
+	CertificateID string
+	Label         string
+}
+
+// DiscardRequest drops staged material that will not be activated.
+type DiscardRequest struct {
+	Config        json.RawMessage
+	StagedRef     string
+	CertificateID string
+	Label         string
+}
+
 // Target installs certificates. Implementations must be safe for concurrent
-// use.
+// use. Embed UnimplementedTarget to get "not supported" answers for calls
+// you do not implement. The proto file documents each call's contract.
 type Target interface {
 	// Describe reports the target's capabilities.
 	Describe(ctx context.Context) (TargetCapabilities, error)
 	// Validate checks config without changing anything and returns the
 	// problems found. A nil or empty slice means the config is usable.
-	Validate(ctx context.Context, config json.RawMessage) ([]string, error)
+	Validate(ctx context.Context, req TargetValidateRequest) ([]string, error)
 	// Current returns the serial (lowercase hex) of the certificate the
-	// target holds now, or "" when unknown.
-	Current(ctx context.Context, config json.RawMessage) (string, error)
+	// target is set up to serve now, as the target records it, or "" when
+	// it cannot tell. Optional.
+	Current(ctx context.Context, req CurrentRequest) (string, error)
 	// Stage prepares a certificate without making it live and returns an
-	// opaque reference for Activate.
+	// opaque reference for Activate or Discard.
 	Stage(ctx context.Context, req StageRequest) (string, error)
 	// Activate makes a staged certificate live and returns an opaque
-	// reference to what was live before, for Rollback.
-	Activate(ctx context.Context, config json.RawMessage, stagedRef string) (string, error)
-	// Rollback restores what was live before Activate.
-	Rollback(ctx context.Context, config json.RawMessage, previousRef string) error
+	// reference to what was live before, for Rollback. On error it must
+	// leave the previous state in place.
+	Activate(ctx context.Context, req ActivateRequest) (string, error)
+	// Rollback restores exactly what was live before the Activate that
+	// returned the previous ref, removing what it installed if nothing was
+	// there before. If it cannot, return an error wrapping ErrPermanent.
+	Rollback(ctx context.Context, req RollbackRequest) error
+	// Discard deletes staged material. It must be idempotent. Optional.
+	Discard(ctx context.Context, req DiscardRequest) error
 }
 
 func joinKeyTypes(ks []KeyType) string {
