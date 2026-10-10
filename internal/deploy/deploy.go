@@ -10,6 +10,9 @@
 //  2. Due check: renew when renewAfter has passed (or, if the API does not
 //     send it, two thirds into the certificate's lifetime), when forced, or
 //     when the connector does not hold the key for the current certificate.
+//     A certificate KrakenKey created with names only (awaiting_csr) is
+//     always due: the connector makes its first CSR, after checking that
+//     the configured names are the ones KrakenKey is waiting for.
 //  3. Ask the key store for a new key and CSR, record it as pending, renew
 //     with it, and wait for issuance.
 //  4. Check that the issued leaf carries the key store's public key and
@@ -251,9 +254,21 @@ func (e *Engine) Process(ctx context.Context, job Job, opts Options) error {
 		return fmt.Errorf("certificate %d is revoked; issue a new one in KrakenKey and update the config", id)
 	}
 
+	awaiting := cert.Status == api.StatusAwaitingCSR
+	if awaiting {
+		if err := checkRequestedNames(cert, job.Cert.Names); err != nil {
+			a := r.entry(audit.StepCheck, audit.ResultFailed)
+			a.Error = err.Error()
+			_ = e.audit(a)
+			return fmt.Errorf("certificate %d: %w", id, err)
+		}
+	}
+
 	var leaf *x509.Certificate
 	leafSerial, leafSPKI := "", ""
-	if cert.CrtPem != "" {
+	// An awaiting_csr certificate has no leaf yet; nothing to adopt or
+	// compare.
+	if cert.CrtPem != "" && !awaiting {
 		if l, err := certutil.ParseLeaf(cert.CrtPem); err == nil {
 			leaf = l
 			leafSerial = certutil.SerialHex(l.SerialNumber)
@@ -271,6 +286,8 @@ func (e *Engine) Process(ctx context.Context, job Job, opts Options) error {
 	renewAt, source, known := cert.RenewAt()
 	reason := ""
 	switch {
+	case awaiting:
+		reason = "first issuance: KrakenKey is waiting for a CSR from this connector"
 	case opts.Force:
 		reason = "forced with --force"
 	case st.KeyRef == "":
@@ -284,7 +301,7 @@ func (e *Engine) Process(ctx context.Context, job Job, opts Options) error {
 	}
 
 	if reason != "" {
-		if opts.Force {
+		if opts.Force && !awaiting {
 			r.log.Warn("renewing because --force was given, although the certificate may not be due",
 				"renew_after", renewAt, "renew_after_source", source)
 		}
@@ -303,6 +320,35 @@ func (e *Engine) Process(ctx context.Context, job Job, opts Options) error {
 	r.sweepOrphans(ctx)
 	return err
 }
+
+// checkRequestedNames compares the configured names with the names an
+// awaiting_csr certificate was created for. KrakenKey refuses a CSR for
+// other names, so asking would only waste a key.
+func checkRequestedNames(cert *api.Cert, configured []string) error {
+	if len(cert.RequestedNames) == 0 {
+		return errors.New("KrakenKey is waiting for a CSR but did not say for which names (no requestedNames)")
+	}
+	if !certutil.SameNames(cert.RequestedNames, configured) {
+		return &RequestedNamesError{Configured: certutil.NormalizeNames(configured), Requested: certutil.NormalizeNames(cert.RequestedNames)}
+	}
+	return nil
+}
+
+// RequestedNamesError means the configured names differ from the names an
+// awaiting_csr certificate was created for, so the connector will not
+// issue it. It is a failure on the connector's side (its config): status
+// reports show it as a failed deployment.
+type RequestedNamesError struct {
+	Configured, Requested []string
+}
+
+func (e *RequestedNamesError) Error() string {
+	return fmt.Sprintf("config names %v differ from the names KrakenKey is waiting for %v; change the config to match, or create the certificate again with the right names",
+		e.Configured, e.Requested)
+}
+
+// BlocksDeployment marks the error as a failure on the connector's side.
+func (e *RequestedNamesError) BlocksDeployment() bool { return true }
 
 // adopt takes KrakenKey's current certificate when it carries a key the
 // connector holds.

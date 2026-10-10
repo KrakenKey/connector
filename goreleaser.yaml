@@ -1,0 +1,96 @@
+version: 2
+
+project_name: krakenkey-connector
+
+builds:
+  - id: connector
+    main: ./cmd/krakenkey-connector
+    binary: krakenkey-connector
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    # No Windows builds yet: the connector's file permission, plugin
+    # ownership and key mode checks are Unix only.
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: connector
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: checksums.txt
+
+# Keyless signing with Sigstore: the release workflow's GitHub OIDC identity
+# signs checksums.txt (which covers every archive) and the container images.
+# No signing key to store or rotate. Verification steps are in the README.
+signs:
+  - id: checksums
+    cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - --bundle=${signature}
+      - ${artifact}
+      - --yes
+    output: true
+
+dockers_v2:
+  - id: connector
+    ids: [connector]
+    images:
+      - ghcr.io/krakenkey/connector
+    dockerfile: Dockerfile.goreleaser
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    tags:
+      - "v{{ .Version }}"
+      # Prereleases (vX.Y.Z-rc.1) get only their own tag.
+      - "{{ if not .Prerelease }}{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if and (not .IsSnapshot) (not .Prerelease) }}latest{{ end }}"
+    labels:
+      org.opencontainers.image.title: krakenkey-connector
+      org.opencontainers.image.description: Renews KrakenKey certificates and deploys them to your systems
+      org.opencontainers.image.url: https://krakenkey.io
+      org.opencontainers.image.source: https://github.com/KrakenKey/connector
+      org.opencontainers.image.documentation: https://github.com/KrakenKey/connector#readme
+      org.opencontainers.image.licenses: Apache-2.0
+      org.opencontainers.image.vendor: KrakenKey
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .CommitDate }}"
+
+docker_signs:
+  - cmd: cosign
+    args:
+      - sign
+      - ${artifact}@${digest}
+      - --yes
+    output: true
+
+release:
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^ci:"
+      - "^test:"

@@ -85,6 +85,7 @@ func (f *fakeKrakenKey) handle(w http.ResponseWriter, r *http.Request) {
 		leaf, leafPEM := f.ca.Issue(f.t, req.PublicKey, certutil.CSRNames(req), 0)
 		later := time.Now().Add(60 * 24 * time.Hour)
 		cert.CrtPem, cert.ExpiresAt, cert.RenewAfter = leafPEM, &leaf.NotAfter, &later
+		cert.Status, cert.ChainPem = api.StatusIssued, f.ca.IntermediatePEM
 		_ = json.NewEncoder(w).Encode(api.CertResponse{ID: id, Status: api.StatusRenewing})
 	default:
 		w.WriteHeader(http.StatusNotFound)
@@ -315,5 +316,85 @@ certificates:
 	}
 	if n != 4 || !strings.Contains(report, "4 problem(s), 3 warning(s)") {
 		t.Errorf("problems = %d\n%s", n, report)
+	}
+}
+
+func TestValidateAwaitingCSR(t *testing.T) {
+	ca := testca.New(t)
+	kk, apiSrv := newFakeKrakenKey(t, ca, 5, 6)
+	tmp := t.TempDir()
+	cfg := writeConfig(t, fmt.Sprintf(`
+krakenkey: { api_url: %q }
+data_dir: %s
+certificates:
+  - id: 5
+    names: [api.example.com]
+    targets: [{ label: hook, plugin: exec, command: [/bin/true], verify: { host: api.example.com } }]
+  - id: 6
+    names: [api.example.com]
+    targets: [{ label: hook, plugin: exec, command: [/bin/true], verify: { host: api.example.com } }]
+`, apiSrv.URL, filepath.Join(tmp, "data")))
+	connectorManaged := "connector"
+	for id, requested := range map[int][]string{5: {"API.example.com"}, 6: {"other.example.com"}} {
+		kk.certs[id] = &api.Cert{ID: id, Status: api.StatusAwaitingCSR, RequestedNames: requested, ManagedBy: &connectorManaged}
+	}
+	host := pluginhost.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer host.Close()
+
+	var out bytes.Buffer
+	n := Validate(context.Background(), cfg, host, api.NewClient(cfg.KrakenKey.APIURL, "kk_test", "test"), &out)
+	report := out.String()
+	if c := strings.Count(report, "KrakenKey: status awaiting_csr: waiting for this connector to issue it"); c != 2 {
+		t.Errorf("awaiting_csr shown %d times:\n%s", c, report)
+	}
+	if !strings.Contains(report, "PROBLEM: config names [api.example.com] differ from the names KrakenKey is waiting for [other.example.com]") || n != 1 {
+		t.Errorf("problems = %d\n%s", n, report)
+	}
+	if strings.Contains(report, "renew after") || strings.Contains(report, "renewal time unknown") {
+		t.Errorf("renewal time shown for a certificate without a leaf:\n%s", report)
+	}
+}
+
+func TestRunOnceIssuesAwaitingCSR(t *testing.T) {
+	ca := testca.New(t)
+	kk, apiSrv := newFakeKrakenKey(t, ca, 9)
+	created := time.Now().Add(-time.Minute)
+	kk.certs[9] = &api.Cert{ID: 9, Status: api.StatusAwaitingCSR, RequestedNames: []string{"api.example.com"}, RenewAfter: &created}
+	tmp := t.TempDir()
+	hookLog := filepath.Join(tmp, "hook.log")
+	cfg := writeConfig(t, fmt.Sprintf(`
+krakenkey: { api_url: %q }
+data_dir: %s
+certificates:
+  - id: 9
+    names: [api.example.com]
+    targets:
+      - label: hook
+        plugin: exec
+        command: [sh, -c, 'echo "$KK_ACTION $KK_CERT_SERIAL" >> %s']
+`, apiSrv.URL, filepath.Join(tmp, "data"), hookLog))
+	auditLog, err := audit.Open(filepath.Join(tmp, "data", "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = auditLog.Close() }()
+	state, _ := deploy.OpenStateStore(cfg.DataDir)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	host := pluginhost.New(cfg, log)
+	defer host.Close()
+	client := api.NewClient(cfg.KrakenKey.APIURL, "kk_test", "test")
+	client.PollInterval = time.Millisecond
+	c := &Connector{Config: cfg, Resolver: host, Log: log,
+		Engine: &deploy.Engine{API: client, Verifier: verify.New(), Audit: auditLog, State: state, Log: log}}
+	if err := c.RunOnce(context.Background(), RunOptions{}); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	leaf, err := certutil.ParseLeaf(kk.certs[9].CrtPem)
+	if err != nil {
+		t.Fatalf("not issued: %v", err)
+	}
+	hook, _ := os.ReadFile(hookLog)
+	if strings.TrimSpace(string(hook)) != "deploy "+certutil.SerialHex(leaf.SerialNumber) {
+		t.Errorf("hook ran %q", hook)
 	}
 }
