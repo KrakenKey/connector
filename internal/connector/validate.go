@@ -65,12 +65,20 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 					rollback = "propagates on its own schedule, not rolled back"
 				case !t.Caps.SupportsRollback:
 					rollback = "no rollback"
+				case t.RollbackUnavailable != "":
+					rollback = "rollback unavailable"
+				case t.Caps.RollbackNeedsMaterial:
+					rollback = "rollback supported (with the previous certificate and key from the connector)"
 				}
 				fmt.Fprintf(w, ", %s", rollback)
 			}
 			fmt.Fprintln(w)
 			for _, p := range t.Problems {
 				bad("%s", p)
+			}
+			for _, warn := range t.Warnings {
+				warnings++
+				fmt.Fprintf(w, "    WARNING: %s\n", warn)
 			}
 			tc := cert.Targets[i]
 			if t.Plugin != "" && t.Caps != nil {

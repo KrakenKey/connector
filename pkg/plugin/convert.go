@@ -87,6 +87,9 @@ func goFormats(fs []pb.KeyFormat) []KeyFormat {
 }
 
 func pbKeyMaterial(k KeyMaterial) *pb.KeyMaterial {
+	if k.Format == "" && len(k.Data) == 0 && k.Ref == "" && k.Password == "" {
+		return nil
+	}
 	return &pb.KeyMaterial{Format: pbFormat(k.Format), Data: k.Data, Ref: k.Ref, Password: k.Password}
 }
 
@@ -121,16 +124,18 @@ func pbTargetCaps(c TargetCapabilities) *pb.TargetCapabilities {
 		KeyTypes:                   pbKeyTypes(c.KeyTypes),
 		DefaultVerifyWindowSeconds: int64(c.DefaultVerifyWindow / time.Second),
 		PropagatesAsync:            c.PropagatesAsync,
+		RollbackNeedsMaterial:      c.RollbackNeedsMaterial,
 	}
 }
 
 func goTargetCaps(c *pb.TargetCapabilities) TargetCapabilities {
 	return TargetCapabilities{
-		Accepts:             goFormats(c.GetAccepts()),
-		NeedsExportableKey:  c.GetNeedsExportableKey(),
-		SupportsRollback:    c.GetSupportsRollback(),
-		KeyTypes:            goKeyTypes(c.GetKeyTypes()),
-		DefaultVerifyWindow: time.Duration(c.GetDefaultVerifyWindowSeconds()) * time.Second,
-		PropagatesAsync:     c.GetPropagatesAsync(),
+		Accepts:               goFormats(c.GetAccepts()),
+		NeedsExportableKey:    c.GetNeedsExportableKey(),
+		SupportsRollback:      c.GetSupportsRollback(),
+		KeyTypes:              goKeyTypes(c.GetKeyTypes()),
+		DefaultVerifyWindow:   time.Duration(c.GetDefaultVerifyWindowSeconds()) * time.Second,
+		PropagatesAsync:       c.GetPropagatesAsync(),
+		RollbackNeedsMaterial: c.GetRollbackNeedsMaterial(),
 	}
 }

@@ -12,8 +12,9 @@ type keyStoreGRPCServer struct {
 	impl KeyStore
 }
 
-func (s *keyStoreGRPCServer) Describe(ctx context.Context, _ *pb.KeyStoreServiceDescribeRequest) (*pb.KeyStoreServiceDescribeResponse, error) {
-	caps, err := s.impl.Describe(ctx)
+func (s *keyStoreGRPCServer) Describe(ctx context.Context, req *pb.KeyStoreServiceDescribeRequest) (*pb.KeyStoreServiceDescribeResponse, error) {
+	ctx = WithInstallID(ctx, req.GetInstallId())
+	caps, err := s.impl.Describe(WithCoreFeatures(ctx, req.GetCoreFeatures()...))
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -21,14 +22,20 @@ func (s *keyStoreGRPCServer) Describe(ctx context.Context, _ *pb.KeyStoreService
 }
 
 func (s *keyStoreGRPCServer) Validate(ctx context.Context, req *pb.KeyStoreServiceValidateRequest) (*pb.KeyStoreServiceValidateResponse, error) {
-	problems, err := s.impl.Validate(ctx, KeyStoreValidateRequest{Config: req.GetConfigJson(), CertificateID: req.GetCertificateId()})
+	ctx = WithInstallID(ctx, req.GetInstallId())
+	v, err := ValidateKeyStore(ctx, s.impl, KeyStoreValidateRequest{Config: req.GetConfigJson(), CertificateID: req.GetCertificateId()})
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	return &pb.KeyStoreServiceValidateResponse{Problems: problems}, nil
+	resp := &pb.KeyStoreServiceValidateResponse{Problems: v.Problems}
+	if v.Capabilities != nil {
+		resp.Capabilities = pbKeyStoreCaps(*v.Capabilities)
+	}
+	return resp, nil
 }
 
 func (s *keyStoreGRPCServer) CreateCSR(ctx context.Context, req *pb.CreateCSRRequest) (*pb.CreateCSRResponse, error) {
+	ctx = WithInstallID(ctx, req.GetInstallId())
 	csr, err := s.impl.CreateCSR(ctx, CSRRequest{
 		Config:        req.GetConfigJson(),
 		CertificateID: req.GetCertificateId(),
@@ -50,6 +57,7 @@ func (s *keyStoreGRPCServer) PublicKey(ctx context.Context, req *pb.PublicKeyReq
 }
 
 func (s *keyStoreGRPCServer) Complete(ctx context.Context, req *pb.CompleteRequest) (*pb.CompleteResponse, error) {
+	ctx = WithInstallID(ctx, req.GetInstallId())
 	ref, err := s.impl.Complete(ctx, CompleteRequest{
 		Config:   req.GetConfigJson(),
 		KeyRef:   req.GetKeyRef(),
@@ -75,6 +83,7 @@ func (s *keyStoreGRPCServer) Export(ctx context.Context, req *pb.ExportRequest) 
 }
 
 func (s *keyStoreGRPCServer) Release(ctx context.Context, req *pb.ReleaseRequest) (*pb.ReleaseResponse, error) {
+	ctx = WithInstallID(ctx, req.GetInstallId())
 	if err := s.impl.Release(ctx, ReleaseRequest{Config: req.GetConfigJson(), KeyRef: req.GetKeyRef()}); err != nil {
 		return nil, toStatus(err)
 	}
@@ -89,7 +98,7 @@ type keyStoreGRPCClient struct {
 var _ KeyStore = (*keyStoreGRPCClient)(nil)
 
 func (c *keyStoreGRPCClient) Describe(ctx context.Context) (KeyStoreCapabilities, error) {
-	resp, err := c.client.Describe(ctx, &pb.KeyStoreServiceDescribeRequest{})
+	resp, err := c.client.Describe(ctx, &pb.KeyStoreServiceDescribeRequest{InstallId: InstallIDFrom(ctx), CoreFeatures: CoreFeatures})
 	if err != nil {
 		return KeyStoreCapabilities{}, fromStatus("key store describe", err)
 	}
@@ -97,15 +106,27 @@ func (c *keyStoreGRPCClient) Describe(ctx context.Context) (KeyStoreCapabilities
 }
 
 func (c *keyStoreGRPCClient) Validate(ctx context.Context, req KeyStoreValidateRequest) ([]string, error) {
-	resp, err := c.client.Validate(ctx, &pb.KeyStoreServiceValidateRequest{ConfigJson: req.Config, CertificateId: req.CertificateID})
+	v, err := c.ValidateCapabilities(ctx, req)
+	return v.Problems, err
+}
+
+// ValidateCapabilities returns the problems and, if the key store sent
+// them, the capabilities for these settings.
+func (c *keyStoreGRPCClient) ValidateCapabilities(ctx context.Context, req KeyStoreValidateRequest) (KeyStoreValidation, error) {
+	resp, err := c.client.Validate(ctx, &pb.KeyStoreServiceValidateRequest{InstallId: InstallIDFrom(ctx), ConfigJson: req.Config, CertificateId: req.CertificateID})
 	if err != nil {
-		return nil, fromStatus("key store validate", err)
+		return KeyStoreValidation{}, fromStatus("key store validate", err)
 	}
-	return resp.GetProblems(), nil
+	v := KeyStoreValidation{Problems: resp.GetProblems()}
+	if resp.Capabilities != nil {
+		caps := goKeyStoreCaps(resp.GetCapabilities())
+		v.Capabilities = &caps
+	}
+	return v, nil
 }
 
 func (c *keyStoreGRPCClient) CreateCSR(ctx context.Context, req CSRRequest) (CSR, error) {
-	resp, err := c.client.CreateCSR(ctx, &pb.CreateCSRRequest{
+	resp, err := c.client.CreateCSR(ctx, &pb.CreateCSRRequest{InstallId: InstallIDFrom(ctx),
 		ConfigJson:    req.Config,
 		CertificateId: req.CertificateID,
 		Names:         req.Names,
@@ -126,7 +147,7 @@ func (c *keyStoreGRPCClient) PublicKey(ctx context.Context, req PublicKeyRequest
 }
 
 func (c *keyStoreGRPCClient) Complete(ctx context.Context, req CompleteRequest) (string, error) {
-	resp, err := c.client.Complete(ctx, &pb.CompleteRequest{
+	resp, err := c.client.Complete(ctx, &pb.CompleteRequest{InstallId: InstallIDFrom(ctx),
 		ConfigJson: req.Config,
 		KeyRef:     req.KeyRef,
 		CertPem:    req.CertPEM,
@@ -151,6 +172,6 @@ func (c *keyStoreGRPCClient) Export(ctx context.Context, req ExportRequest) (Key
 }
 
 func (c *keyStoreGRPCClient) Release(ctx context.Context, req ReleaseRequest) error {
-	_, err := c.client.Release(ctx, &pb.ReleaseRequest{ConfigJson: req.Config, KeyRef: req.KeyRef})
+	_, err := c.client.Release(ctx, &pb.ReleaseRequest{InstallId: InstallIDFrom(ctx), ConfigJson: req.Config, KeyRef: req.KeyRef})
 	return fromStatus("key store release", err)
 }

@@ -236,12 +236,13 @@ func TestCapabilitiesSurviveTheWire(t *testing.T) {
 	// Every field of TargetCapabilities must round-trip; a target that
 	// forgets one would break matching in the core.
 	want := plugin.TargetCapabilities{
-		Accepts:             []plugin.KeyFormat{plugin.KeyFormatVaultRef, plugin.KeyFormatPFX},
-		NeedsExportableKey:  true,
-		SupportsRollback:    true,
-		KeyTypes:            []plugin.KeyType{plugin.KeyTypeRSA3072, plugin.KeyTypeECDSAP384},
-		DefaultVerifyWindow: 45 * time.Minute,
-		PropagatesAsync:     true,
+		Accepts:               []plugin.KeyFormat{plugin.KeyFormatVaultRef, plugin.KeyFormatPFX},
+		NeedsExportableKey:    true,
+		SupportsRollback:      true,
+		KeyTypes:              []plugin.KeyType{plugin.KeyTypeRSA3072, plugin.KeyTypeECDSAP384},
+		DefaultVerifyWindow:   45 * time.Minute,
+		PropagatesAsync:       true,
+		RollbackNeedsMaterial: true,
 	}
 	client, _ := goplugin.TestPluginGRPCConn(t, false, plugin.ServeOpts{Target: fixedTarget{caps: want}}.PluginSet())
 	defer func() { _ = client.Close() }()
@@ -284,6 +285,74 @@ func TestKeyMaterialIsNotPrinted(t *testing.T) {
 	}
 	if !strings.Contains(logged.String(), "req.serial=0a") {
 		t.Errorf("StageRequest log value missing fields: %s", logged.String())
+	}
+
+	rb := plugin.RollbackRequest{
+		CertificateID: "1", Label: "web", PreviousRef: "arn:prev", PreviousSerial: "0b",
+		PreviousCertPEM: "LEAF", PreviousChainPEM: "CHAIN", PreviousFullChainPEM: "LEAF\nCHAIN", PreviousKey: k,
+	}
+	logged.Reset()
+	slog.New(slog.NewTextHandler(&logged, nil)).Info("x", "req", rb)
+	slog.New(slog.NewJSONHandler(&logged, nil)).Info("x", "req", rb)
+	rbj, _ := json.Marshal(rb)
+	for _, s := range []string{
+		fmt.Sprintf("%v %+v %#v %s", rb, rb, rb, rb), logged.String(), string(rbj),
+	} {
+		for _, secret := range []string{"secret", "hunter2", "LEAF", "CHAIN"} {
+			if strings.Contains(s, secret) {
+				t.Errorf("RollbackRequest output contains %q: %s", secret, s)
+			}
+		}
+	}
+	if !strings.Contains(logged.String(), "req.previous_serial=0b") || !strings.Contains(string(rbj), `"previous_ref":"arn:prev"`) {
+		t.Errorf("RollbackRequest output missing fields: %s %s", logged.String(), rbj)
+	}
+}
+
+// rollbackRecorder passes Rollback requests to a channel.
+type rollbackRecorder struct {
+	plugin.UnimplementedTarget
+	got chan plugin.RollbackRequest
+}
+
+func (r rollbackRecorder) Rollback(_ context.Context, req plugin.RollbackRequest) error {
+	r.got <- req
+	return nil
+}
+
+func TestRollbackMaterialCrossesTheWire(t *testing.T) {
+	rt := rollbackRecorder{got: make(chan plugin.RollbackRequest, 2)}
+	client, _ := goplugin.TestPluginGRPCConn(t, false, plugin.ServeOpts{Target: rt}.PluginSet())
+	defer func() { _ = client.Close() }()
+	tg, err := plugin.DispenseTarget(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := selfSigned(t)
+	want := plugin.RollbackRequest{
+		Config: json.RawMessage(`{"a":1}`), PreviousRef: "p1", CertificateID: "7", Label: "acm",
+		PreviousCertPEM: cert, PreviousChainPEM: "chain", PreviousFullChainPEM: cert + "chain",
+		PreviousKey:    plugin.KeyMaterial{Format: plugin.KeyFormatPFX, Data: []byte{0, 1, 2}, Password: "pw"},
+		PreviousSerial: "2a",
+	}
+	if err := tg.Rollback(context.Background(), want); err != nil {
+		t.Fatal(err)
+	}
+	got := <-rt.got
+	if string(got.Config) != string(want.Config) || got.PreviousRef != want.PreviousRef || got.CertificateID != want.CertificateID ||
+		got.Label != want.Label || got.PreviousCertPEM != want.PreviousCertPEM || got.PreviousChainPEM != want.PreviousChainPEM ||
+		got.PreviousFullChainPEM != want.PreviousFullChainPEM || got.PreviousSerial != want.PreviousSerial ||
+		got.PreviousKey.Format != plugin.KeyFormatPFX || string(got.PreviousKey.Data) != "\x00\x01\x02" || got.PreviousKey.Password != "pw" ||
+		!got.HasPreviousMaterial() {
+		t.Errorf("rollback request changed on the wire: %+v", got)
+	}
+
+	// Without material, the target sees empty fields.
+	if err := tg.Rollback(context.Background(), plugin.RollbackRequest{PreviousRef: "p2"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-rt.got; got.HasPreviousMaterial() || got.PreviousKey.Format != "" || got.PreviousSerial != "" {
+		t.Errorf("rollback without material = %+v", got)
 	}
 }
 

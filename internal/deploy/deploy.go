@@ -22,8 +22,12 @@
 //     the previous ref in the state and the audit log before anything else),
 //     run the then command, and verify the endpoint. On failure, roll that
 //     target back, unless the certificate to go back to expires within a
-//     day. Other targets are not affected.
-//  6. When every target serves the new certificate, release the old keys.
+//     day. Other targets are not affected. A target that cannot keep the
+//     previous certificate and key itself (RollbackNeedsMaterial) is handed
+//     them on rollback: the state keeps every earlier certificate a target
+//     still serves, and the key store keeps its key.
+//  6. When every target serves the new certificate, release the old keys
+//     and forget the earlier certificates.
 //
 // Targets that failed keep their old certificate and are retried on later
 // passes, with growing delays.
@@ -126,6 +130,10 @@ type TargetJob struct {
 	Window time.Duration
 	// Roots come from verify.ca_file; nil means the system roots.
 	Roots *x509.CertPool
+	// RollbackUnavailable, when set, says why the previous certificate
+	// and key cannot be handed to a target with RollbackNeedsMaterial (see
+	// plugin.RollbackUnavailable). Rollback is then called without them.
+	RollbackUnavailable string
 }
 
 // Options change one pass.
@@ -276,9 +284,16 @@ func (e *Engine) Process(ctx context.Context, job Job, opts Options) error {
 		}
 	}
 
+	adoptRefused := false
 	if leaf != nil && leafSerial != st.Serial && cert.Status == api.StatusIssued {
 		if err := r.adopt(ctx, cert, leafSPKI); err != nil {
-			return fmt.Errorf("certificate %d: %w", id, err)
+			if !errors.Is(err, errAdoptRefused) {
+				return fmt.Errorf("certificate %d: %w", id, err)
+			}
+			// Retrying the same Complete every pass would not help; get
+			// a certificate for a new key instead.
+			r.log.Warn("the key store refused the certificate KrakenKey renewed with the connector's key; renewing with a new key", "error", err)
+			adoptRefused = true
 		}
 	}
 	held := st.KeyRef != "" && leaf != nil && leafSerial == st.Serial && leafSPKI == st.KeySPKI
@@ -288,6 +303,8 @@ func (e *Engine) Process(ctx context.Context, job Job, opts Options) error {
 	switch {
 	case awaiting:
 		reason = "first issuance: KrakenKey is waiting for a CSR from this connector"
+	case adoptRefused:
+		reason = "the key store refused the certificate KrakenKey renewed with the connector's key"
 	case opts.Force:
 		reason = "forced with --force"
 	case st.KeyRef == "":
@@ -350,17 +367,41 @@ func (e *RequestedNamesError) Error() string {
 // BlocksDeployment marks the error as a failure on the connector's side.
 func (e *RequestedNamesError) BlocksDeployment() bool { return true }
 
+// errCompleteRefused marks a permanent Complete failure, and
+// errAdoptRefused one for a certificate KrakenKey renewed on its own with
+// the connector's current key. The pass then renews with a new key instead
+// of retrying the same Complete on every pass.
+var (
+	errCompleteRefused = errors.New("key store refused the issued certificate")
+	errAdoptRefused    = errors.New("cannot adopt KrakenKey's renewal")
+)
+
 // adopt takes KrakenKey's current certificate when it carries a key the
 // connector holds.
 func (r *run) adopt(ctx context.Context, cert *api.Cert, leafSPKI string) error {
 	st := r.st
 	switch {
-	case st.KeyRef != "" && leafSPKI == st.KeySPKI:
-		r.log.Info("KrakenKey renewed the certificate with the connector's current key; deploying it")
-		return r.finishIssued(ctx, cert, st.KeyRef, st.KeySPKI, false, "renewed by KrakenKey with the connector's key")
 	case st.Pending != nil && leafSPKI == st.Pending.SPKI:
 		r.log.Info("a renewal from an earlier pass has completed; deploying it", "key_ref", st.Pending.KeyRef)
 		return r.finishIssued(ctx, cert, st.Pending.KeyRef, st.Pending.SPKI, true, "renewal from an earlier pass completed")
+	case st.KeyRef != "" && leafSPKI == st.KeySPKI:
+		if st.Pending != nil {
+			// KrakenKey's current certificate is not the one the pending
+			// key was for, so that renewal will not produce it. Resolve
+			// it first: some key stores refuse to complete another
+			// certificate while a request of their own is open.
+			r.releaseKey(ctx, st.Pending.KeyRef, "pending key from a renewal superseded by KrakenKey's renewal with the current key")
+			st.Pending = nil
+			if err := r.save(); err != nil {
+				return err
+			}
+		}
+		r.log.Info("KrakenKey renewed the certificate with the connector's current key; deploying it")
+		err := r.finishIssued(ctx, cert, st.KeyRef, st.KeySPKI, false, "renewed by KrakenKey with the connector's key")
+		if errors.Is(err, errCompleteRefused) {
+			return fmt.Errorf("%w: %w", errAdoptRefused, err)
+		}
+		return err
 	}
 	return nil
 }
@@ -499,9 +540,19 @@ func (r *run) finishIssued(ctx context.Context, issued *api.Cert, keyRef, spki s
 		a := r.entry(audit.StepComplete, audit.ResultFailed)
 		a.Error = err.Error()
 		_ = r.e.audit(a)
+		if plugin.IsPermanent(err) {
+			err = fmt.Errorf("%w: %w", errCompleteRefused, err)
+		}
 		return &BlockedError{Err: err}
 	}
 
+	if st.Serial != "" && st.Serial != newSerial && st.CertPEM != "" {
+		// Targets still serve the outgoing certificate until they are
+		// deployed; keep it for targets that need it to roll back.
+		prev := st.current()
+		st.PreviousCerts = slices.DeleteFunc(st.PreviousCerts, func(c CertRecord) bool { return c.Serial == prev.Serial })
+		st.PreviousCerts = append(st.PreviousCerts, prev)
+	}
 	if st.KeyRef != "" && st.KeyRef != newRef && !slices.Contains(st.RetiredKeys, st.KeyRef) {
 		st.RetiredKeys = append(st.RetiredKeys, st.KeyRef)
 	}
@@ -556,10 +607,12 @@ func (r *run) fullChain(ctx context.Context, issued *api.Cert, leaf *x509.Certif
 func (r *run) deployPending(ctx context.Context) error {
 	st := r.st
 	labels := make([]string, 0, len(r.job.Targets))
+	for _, tj := range r.job.Targets {
+		labels = append(labels, tj.Config.Label)
+	}
 	var errs []error
 	for _, tj := range r.job.Targets {
 		label := tj.Config.Label
-		labels = append(labels, label)
 		if ctx.Err() != nil {
 			errs = append(errs, ctx.Err())
 			break
@@ -601,6 +654,13 @@ func (r *run) deployPending(ctx context.Context) error {
 			r.log.Info("old keys released; every target serves the current certificate", "serial", st.Serial)
 		}
 	}
+	// Keep an earlier certificate only while a target serves it and its key
+	// is still held.
+	st.PreviousCerts = slices.DeleteFunc(st.PreviousCerts, func(c CertRecord) bool {
+		served := slices.ContainsFunc(labels, func(l string) bool { return st.Targets[l].Serial == c.Serial })
+		held := c.KeyRef == st.KeyRef || slices.Contains(st.RetiredKeys, c.KeyRef)
+		return c.Serial == st.Serial || !served || !held
+	})
 	if err := r.save(); err != nil {
 		errs = append(errs, err)
 	}
@@ -668,7 +728,7 @@ func (t *targetRun) failStep(step string, err error) {
 // outcome is OutcomeFailed or OutcomeRolledBack.
 func (t *targetRun) recordFailure(err error, outcome string) error {
 	ts := t.ts()
-	ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+	ts.endDeployment()
 	ts.Outcome = outcome
 	ts.Failures++
 	base := t.e.RetryBase
@@ -688,7 +748,7 @@ func (t *targetRun) recordSuccess(serial string, notAfter time.Time, outcome str
 	ts := t.ts()
 	ts.Serial, ts.NotAfter = serial, notAfter
 	ts.Outcome = outcome
-	ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+	ts.endDeployment()
 	ts.Failures, ts.NextAttempt, ts.LastError = 0, time.Time{}, ""
 	t.setTS(ts)
 	_ = t.save()
@@ -722,7 +782,7 @@ func (t *targetRun) recover(ctx context.Context) error {
 	switch ts.Phase {
 	case PhaseStaged:
 		t.discard(ctx, ts.StagedRef)
-		ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+		ts.endDeployment()
 		t.setTS(ts)
 		return t.save()
 
@@ -735,7 +795,7 @@ func (t *targetRun) recover(ctx context.Context) error {
 			cur = ""
 		}
 		if cur == "" || cur != ts.DeployingSerial {
-			ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+			ts.endDeployment()
 			t.setTS(ts)
 			return t.save()
 		}
@@ -782,6 +842,27 @@ func (t *targetRun) discard(ctx context.Context, stagedRef string) {
 	}
 }
 
+// current asks the target which certificate it serves, with its own
+// timeout. It returns "" when the target cannot tell.
+func (t *targetRun) current(ctx context.Context) string {
+	cctx, cancel := t.bg(ctx, time.Minute)
+	defer cancel()
+	cur, err := t.tj.Plugin.Current(cctx, plugin.CurrentRequest{Config: t.tj.Settings, CertificateID: strconv.Itoa(t.job.Cert.ID), Label: t.label()})
+	if err != nil {
+		if !plugin.IsUnsupported(err) {
+			t.log.Warn("target cannot report its current certificate", "error", err)
+		}
+		return ""
+	}
+	return cur
+}
+
+// notAfter returns the expiry of a certificate the state still records.
+func (t *targetRun) notAfter(serial string) time.Time {
+	rec, _ := t.st.certRecord(serial)
+	return rec.NotAfter
+}
+
 func (t *targetRun) deployCurrent(ctx context.Context) error {
 	st, tj := t.st, t.tj
 	certID := strconv.Itoa(t.job.Cert.ID)
@@ -815,6 +896,11 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	_ = t.e.audit(t.entry(audit.StepStage, audit.ResultOK))
 
 	ts.Phase = PhaseActivating
+	if tj.Caps.RollbackNeedsMaterial {
+		// What the target serves now is what a rollback must restore,
+		// whatever the state says it was given last.
+		ts.LiveBefore = t.current(ctx)
+	}
 	t.setTS(ts)
 	if err := t.save(); err != nil {
 		t.discard(ctx, stagedRef)
@@ -826,6 +912,21 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	if err != nil {
 		t.failStep(audit.StepActivate, err)
 		t.discard(ctx, stagedRef)
+		if cur := t.current(ctx); cur != "" && cur == st.Serial {
+			// The target reports the new certificate although Activate
+			// failed (for example the answer was lost). Treat it as
+			// activated with an unknown previous state, as recovery does,
+			// so the state matches what the target serves.
+			a := t.entry(audit.StepRecover, audit.ResultOK)
+			a.Detail = "activate failed, but the target serves the new certificate; checking it"
+			_ = t.e.audit(a)
+			t.log.Warn("activate failed, but the target reports the new certificate; verifying it as activated", "error", err)
+			ts = t.ts()
+			ts.Phase, ts.StagedRef, ts.PreviousRef = PhaseActivated, "", ""
+			t.setTS(ts)
+			_ = t.save()
+			return t.finishActivated(ctx, "", true)
+		}
 		return t.recordFailure(err, OutcomeFailed)
 	}
 	ts.Phase, ts.StagedRef, ts.PreviousRef = PhaseActivated, "", prevRef
@@ -923,7 +1024,7 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 			return t.recordFailure(err, outcome)
 		}
 		ts := t.ts()
-		ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+		ts.endDeployment()
 		t.setTS(ts)
 		_ = t.save()
 		return err
@@ -936,8 +1037,8 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 		t.log.Error("not rolling back; the target keeps the new certificate, which failed its checks", "reason", why, "error", cause)
 		// The target holds the new certificate now; record that so it is
 		// not activated again on top of itself.
-		ts.Serial, ts.NotAfter = ts.DeployingSerial, t.st.NotAfter
-		ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+		ts.Serial, ts.NotAfter = ts.DeployingSerial, t.notAfter(ts.DeployingSerial)
+		ts.endDeployment()
 		ts.LastError = cause.Error()
 		ts.Outcome = OutcomeFailed
 		t.setTS(ts)
@@ -949,28 +1050,50 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 	case !t.tj.Caps.SupportsRollback:
 		return keepNew("target does not support rollback")
 	case prevRef == "":
-		return keepNew("the previous state is unknown after an interrupted activation")
+		return keepNew("the previous state is unknown (activation was interrupted, or the target reported no previous state)")
 	case ts.Serial != "" && !ts.NotAfter.IsZero() && ts.NotAfter.Before(t.e.now().Add(RollbackMinValidity)):
 		return keepNew(fmt.Sprintf("the previous certificate %s expires at %s", ts.Serial, ts.NotAfter.Format(time.RFC3339)))
 	}
 
-	timeout := t.e.RollbackTimeout
-	if timeout == 0 {
-		timeout = DefaultRollbackTimeout
-	}
-	rctx, cancel := t.bg(ctx, timeout)
-	defer cancel()
-
 	a := t.entry(audit.StepRollback, audit.ResultOK)
 	a.PreviousRef = prevRef
-	err := t.tj.Plugin.Rollback(rctx, plugin.RollbackRequest{
+	req := plugin.RollbackRequest{
 		Config: t.tj.Settings, PreviousRef: prevRef, CertificateID: strconv.Itoa(t.job.Cert.ID), Label: t.label(),
-	})
+	}
+	restores := ts.Serial
+	if t.tj.Caps.RollbackNeedsMaterial {
+		if ts.LiveBefore != "" {
+			restores = ts.LiveBefore
+		}
+		if why := t.previousMaterial(ctx, &req, restores); why != "" {
+			a.Detail = "previous certificate and key not available: " + why
+			t.log.Warn("rolling back without the previous certificate and key", "reason", why)
+		}
+	}
+
+	rctx, cancel := t.bg(ctx, t.rollbackTimeout())
+	defer cancel()
+	err := t.tj.Plugin.Rollback(rctx, req)
 	if err != nil {
 		a.Result, a.Error = audit.ResultFailed, err.Error()
 		_ = t.e.audit(a)
 		t.log.Error("rollback failed", "error", err)
+		if cur := t.current(ctx); cur != "" && cur == ts.DeployingSerial {
+			// The target still serves the certificate that failed its
+			// checks. Record that, so the next deployment's previous
+			// state matches the target.
+			ts = t.ts()
+			ts.Serial, ts.NotAfter = ts.DeployingSerial, t.notAfter(ts.DeployingSerial)
+			t.setTS(ts)
+		}
 		return done(errors.Join(cause, fmt.Errorf("rollback failed: %w", err)), OutcomeFailed)
+	}
+	if restores != ts.Serial {
+		// The target served something other than what the state said;
+		// it serves that again now.
+		ts = t.ts()
+		ts.Serial, ts.NotAfter = restores, t.notAfter(restores)
+		t.setTS(ts)
 	}
 	if t.tj.Config.Then != nil {
 		if err := t.runThen(rctx, "", "rollback"); err != nil {
@@ -984,6 +1107,48 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 	_ = t.e.audit(a)
 	t.log.Warn("rolled back to the previous certificate", "cause", cause)
 	return done(fmt.Errorf("%w (rolled back)", cause), OutcomeRolledBack)
+}
+
+// rollbackTimeout is the engine's rollback timeout, or the plugin's call
+// timeout when that is longer, so a slow target can finish.
+func (t *targetRun) rollbackTimeout() time.Duration {
+	timeout := t.e.RollbackTimeout
+	if timeout == 0 {
+		timeout = DefaultRollbackTimeout
+	}
+	if ct, ok := t.tj.Plugin.(interface{ CallTimeout() time.Duration }); ok {
+		timeout = max(timeout, ct.CallTimeout())
+	}
+	return timeout
+}
+
+// previousMaterial fills req with the certificate the target served before
+// (serial) and its key, exported in the target's format. It returns why it
+// could not, or "". The export has its own short timeout and runs even if
+// ctx is cancelled.
+func (t *targetRun) previousMaterial(ctx context.Context, req *plugin.RollbackRequest, serial string) string {
+	if t.tj.RollbackUnavailable != "" {
+		return t.tj.RollbackUnavailable
+	}
+	if serial == "" {
+		return "the connector has not deployed a certificate to this target before"
+	}
+	rec, ok := t.st.certRecord(serial)
+	if !ok || rec.KeyRef == "" || rec.CertPEM == "" {
+		return "the connector no longer holds certificate " + serial
+	}
+	if !rec.NotAfter.IsZero() && !rec.NotAfter.After(t.e.now()) {
+		return "certificate " + serial + " has expired"
+	}
+	ectx, cancel := t.bg(ctx, time.Minute)
+	defer cancel()
+	key, err := t.job.KeyStore.Export(ectx, plugin.ExportRequest{Config: t.job.KeyStoreConfig, KeyRef: rec.KeyRef, Format: t.tj.Format})
+	if err != nil {
+		return "key store could not export its key: " + err.Error()
+	}
+	req.PreviousCertPEM, req.PreviousChainPEM, req.PreviousFullChainPEM = rec.CertPEM, rec.ChainPEM, rec.FullChainPEM
+	req.PreviousKey, req.PreviousSerial = key, rec.Serial
+	return ""
 }
 
 func (t *targetRun) runThen(ctx context.Context, serial, action string) error {

@@ -26,6 +26,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -184,11 +186,15 @@ func (h *Host) start(name string) (*goplugin.Client, error) {
 	}
 	cmd := exec.Command(cmdPath)
 	cmd.Args[0] = path
+	cmd.Env = PluginEnv(os.Environ())
 	cfg := plugin.ClientConfig(cmd, hclog.New(&hclog.LoggerOptions{
 		Name:   "plugin." + name,
 		Output: os.Stderr,
 		Level:  hclog.Info,
 	}))
+	// cmd.Env is the whole environment; do not let go-plugin add the
+	// connector's own back.
+	cfg.SkipHostEnv = true
 	client := goplugin.NewClient(cfg)
 	if _, err := client.Start(); err != nil {
 		client.Kill()
@@ -196,6 +202,26 @@ func (h *Host) start(name string) (*goplugin.Client, error) {
 	}
 	h.log.Debug("plugin started", "plugin", name, "path", path, "sha256", hex.EncodeToString(got))
 	return client, nil
+}
+
+// connectorSecretEnv lists environment variables that carry the
+// connector's own KrakenKey credentials. Plugins never need them.
+var connectorSecretEnv = []string{"KK_API_KEY", "KK_API_KEY_FILE", "CREDENTIALS_DIRECTORY"}
+
+// PluginEnv returns the environment for a plugin process: the connector's,
+// without its KrakenKey API key, enrollment token and systemd credentials
+// directory. Everything else is kept, since cloud SDKs read their
+// credentials and settings from the environment.
+func PluginEnv(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.Contains(connectorSecretEnv, name) || strings.HasPrefix(name, "KK_ENROLLMENT_TOKEN") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // OpenBinary checks a plugin executable and its parent directories, then
@@ -336,6 +362,18 @@ func (r *remoteKeyStore) Validate(ctx context.Context, req plugin.KeyStoreValida
 	return ks.Validate(ctx, req)
 }
 
+// ValidateCapabilities forwards to the plugin, keeping the capabilities it
+// returns for these settings.
+func (r *remoteKeyStore) ValidateCapabilities(ctx context.Context, req plugin.KeyStoreValidateRequest) (plugin.KeyStoreValidation, error) {
+	ctx, cancel := r.ctx(ctx, true)
+	defer cancel()
+	ks, err := r.get()
+	if err != nil {
+		return plugin.KeyStoreValidation{}, err
+	}
+	return plugin.ValidateKeyStore(ctx, ks, req)
+}
+
 func (r *remoteKeyStore) CreateCSR(ctx context.Context, req plugin.CSRRequest) (plugin.CSR, error) {
 	ctx, cancel := r.ctx(ctx, false)
 	defer cancel()
@@ -427,6 +465,10 @@ func (r *remoteTarget) Current(ctx context.Context, req plugin.CurrentRequest) (
 	}
 	return t.Current(ctx, req)
 }
+
+// CallTimeout is the plugin's call_timeout. The engine gives a rollback at
+// least this long.
+func (r *remoteTarget) CallTimeout() time.Duration { return r.timeout }
 
 func (r *remoteTarget) Stage(ctx context.Context, req plugin.StageRequest) (string, error) {
 	ctx, cancel := r.ctx(ctx, false)
