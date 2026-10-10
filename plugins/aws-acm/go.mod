@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/acm v1.50.4
 	github.com/aws/smithy-go v1.28.5
 	github.com/hashicorp/go-plugin v1.8.0
-	github.com/krakenkey/connector v0.0.0
+	github.com/krakenkey/connector v0.1.0
 )
 
 require (
@@ -37,5 +37,3 @@ require (
 	google.golang.org/grpc v1.84.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
-
-replace github.com/krakenkey/connector => ../..

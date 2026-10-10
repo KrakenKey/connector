@@ -2,8 +2,6 @@ module github.com/krakenkey/connector/plugins/azure-keyvault
 
 go 1.26
 
-replace github.com/krakenkey/connector => ../..
-
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.3
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1
@@ -11,7 +9,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets v1.5.0
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-plugin v1.8.0
-	github.com/krakenkey/connector v0.0.0
+	github.com/krakenkey/connector v0.1.0
 	software.sslmate.com/src/go-pkcs12 v0.7.3
 )
 

@@ -137,7 +137,9 @@ no plugin downloads.
 | `X.Y` | The latest patch release of `X.Y`. |
 | `latest` | The latest release that is not a prerelease. |
 
-Images are signed the same way. To check one before running it:
+Images are signed the same way. Image signatures are stored in the format
+cosign v3 writes, so check them with cosign v3 or later (cosign v2 reports
+"no signatures found"). To check one before running it:
 
 ```sh
 cosign verify ghcr.io/krakenkey/connector:v${VERSION} \

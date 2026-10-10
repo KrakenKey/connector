@@ -16,9 +16,13 @@ go test ./... -race
 golangci-lint run
 ```
 
-Plugins under `plugins/` are separate Go modules, listed in `go.work` so
-they build against the SDK in this checkout. Run the same checks inside each
-plugin directory you change. The core module must not import cloud SDKs;
+Plugins under `plugins/` are separate Go modules. Each requires a released
+version of the core module (`github.com/krakenkey/connector`), and `go.work`
+lists them so local builds use the SDK in this checkout instead. CI builds
+each plugin with `GOWORK=off`, against the version in its `go.mod`, so a
+plugin change that needs an unreleased core change has to wait for a core
+release and a `go.mod` bump. Run the same checks inside each plugin
+directory you change, with `GOWORK=off`. The core module must not import cloud SDKs;
 those belong in the plugin modules.
 
 ## Commit messages
