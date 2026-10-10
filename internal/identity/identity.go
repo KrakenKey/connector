@@ -89,7 +89,9 @@ func (i *Identity) RotationPending() bool { return i.next != nil }
 func EncodePublicKey(pub ed25519.PublicKey) string { return base64.StdEncoding.EncodeToString(pub) }
 
 // Timestamp formats t as RFC 3339 UTC with second precision.
-func Timestamp(t time.Time) string { return t.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z") }
+func Timestamp(t time.Time) string {
+	return t.UTC().Truncate(time.Second).Format("2006-01-02T15:04:05Z")
+}
 
 // nonceBytes is the number of random bytes in a nonce: 43 characters
 // once encoded, within the API's 16 bytes to 64 characters.
