@@ -103,14 +103,15 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 		}
 		c, err := client.GetCert(ctx, cert.ID)
 		var authErr *api.AuthError
+		var connAuthErr *api.ConnectorAuthError
 		var nf *api.NotFoundError
 		switch {
-		case errors.As(err, &authErr):
+		case errors.As(err, &authErr), errors.As(err, &connAuthErr):
 			authFailed = true
 			bad("%v", err)
 			continue
 		case errors.As(err, &nf):
-			bad("KrakenKey has no certificate %d for this API key", cert.ID)
+			bad("KrakenKey has no certificate %d that these credentials can see", cert.ID)
 			continue
 		case err != nil:
 			bad("KrakenKey API: %v", err)

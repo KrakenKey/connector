@@ -382,3 +382,58 @@ func TestGetCertChain(t *testing.T) {
 		t.Fatalf("chain = %+v, %v", ch, err)
 	}
 }
+
+func TestConnectorRoutesSendNoBearerAndDoNotLatch401(t *testing.T) {
+	var calls atomic.Int32
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if strings.HasPrefix(r.URL.Path, "/connectors/") && r.Header.Get("Authorization") != "" {
+			t.Errorf("%s sent a bearer token", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"statusCode":401,"message":"Invalid connector credentials"}`))
+	})
+	ctx := context.Background()
+	_, err := c.Enrol(ctx, EnrolRequest{Token: "kkce_x"})
+	var tokErr *EnrolmentTokenError
+	if !errors.As(err, &tokErr) {
+		t.Errorf("enrol 401: %v", err)
+	}
+	_, err = c.ConnectorToken(ctx, ConnectorTokenRequest{ConnectorID: "c"})
+	var connErr *ConnectorAuthError
+	if !errors.As(err, &connErr) || !IsClientError(err) {
+		t.Errorf("token 401: %v", err)
+	}
+	if err := c.RotateIdentity(ctx, RotateRequest{}); !errors.As(err, &connErr) {
+		t.Errorf("rotate 401: %v", err)
+	}
+	// None of these is the API key failing, so authenticated calls still go out.
+	_, _ = c.GetCert(ctx, 1)
+	if calls.Load() != 4 {
+		t.Errorf("%d requests, want 4: a 401 on a connector route blocked later calls", calls.Load())
+	}
+}
+
+func TestKeySourceIsAskedPerRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":1,"status":"issued","auth":"` + r.Header.Get("Authorization") + `"}`))
+	}))
+	defer srv.Close()
+	var n atomic.Int32
+	keys := KeySourceFunc(func(context.Context) (string, error) {
+		if n.Add(1) == 3 {
+			return "", &ConnectorAuthError{Message: "revoked"}
+		}
+		return "kk_short_" + strconv.Itoa(int(n.Load())), nil
+	})
+	c := NewClientWithKeys(srv.URL, keys, "test")
+	for range 2 {
+		if _, err := c.GetCert(context.Background(), 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := c.GetCert(context.Background(), 1)
+	if !errors.As(err, new(*ConnectorAuthError)) {
+		t.Errorf("key source error not returned: %v", err)
+	}
+}
