@@ -91,7 +91,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 
 // send sends a request, with the bearer token when auth is true. A 401 on
 // an authenticated request is remembered and ends every later call; on an
-// unauthenticated one (the connector enrolment and token routes) it is
+// unauthenticated one (the connector enrollment and token routes) it is
 // returned as an *APIError and not remembered.
 func (c *Client) send(ctx context.Context, method, path string, body, out any, auth bool) error {
 	if prev := c.authFailed.Load(); prev != nil && auth {

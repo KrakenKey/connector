@@ -394,10 +394,10 @@ func TestConnectorRoutesSendNoBearerAndDoNotLatch401(t *testing.T) {
 		_, _ = w.Write([]byte(`{"statusCode":401,"message":"Invalid connector credentials"}`))
 	})
 	ctx := context.Background()
-	_, err := c.Enrol(ctx, EnrolRequest{Token: "kkce_x"})
-	var tokErr *EnrolmentTokenError
+	_, err := c.Enroll(ctx, EnrollRequest{Token: "kkce_x"})
+	var tokErr *EnrollmentTokenError
 	if !errors.As(err, &tokErr) {
-		t.Errorf("enrol 401: %v", err)
+		t.Errorf("enroll 401: %v", err)
 	}
 	_, err = c.ConnectorToken(ctx, ConnectorTokenRequest{ConnectorID: "c"})
 	var connErr *ConnectorAuthError

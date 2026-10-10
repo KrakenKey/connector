@@ -53,7 +53,7 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage: krakenkey-connector <command> [flags]
 
 Commands:
-  enrol            Enrol this connector with a one-time token from the dashboard
+  enroll           Enroll this connector with a one-time token from the dashboard
   rotate-identity  Replace the connector's identity key
   run              Renew and deploy certificates every check_interval
   run --once       Run a single pass and exit (for cron or systemd timers)
@@ -65,12 +65,12 @@ Run "krakenkey-connector <command> -h" for the flags of a command.
 An enrolled connector gets short-lived API keys by proving its identity.
 Otherwise the API key is read from the file named by KK_API_KEY_FILE, from
 the systemd credential kk_api_key, or from the KK_API_KEY environment
-variable. The enrolment token is read the same way from
-KK_ENROLMENT_TOKEN_FILE, the credential kk_enrolment_token, or
-KK_ENROLMENT_TOKEN.
+variable. The enrollment token is read the same way from
+KK_ENROLLMENT_TOKEN_FILE, the credential kk_enrollment_token, or
+KK_ENROLLMENT_TOKEN.
 
 Exit codes: 0 success, 1 a certificate or target failed, 2 usage or config
-error, 3 API key or enrolment token rejected, 4 rate limited, 5 connector
+error, 3 API key or enrollment token rejected, 4 rate limited, 5 connector
 identity rejected (revoked or invalid).
 `)
 }
@@ -81,8 +81,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	switch args[0] {
-	case "enrol", "enroll":
-		return cmdEnrol(args[1:], stdout, stderr)
+	case "enroll":
+		return cmdEnroll(args[1:], stdout, stderr)
 	case "rotate-identity":
 		return cmdRotateIdentity(args[1:], stdout, stderr)
 	case "run":
@@ -144,9 +144,9 @@ type secretSource struct {
 var (
 	// apiKeySecret: LoadCredential=kk_api_key:/path/to/key.
 	apiKeySecret = secretSource{what: "API key", env: "KK_API_KEY", fileEnv: "KK_API_KEY_FILE", credential: "kk_api_key"}
-	// enrolmentTokenSecret: LoadCredential=kk_enrolment_token:/path/to/token.
-	enrolmentTokenSecret = secretSource{what: "enrolment token", env: "KK_ENROLMENT_TOKEN",
-		fileEnv: "KK_ENROLMENT_TOKEN_FILE", credential: "kk_enrolment_token"}
+	// enrollmentTokenSecret: LoadCredential=kk_enrollment_token:/path/to/token.
+	enrollmentTokenSecret = secretSource{what: "enrollment token", env: "KK_ENROLLMENT_TOKEN",
+		fileEnv: "KK_ENROLLMENT_TOKEN_FILE", credential: "kk_enrollment_token"}
 )
 
 // loadAPIKey finds the API key: the file in KK_API_KEY_FILE, then the
@@ -230,7 +230,7 @@ func cmdRun(args []string, stderr io.Writer) int {
 	if err := procsec.Harden(); err != nil {
 		log.Warn("could not make the process non-dumpable", "error", err)
 	}
-	_ = os.Unsetenv(enrolmentTokenSecret.env)
+	_ = os.Unsetenv(enrollmentTokenSecret.env)
 	apiKey, keySource, err := loadAPIKey(log)
 	if err != nil {
 		log.Error("cannot read the API key", "error", err)
@@ -349,7 +349,7 @@ func apiClient(log *slog.Logger, cfg *config.Config, store *identity.Store, iden
 ) (client *api.Client, credential string, ok bool) {
 	if ident == nil {
 		if apiKey == "" {
-			log.Error("no credentials: the connector is not enrolled (run enrol) and no API key is set " +
+			log.Error("no credentials: the connector is not enrolled (run enroll) and no API key is set " +
 				"(KK_API_KEY_FILE, the kk_api_key systemd credential, or KK_API_KEY)")
 			return nil, "", false
 		}
@@ -381,12 +381,12 @@ func identityClient(log *slog.Logger, cfg *config.Config, store *identity.Store,
 	return client, tokens
 }
 
-func cmdEnrol(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("enrol", flag.ContinueOnError)
+func cmdEnroll(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("enroll", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var common commonFlags
 	common.register(fs)
-	force := fs.Bool("force", false, "enrol again although an identity exists; the old identity files are kept as backups")
+	force := fs.Bool("force", false, "enroll again although an identity exists; the old identity files are kept as backups")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -402,17 +402,17 @@ func cmdEnrol(args []string, stdout, stderr io.Writer) int {
 	if err := procsec.Harden(); err != nil {
 		log.Warn("could not make the process non-dumpable", "error", err)
 	}
-	token, _, err := loadSecret(log, enrolmentTokenSecret)
+	token, _, err := loadSecret(log, enrollmentTokenSecret)
 	if err != nil {
-		log.Error("cannot read the enrolment token", "error", err)
+		log.Error("cannot read the enrollment token", "error", err)
 		return exitUsage
 	}
 	if token == "" {
-		log.Error("no enrolment token: set KK_ENROLMENT_TOKEN_FILE, the kk_enrolment_token systemd credential, or KK_ENROLMENT_TOKEN")
+		log.Error("no enrollment token: set KK_ENROLLMENT_TOKEN_FILE, the kk_enrollment_token systemd credential, or KK_ENROLLMENT_TOKEN")
 		return exitUsage
 	}
 	if !strings.HasPrefix(token, "kkce_") {
-		log.Error("that is not an enrolment token: enrolment tokens start with kkce_ (create one for this connector in the dashboard)")
+		log.Error("that is not an enrollment token: enrollment tokens start with kkce_ (create one for this connector in the dashboard)")
 		return exitUsage
 	}
 	cfg, err := config.Load(common.configPath)
@@ -434,24 +434,24 @@ func cmdEnrol(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	client := api.NewClient(cfg.KrakenKey.APIURL, "", userAgent())
-	res, err := identity.NewStore(cfg.DataDir).Enrol(ctx, client, identity.EnrolOptions{
+	res, err := identity.NewStore(cfg.DataDir).Enroll(ctx, client, identity.EnrollOptions{
 		Token: token, Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH,
 		APIURL: cfg.KrakenKey.APIURL, Force: *force, Now: time.Now(),
 	})
-	var tokErr *api.EnrolmentTokenError
+	var tokErr *api.EnrollmentTokenError
 	var rl *api.RateLimitError
 	switch {
 	case errors.Is(err, identity.ErrAlreadyEnrolled):
 		log.Error("not enrolling", "error", err)
 		return exitUsage
 	case errors.As(err, &tokErr):
-		log.Error("enrolment failed", "error", tokErr)
+		log.Error("enrollment failed", "error", tokErr)
 		return exitAuth
 	case errors.As(err, &rl):
-		log.Error("enrolment failed: KrakenKey asked the connector to back off", "retry_after", rl.RetryAfter)
+		log.Error("enrollment failed: KrakenKey asked the connector to back off", "retry_after", rl.RetryAfter)
 		return exitRateLimit
 	case err != nil:
-		log.Error("enrolment failed", "error", err)
+		log.Error("enrollment failed", "error", err)
 		return exitFailed
 	}
 	for _, b := range res.Backups {
@@ -504,7 +504,7 @@ func cmdRotateIdentity(args []string, stdout, stderr io.Writer) int {
 		return exitFailed
 	}
 	if ident == nil {
-		log.Error("the connector is not enrolled; run enrol first")
+		log.Error("the connector is not enrolled; run enroll first")
 		return exitUsage
 	}
 
@@ -541,7 +541,7 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	if err := procsec.Harden(); err != nil {
 		log.Warn("could not make the process non-dumpable", "error", err)
 	}
-	_ = os.Unsetenv(enrolmentTokenSecret.env)
+	_ = os.Unsetenv(enrollmentTokenSecret.env)
 	apiKey, keySource, keyErr := loadAPIKey(log)
 	cfg, err := config.Load(common.configPath)
 	if err != nil {
