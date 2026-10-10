@@ -113,6 +113,14 @@ After that it renews when KrakenKey says the certificate is due
 (`renewAfter`). If the API does not say, it renews two thirds of the way
 through the certificate's lifetime.
 
+**New certificates:** a certificate can also be created in KrakenKey with
+names only, to be issued by the connector (status `awaiting_csr`). Put its
+id and exactly those names in the config. On its next pass the connector
+creates the key and CSR, has the certificate issued, and deploys it. If the
+configured names differ from the ones KrakenKey is waiting for, the
+connector refuses with an error and creates nothing. `validate` lists such
+certificates as waiting for this connector to issue them.
+
 If KrakenKey renews a certificate on its own (auto-renewal reuses the CSR,
 so the new certificate has the connector's key), the connector deploys that
 certificate rather than renewing again. `validate` warns when auto-renewal is
