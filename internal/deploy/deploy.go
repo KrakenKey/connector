@@ -2,26 +2,35 @@
 //
 // For each certificate, a pass does:
 //
-//  1. Due check: renew when renewAfter has passed (or 30 days before expiry
-//     when the API does not send renewAfter), when forced, or when the
-//     connector does not hold the key for the current certificate.
-//  2. Ask the key store for a new key and CSR, renew with it, and wait for
-//     issuance.
-//  3. Check that the issued leaf carries the key store's public key and
+//  1. Adoption: if KrakenKey's current certificate carries a key the
+//     connector holds (its current key, or a key whose renewal was still
+//     in flight when an earlier pass stopped waiting), take that
+//     certificate instead of renewing again. This also covers renewals
+//     KrakenKey made on its own with the stored CSR.
+//  2. Due check: renew when renewAfter has passed (or, if the API does not
+//     send it, two thirds into the certificate's lifetime), when forced, or
+//     when the connector does not hold the key for the current certificate.
+//  3. Ask the key store for a new key and CSR, record it as pending, renew
+//     with it, and wait for issuance.
+//  4. Check that the issued leaf carries the key store's public key and
 //     exactly the configured names. Otherwise reject it and deploy nothing.
-//  4. For each target on its own: export the key in the agreed format,
-//     Stage, Activate (recording the previous ref in the audit log before
-//     anything else), run the then command, and verify the endpoint. On
-//     failure, roll that target back. Other targets are not affected.
-//  5. When every target serves the new certificate, release the old keys.
+//  5. For each target on its own: finish or undo any deployment an earlier
+//     run left half done, then export the key, Stage, Activate (recording
+//     the previous ref in the state and the audit log before anything else),
+//     run the then command, and verify the endpoint. On failure, roll that
+//     target back, unless the certificate to go back to expires within a
+//     day. Other targets are not affected.
+//  6. When every target serves the new certificate, release the old keys.
 //
-// Targets that failed keep their old certificate and are retried on the
-// next pass.
+// Targets that failed keep their old certificate and are retried on later
+// passes, with growing delays.
 package deploy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,10 +62,28 @@ type Verifier interface {
 	Verify(ctx context.Context, req verify.Request) error
 }
 
+// KeyLister is implemented by key stores that can list their keys for a
+// certificate (the built-in local key store). The engine uses it to delete
+// keys its state no longer refers to.
+type KeyLister interface {
+	KeyRefs(certificateID string) ([]string, error)
+}
+
 // CommandRunner runs then.exec commands.
 type CommandRunner func(ctx context.Context, argv, env []string, timeout time.Duration) error
 
-// Engine runs passes. All fields except Now and RunThen are required.
+// Defaults for Engine fields.
+const (
+	DefaultRollbackTimeout = 5 * time.Minute
+	DefaultRetryBase       = 30 * time.Minute
+	MaxRetryDelay          = 24 * time.Hour
+	// RollbackMinValidity is how long the certificate a rollback would
+	// restore must still be valid. Rolling back to something that expires
+	// sooner than this is worse than keeping the new certificate.
+	RollbackMinValidity = 24 * time.Hour
+)
+
+// Engine runs passes. API, Verifier, Audit, State and Log are required.
 type Engine struct {
 	API      API
 	Verifier Verifier
@@ -68,8 +95,11 @@ type Engine struct {
 	// Now defaults to time.Now.
 	Now func() time.Time
 	// RollbackTimeout bounds a rollback, which runs even if the pass is
-	// being cancelled. Default 5m.
+	// being cancelled.
 	RollbackTimeout time.Duration
+	// RetryBase is the delay after a target's first failed deployment; it
+	// doubles with each further failure, up to MaxRetryDelay.
+	RetryBase time.Duration
 }
 
 // Job is one configured certificate with its plugins resolved.
@@ -98,7 +128,8 @@ type TargetJob struct {
 // Options change one pass.
 type Options struct {
 	RunID string
-	// Force renews even when the certificate is not due.
+	// Force renews even when the certificate is not due, and retries
+	// failed targets without waiting for their retry delay.
 	Force bool
 }
 
@@ -125,20 +156,44 @@ func (e *Engine) audit(entry audit.Entry) error {
 	return nil
 }
 
+func spkiHash(der []byte) string {
+	sum := sha256.Sum256(der)
+	return hex.EncodeToString(sum[:])
+}
+
+// run carries what one certificate's pass needs.
+type run struct {
+	e    *Engine
+	job  Job
+	opts Options
+	log  *slog.Logger
+	st   *State
+}
+
+func (r *run) entry(step, result string) audit.Entry {
+	return audit.Entry{RunID: r.opts.RunID, CertificateID: r.job.Cert.ID, Step: step, Result: result}
+}
+
+func (r *run) save() error {
+	r.st.UpdatedAt = r.e.now().UTC()
+	return r.e.State.Save(r.st)
+}
+
+func (r *run) bg(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), d)
+}
+
 // Process runs one pass for one certificate.
 func (e *Engine) Process(ctx context.Context, job Job, opts Options) error {
 	id := job.Cert.ID
-	log := e.Log.With("certificate_id", id, "run_id", opts.RunID)
-	entry := func(step, result string) audit.Entry {
-		return audit.Entry{RunID: opts.RunID, CertificateID: id, Step: step, Result: result}
-	}
+	r := &run{e: e, job: job, opts: opts, log: e.Log.With("certificate_id", id, "run_id", opts.RunID)}
 
 	cert, err := e.API.GetCert(ctx, id)
 	if err != nil {
 		return fmt.Errorf("certificate %d: %w", id, err)
 	}
 	if cert.ManagedBy != nil {
-		log.Debug("certificate record", "managed_by", *cert.ManagedBy)
+		r.log.Debug("certificate record", "managed_by", *cert.ManagedBy, "auto_renew", cert.AutoRenew)
 	}
 
 	st, err := e.State.Load(id)
@@ -146,241 +201,301 @@ func (e *Engine) Process(ctx context.Context, job Job, opts Options) error {
 		return err
 	}
 	if st != nil && st.KeyStore != job.KeyStoreName {
-		log.Warn("key store changed since the last run; starting over with the new one",
+		r.log.Warn("key store changed since the last run; starting over with the new one",
 			"old_key_store", st.KeyStore, "new_key_store", job.KeyStoreName)
 		st = nil
 	}
-
-	currentSerial := ""
-	if cert.CrtPem != "" {
-		if leaf, err := certutil.ParseLeaf(cert.CrtPem); err == nil {
-			currentSerial = certutil.SerialHex(leaf.SerialNumber)
+	if st == nil {
+		st = &State{CertificateID: id, KeyStore: job.KeyStoreName, Targets: map[string]TargetState{}}
+	}
+	if st.KeySPKI == "" && st.CertPEM != "" {
+		if leaf, err := certutil.ParseLeaf(st.CertPEM); err == nil {
+			st.KeySPKI = spkiHash(leaf.RawSubjectPublicKeyInfo)
 		}
 	}
-	held := st != nil && st.KeyRef != "" && st.Serial != "" && st.Serial == currentSerial
+	r.st = st
 
 	switch cert.Status {
 	case api.StatusPending, api.StatusIssuing, api.StatusRenewing, api.StatusRevoking:
-		log.Info("certificate is busy in KrakenKey; checking again next pass", "status", cert.Status)
-		e2 := entry(audit.StepCheck, audit.ResultSkipped)
-		e2.Detail = "status " + cert.Status
-		_ = e.audit(e2)
+		r.log.Info("certificate is busy in KrakenKey; checking again next pass", "status", cert.Status)
+		a := r.entry(audit.StepCheck, audit.ResultSkipped)
+		a.Detail = "status " + cert.Status
+		_ = e.audit(a)
 		return nil
 	case api.StatusRevoked:
 		return fmt.Errorf("certificate %d is revoked; issue a new one in KrakenKey and update the config", id)
 	}
 
-	renewAt, fromAPI, known := cert.RenewAt()
+	var leaf *x509.Certificate
+	leafSerial, leafSPKI := "", ""
+	if cert.CrtPem != "" {
+		if l, err := certutil.ParseLeaf(cert.CrtPem); err == nil {
+			leaf = l
+			leafSerial = certutil.SerialHex(l.SerialNumber)
+			leafSPKI = spkiHash(l.RawSubjectPublicKeyInfo)
+		}
+	}
+
+	if leaf != nil && leafSerial != st.Serial && cert.Status == api.StatusIssued {
+		if err := r.adopt(ctx, cert, leafSPKI); err != nil {
+			return fmt.Errorf("certificate %d: %w", id, err)
+		}
+	}
+	held := st.KeyRef != "" && leaf != nil && leafSerial == st.Serial && leafSPKI == st.KeySPKI
+
+	renewAt, source, known := cert.RenewAt()
 	reason := ""
 	switch {
 	case opts.Force:
 		reason = "forced with --force"
-	case st == nil:
+	case st.KeyRef == "":
 		reason = "first run: the connector does not hold the key for the current certificate yet"
 	case !held:
 		reason = "the current certificate was not issued for a key this connector holds"
 	case !known:
-		reason = "the API sent neither renewAfter nor expiresAt"
+		r.log.Warn("cannot tell when to renew: the API sent neither renewAfter nor a parsable certificate or expiry; not renewing")
 	case !e.now().Before(renewAt):
-		if fromAPI {
-			reason = "renewAfter has passed"
-		} else {
-			reason = "less than 30 days to expiry (the API sent no renewAfter)"
-		}
+		reason = "renewal time reached (" + source + ")"
 	}
 
 	if reason != "" {
 		if opts.Force {
-			log.Warn("renewing because --force was given, although the certificate may not be due",
-				"renew_after", renewAt, "renew_after_known", known)
+			r.log.Warn("renewing because --force was given, although the certificate may not be due",
+				"renew_after", renewAt, "renew_after_source", source)
 		}
-		log.Info("renewing", "reason", reason, "status", cert.Status, "current_serial", currentSerial)
-		st, err = e.renew(ctx, log, job, cert, st, currentSerial, reason, opts)
-		if err != nil {
+		r.log.Info("renewing", "reason", reason, "status", cert.Status, "current_serial", leafSerial)
+		if err := r.renew(ctx, cert, leafSerial, reason); err != nil {
 			return fmt.Errorf("certificate %d: %w", id, err)
 		}
-	} else {
-		log.Info("not due for renewal", "renew_after", renewAt, "renew_after_from_api", fromAPI)
+	} else if known {
+		r.log.Info("not due for renewal", "renew_after", renewAt, "source", source)
 	}
 
-	return e.deployPending(ctx, log, job, st, opts)
+	if st.Serial == "" {
+		return nil
+	}
+	err = r.deployPending(ctx)
+	r.sweepOrphans(ctx)
+	return err
 }
 
-func (e *Engine) renew(ctx context.Context, log *slog.Logger, job Job, cert *api.Cert, st *State,
-	oldSerial, reason string, opts Options) (*State, error) {
-	id := job.Cert.ID
-	entry := func(step, result string) audit.Entry {
-		return audit.Entry{RunID: opts.RunID, CertificateID: id, Step: step, Result: result, OldSerial: oldSerial}
+// adopt takes KrakenKey's current certificate when it carries a key the
+// connector holds.
+func (r *run) adopt(ctx context.Context, cert *api.Cert, leafSPKI string) error {
+	st := r.st
+	switch {
+	case st.KeyRef != "" && leafSPKI == st.KeySPKI:
+		r.log.Info("KrakenKey renewed the certificate with the connector's current key; deploying it")
+		return r.finishIssued(ctx, cert, st.KeyRef, st.KeySPKI, false, "renewed by KrakenKey with the connector's key")
+	case st.Pending != nil && leafSPKI == st.Pending.SPKI:
+		r.log.Info("a renewal from an earlier pass has completed; deploying it", "key_ref", st.Pending.KeyRef)
+		return r.finishIssued(ctx, cert, st.Pending.KeyRef, st.Pending.SPKI, true, "renewal from an earlier pass completed")
 	}
+	return nil
+}
+
+// renew creates a key and CSR, records it as pending, renews and waits.
+func (r *run) renew(ctx context.Context, cert *api.Cert, oldSerial, reason string) error {
+	job, st := r.job, r.st
 	fail := func(step string, err error) error {
-		a := entry(step, audit.ResultFailed)
+		a := r.entry(step, audit.ResultFailed)
+		a.OldSerial = oldSerial
 		var rej *RejectedError
 		if errors.As(err, &rej) {
 			a.Result = audit.ResultRejected
 		}
 		a.Error = err.Error()
-		_ = e.audit(a)
+		_ = r.e.audit(a)
 		return err
+	}
+
+	if st.Pending != nil {
+		// The earlier renewal did not produce the current certificate; its
+		// key will never be used.
+		r.releaseKey(ctx, st.Pending.KeyRef, "pending key from a renewal that did not complete")
+		st.Pending = nil
+		if err := r.save(); err != nil {
+			return err
+		}
 	}
 
 	csr, err := job.KeyStore.CreateCSR(ctx, plugin.CSRRequest{
 		Config:        job.KeyStoreConfig,
-		CertificateID: strconv.Itoa(id),
+		CertificateID: strconv.Itoa(job.Cert.ID),
 		Names:         job.Cert.Names,
 		KeyType:       job.Cert.KeyStore.KeyType,
 	})
 	if err != nil {
-		return nil, fail(audit.StepCreateCSR, err)
+		return fail(audit.StepCreateCSR, err)
 	}
-	a := entry(audit.StepCreateCSR, audit.ResultOK)
-	a.Detail = reason
-	_ = e.audit(a)
-
-	// From here on, a failure leaves a key nobody will use.
-	release := func() {
-		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-		defer cancel()
-		r := entry(audit.StepRelease, audit.ResultOK)
-		r.Detail = "unused key from a failed renewal"
-		if err := job.KeyStore.Release(rctx, plugin.ReleaseRequest{Config: job.KeyStoreConfig, KeyRef: csr.KeyRef}); err != nil {
-			log.Warn("could not release unused key", "error", err)
-			r.Result, r.Error = audit.ResultFailed, err.Error()
-		}
-		_ = e.audit(r)
-	}
-
 	req, err := certutil.ParseCSR(csr.PEM)
-	if err != nil {
-		release()
-		return nil, fail(audit.StepCreateCSR, fmt.Errorf("key store returned a bad CSR: %w", err))
+	if err == nil && !certutil.SameNames(certutil.CSRNames(req), job.Cert.Names) {
+		err = fmt.Errorf("key store returned a CSR for %v, want %v", certutil.CSRNames(req), job.Cert.Names)
 	}
-	if !certutil.SameNames(certutil.CSRNames(req), job.Cert.Names) {
-		release()
-		return nil, fail(audit.StepCreateCSR, fmt.Errorf("key store returned a CSR for %v, want %v",
-			certutil.CSRNames(req), job.Cert.Names))
+	if err != nil {
+		r.releaseKey(ctx, csr.KeyRef, "unused key from a bad CSR")
+		return fail(audit.StepCreateCSR, fmt.Errorf("key store returned a bad CSR: %w", err))
+	}
+	a := r.entry(audit.StepCreateCSR, audit.ResultOK)
+	a.Detail = reason
+	_ = r.e.audit(a)
+
+	// Record the key before asking for the certificate, so a renewal that
+	// finishes after this pass stops waiting is adopted, not repeated.
+	st.Pending = &PendingKey{KeyRef: csr.KeyRef, SPKI: spkiHash(req.RawSubjectPublicKeyInfo), CreatedAt: r.e.now().UTC()}
+	if err := r.save(); err != nil {
+		r.releaseKey(ctx, csr.KeyRef, "unused key; state could not be saved")
+		return err
+	}
+	dropPending := func(why string) {
+		r.releaseKey(ctx, csr.KeyRef, why)
+		st.Pending = nil
+		_ = r.save()
 	}
 
-	if _, err := e.API.RenewCert(ctx, id, csr.PEM); err != nil {
-		release()
-		return nil, fail(audit.StepRenew, err)
+	if _, err := r.e.API.RenewCert(ctx, job.Cert.ID, csr.PEM); err != nil {
+		if api.IsClientError(err) {
+			dropPending("unused key; KrakenKey refused the renewal")
+		} else {
+			r.log.Warn("renewal request outcome unknown; keeping the key in case it went through", "error", err)
+		}
+		return fail(audit.StepRenew, err)
 	}
-	_ = e.audit(entry(audit.StepRenew, audit.ResultOK))
-	log.Info("renewal requested; waiting for issuance")
+	_ = r.e.audit(r.entry(audit.StepRenew, audit.ResultOK))
+	r.log.Info("renewal requested; waiting for issuance")
 
-	issued, err := e.API.WaitForIssuance(ctx, id, cert.CrtPem)
+	issued, err := r.e.API.WaitForIssuance(ctx, job.Cert.ID, cert.CrtPem)
 	if err != nil {
-		release()
-		return nil, fail(audit.StepIssued, err)
+		var failed *api.IssuanceFailedError
+		if errors.As(err, &failed) || api.IsClientError(err) {
+			dropPending("unused key from a failed renewal")
+		} else {
+			r.log.Warn("stopped waiting for issuance; the next pass picks up the certificate if it is issued", "error", err)
+		}
+		return fail(audit.StepIssued, err)
 	}
+	return r.finishIssued(ctx, issued, csr.KeyRef, st.Pending.SPKI, true, reason)
+}
+
+// finishIssued checks an issued certificate against the key and names,
+// completes it in the key store and makes it the current certificate.
+// fromPending says whether keyRef is the pending key (released on reject)
+// or the current one.
+func (r *run) finishIssued(ctx context.Context, issued *api.Cert, keyRef, spki string, fromPending bool, detail string) error {
+	job, st := r.job, r.st
+	oldSerial := st.Serial
+	reject := func(reason string) error {
+		err := &RejectedError{Reason: reason}
+		if fromPending {
+			r.releaseKey(ctx, keyRef, "unused key from a rejected certificate")
+			st.Pending = nil
+			_ = r.save()
+		}
+		a := r.entry(audit.StepIssued, audit.ResultRejected)
+		a.OldSerial, a.Error = oldSerial, err.Error()
+		_ = r.e.audit(a)
+		return err
+	}
+
 	leaf, err := certutil.ParseLeaf(issued.CrtPem)
 	if err != nil {
-		release()
-		return nil, fail(audit.StepIssued, &RejectedError{Reason: "cannot parse the issued certificate: " + err.Error()})
+		return reject("cannot parse the issued certificate: " + err.Error())
 	}
 	newSerial := certutil.SerialHex(leaf.SerialNumber)
-	if !certutil.SamePublicKey(leaf.PublicKey, req.PublicKey) {
-		release()
-		return nil, fail(audit.StepIssued, &RejectedError{Reason: fmt.Sprintf(
-			"certificate %s does not carry the public key from the connector's CSR", newSerial)})
+	if spkiHash(leaf.RawSubjectPublicKeyInfo) != spki {
+		return reject(fmt.Sprintf("certificate %s does not carry the public key from the connector's CSR", newSerial))
 	}
 	if !certutil.SameNames(certutil.CertNames(leaf), job.Cert.Names) {
-		release()
-		return nil, fail(audit.StepIssued, &RejectedError{Reason: fmt.Sprintf(
-			"certificate %s covers %v, but the config lists %v", newSerial,
-			certutil.NormalizeNames(certutil.CertNames(leaf)), certutil.NormalizeNames(job.Cert.Names))})
+		return reject(fmt.Sprintf("certificate %s covers %v, but the config lists %v", newSerial,
+			certutil.NormalizeNames(certutil.CertNames(leaf)), certutil.NormalizeNames(job.Cert.Names)))
+	}
+	// The key store must still hold the key.
+	if der, err := job.KeyStore.PublicKey(ctx, plugin.PublicKeyRequest{Config: job.KeyStoreConfig, KeyRef: keyRef}); err == nil {
+		if spkiHash(der) != spki {
+			return reject("the key store's key does not match its CSR")
+		}
+	} else if errors.Is(err, plugin.ErrNotFound) {
+		return reject("the key store no longer holds the key for this certificate")
+	} else if !plugin.IsUnsupported(err) {
+		return err
 	}
 
-	fullChain := e.fullChain(ctx, log, id, issued, leaf)
-
-	keyRef, err := job.KeyStore.Complete(ctx, plugin.CompleteRequest{
-		Config: job.KeyStoreConfig, KeyRef: csr.KeyRef, CertPEM: issued.CrtPem, ChainPEM: issued.ChainPem,
+	fullChain := r.fullChain(ctx, issued, leaf)
+	newRef, err := job.KeyStore.Complete(ctx, plugin.CompleteRequest{
+		Config: job.KeyStoreConfig, KeyRef: keyRef, CertPEM: issued.CrtPem, ChainPEM: issued.ChainPem,
 	})
 	if err != nil {
-		release()
-		return nil, fail(audit.StepComplete, err)
+		a := r.entry(audit.StepComplete, audit.ResultFailed)
+		a.Error = err.Error()
+		_ = r.e.audit(a)
+		return err
 	}
 
-	next := &State{
-		CertificateID: id,
-		KeyStore:      job.KeyStoreName,
-		KeyRef:        keyRef,
-		Serial:        newSerial,
-		CertPEM:       issued.CrtPem,
-		ChainPEM:      issued.ChainPem,
-		FullChainPEM:  fullChain,
-		Targets:       map[string]TargetState{},
-		UpdatedAt:     e.now().UTC(),
+	if st.KeyRef != "" && st.KeyRef != newRef && !slices.Contains(st.RetiredKeys, st.KeyRef) {
+		st.RetiredKeys = append(st.RetiredKeys, st.KeyRef)
 	}
-	if st != nil {
-		next.Targets = st.Targets
-		next.RetiredKeys = append(next.RetiredKeys, st.RetiredKeys...)
-		if st.KeyRef != "" && st.KeyRef != keyRef && !slices.Contains(next.RetiredKeys, st.KeyRef) {
-			next.RetiredKeys = append(next.RetiredKeys, st.KeyRef)
-		}
+	st.KeyRef, st.KeySPKI = newRef, spki
+	st.Serial, st.NotAfter = newSerial, leaf.NotAfter
+	st.CertPEM, st.ChainPEM, st.FullChainPEM = issued.CrtPem, issued.ChainPem, fullChain
+	if fromPending {
+		st.Pending = nil
 	}
-	if err := e.State.Save(next); err != nil {
-		return nil, err
+	if err := r.save(); err != nil {
+		return err
 	}
-	ok := entry(audit.StepIssued, audit.ResultOK)
-	ok.NewSerial = newSerial
-	_ = e.audit(ok)
-	log.Info("certificate issued and checked", "new_serial", newSerial, "old_serial", oldSerial)
-	return next, nil
+	a := r.entry(audit.StepIssued, audit.ResultOK)
+	a.OldSerial, a.NewSerial, a.Detail = oldSerial, newSerial, detail
+	_ = r.e.audit(a)
+	r.log.Info("certificate issued and checked", "new_serial", newSerial, "old_serial", oldSerial)
+	return nil
+}
+
+func (r *run) releaseKey(ctx context.Context, ref, why string) {
+	rctx, cancel := r.bg(ctx, time.Minute)
+	defer cancel()
+	a := r.entry(audit.StepRelease, audit.ResultOK)
+	a.Detail = why
+	if err := r.job.KeyStore.Release(rctx, plugin.ReleaseRequest{Config: r.job.KeyStoreConfig, KeyRef: ref}); err != nil {
+		r.log.Warn("could not release key", "error", err)
+		a.Result, a.Error = audit.ResultFailed, err.Error()
+	}
+	_ = r.e.audit(a)
 }
 
 // fullChain prefers the API's fullChainPem, but falls back to leaf plus
 // chain if it is missing or does not start with the issued leaf.
-func (e *Engine) fullChain(ctx context.Context, log *slog.Logger, id int, issued *api.Cert, leaf *x509.Certificate) string {
+func (r *run) fullChain(ctx context.Context, issued *api.Cert, leaf *x509.Certificate) string {
 	built := strings.TrimSpace(issued.CrtPem) + "\n"
 	if c := strings.TrimSpace(issued.ChainPem); c != "" {
 		built += c + "\n"
 	}
-	chain, err := e.API.GetCertChain(ctx, id)
+	chain, err := r.e.API.GetCertChain(ctx, r.job.Cert.ID)
 	if err != nil {
-		log.Warn("could not fetch the full chain; building it from the certificate record", "error", err)
+		r.log.Warn("could not fetch the full chain; building it from the certificate record", "error", err)
 		return built
 	}
 	certs, err := certutil.ParseCerts([]byte(chain.FullChainPem))
 	if err != nil || !certs[0].Equal(leaf) {
-		log.Warn("full chain from the API does not start with the issued leaf; building it from the certificate record")
+		r.log.Warn("full chain from the API does not start with the issued leaf; building it from the certificate record")
 		return built
 	}
 	return chain.FullChainPem
 }
 
-func (e *Engine) deployPending(ctx context.Context, log *slog.Logger, job Job, st *State, opts Options) error {
-	if st == nil {
-		return nil
-	}
-	labels := make([]string, 0, len(job.Targets))
+func (r *run) deployPending(ctx context.Context) error {
+	st := r.st
+	labels := make([]string, 0, len(r.job.Targets))
 	var errs []error
-	for _, tj := range job.Targets {
+	for _, tj := range r.job.Targets {
 		label := tj.Config.Label
 		labels = append(labels, label)
-		ts := st.Targets[label]
-		if ts.Serial == st.Serial {
-			continue
-		}
 		if ctx.Err() != nil {
 			errs = append(errs, ctx.Err())
 			break
 		}
-		deployed, prevRef, err := e.deployTarget(ctx, log.With("target", label), job, tj, st, ts.Serial, opts)
-		if prevRef != "" {
-			ts.PreviousRef = prevRef
-		}
-		if deployed {
-			ts.Serial = st.Serial
-		}
-		ts.LastError = ""
-		if err != nil {
-			ts.LastError = err.Error()
+		tr := &targetRun{run: r, tj: tj, log: r.log.With("target", label)}
+		if err := tr.deploy(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("target %s: %w", label, err))
-		}
-		ts.UpdatedAt = e.now().UTC()
-		st.Targets[label] = ts
-		if err := e.State.Save(st); err != nil {
-			errs = append(errs, err)
 		}
 	}
 
@@ -393,59 +508,219 @@ func (e *Engine) deployPending(ctx context.Context, log *slog.Logger, job Job, s
 
 	allCurrent := true
 	for _, label := range labels {
-		if st.Targets[label].Serial != st.Serial {
+		ts := st.Targets[label]
+		if ts.Serial != st.Serial || ts.Phase != "" {
 			allCurrent = false
 		}
 	}
 	if allCurrent && len(st.RetiredKeys) > 0 {
 		var kept []string
 		for _, ref := range st.RetiredKeys {
-			a := audit.Entry{RunID: opts.RunID, CertificateID: job.Cert.ID, Step: audit.StepRelease, Result: audit.ResultOK,
-				Detail: "every target serves serial " + st.Serial}
-			if err := job.KeyStore.Release(ctx, plugin.ReleaseRequest{Config: job.KeyStoreConfig, KeyRef: ref}); err != nil {
-				log.Warn("could not release old key; will retry", "error", err)
+			a := r.entry(audit.StepRelease, audit.ResultOK)
+			a.Detail = "every target serves serial " + st.Serial
+			if err := r.job.KeyStore.Release(ctx, plugin.ReleaseRequest{Config: r.job.KeyStoreConfig, KeyRef: ref}); err != nil {
+				r.log.Warn("could not release old key; will retry", "error", err)
 				a.Result, a.Error = audit.ResultFailed, err.Error()
 				kept = append(kept, ref)
 			}
-			_ = e.audit(a)
+			_ = r.e.audit(a)
 		}
 		st.RetiredKeys = kept
 		if len(kept) == 0 {
-			log.Info("old keys released; every target serves the current certificate", "serial", st.Serial)
+			r.log.Info("old keys released; every target serves the current certificate", "serial", st.Serial)
 		}
 	}
-	if err := e.State.Save(st); err != nil {
+	if err := r.save(); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
 
-// deployTarget deploys the state's certificate to one target. deployed is
-// true when the target now holds the new certificate (verified, or not
-// rolled back because it propagates on its own schedule).
-func (e *Engine) deployTarget(ctx context.Context, log *slog.Logger, job Job, tj TargetJob, st *State,
-	oldSerial string, opts Options) (deployed bool, prevRef string, err error) {
-	label := tj.Config.Label
-	entry := func(step, result string) audit.Entry {
-		return audit.Entry{RunID: opts.RunID, CertificateID: job.Cert.ID, Target: label, Step: step,
-			Result: result, OldSerial: oldSerial, NewSerial: st.Serial}
+// sweepOrphans releases keys the key store holds for this certificate that
+// the state no longer refers to (for example left by a crash between
+// CreateCSR and saving the state).
+func (r *run) sweepOrphans(ctx context.Context) {
+	lister, ok := r.job.KeyStore.(KeyLister)
+	if !ok {
+		return
 	}
-	failEntry := func(step string, err error) {
-		a := entry(step, audit.ResultFailed)
-		a.Error = err.Error()
-		_ = e.audit(a)
-		log.Error("deployment step failed", "step", step, "error", err)
-	}
-
-	key, err := job.KeyStore.Export(ctx, plugin.ExportRequest{Config: job.KeyStoreConfig, KeyRef: st.KeyRef, Format: tj.Format})
+	refs, err := lister.KeyRefs(strconv.Itoa(r.job.Cert.ID))
 	if err != nil {
-		failEntry(audit.StepStage, err)
-		return false, "", err
+		r.log.Warn("could not list keys", "error", err)
+		return
+	}
+	keep := append([]string{r.st.KeyRef}, r.st.RetiredKeys...)
+	if r.st.Pending != nil {
+		keep = append(keep, r.st.Pending.KeyRef)
+	}
+	for _, ref := range refs {
+		if !slices.Contains(keep, ref) {
+			r.releaseKey(ctx, ref, "key not referenced by the connector's state")
+		}
+	}
+}
+
+// targetRun deploys to one target.
+type targetRun struct {
+	*run
+	tj  TargetJob
+	log *slog.Logger
+}
+
+func (t *targetRun) label() string { return t.tj.Config.Label }
+
+func (t *targetRun) ts() TargetState { return t.st.Targets[t.label()] }
+
+func (t *targetRun) setTS(ts TargetState) {
+	ts.UpdatedAt = t.e.now().UTC()
+	t.st.Targets[t.label()] = ts
+}
+
+func (t *targetRun) entry(step, result string) audit.Entry {
+	ts := t.ts()
+	a := t.run.entry(step, result)
+	a.Target, a.OldSerial, a.NewSerial = t.label(), ts.Serial, ts.DeployingSerial
+	if a.NewSerial == "" {
+		a.NewSerial = t.st.Serial
+	}
+	return a
+}
+
+func (t *targetRun) failStep(step string, err error) {
+	a := t.entry(step, audit.ResultFailed)
+	a.Error = err.Error()
+	_ = t.e.audit(a)
+	t.log.Error("deployment step failed", "step", step, "error", err)
+}
+
+// recordFailure ends a failed deployment and schedules the next attempt.
+func (t *targetRun) recordFailure(err error) error {
+	ts := t.ts()
+	ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+	ts.Failures++
+	base := t.e.RetryBase
+	if base == 0 {
+		base = DefaultRetryBase
+	}
+	delay := min(base<<min(ts.Failures-1, 16), MaxRetryDelay)
+	ts.NextAttempt = t.e.now().Add(delay).UTC()
+	ts.LastError = err.Error()
+	t.setTS(ts)
+	_ = t.save()
+	t.log.Warn("next attempt for this target delayed", "until", ts.NextAttempt, "failures", ts.Failures)
+	return err
+}
+
+func (t *targetRun) recordSuccess(serial string, notAfter time.Time) {
+	ts := t.ts()
+	ts.Serial, ts.NotAfter = serial, notAfter
+	ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+	ts.Failures, ts.NextAttempt, ts.LastError = 0, time.Time{}, ""
+	t.setTS(ts)
+	_ = t.save()
+}
+
+func (t *targetRun) deploy(ctx context.Context) error {
+	if t.ts().Phase != "" {
+		if err := t.recover(ctx); err != nil {
+			return err
+		}
+	}
+	ts := t.ts()
+	if ts.Serial == t.st.Serial {
+		return nil
+	}
+	if !t.opts.Force && t.e.now().Before(ts.NextAttempt) {
+		t.log.Info("waiting before trying this target again", "next_attempt", ts.NextAttempt, "last_error", ts.LastError)
+		return nil
+	}
+	return t.deployCurrent(ctx)
+}
+
+// recover finishes or undoes a deployment an earlier run left half done.
+func (t *targetRun) recover(ctx context.Context) error {
+	ts := t.ts()
+	a := t.entry(audit.StepRecover, audit.ResultOK)
+	a.Detail = "interrupted in phase " + ts.Phase
+	_ = t.e.audit(a)
+	t.log.Warn("finishing a deployment interrupted by an earlier run", "phase", ts.Phase, "serial", ts.DeployingSerial)
+
+	switch ts.Phase {
+	case PhaseStaged:
+		t.discard(ctx, ts.StagedRef)
+		ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+		t.setTS(ts)
+		return t.save()
+
+	case PhaseActivating:
+		// Activate may or may not have happened. Ask the target.
+		t.discard(ctx, ts.StagedRef)
+		cur, err := t.tj.Plugin.Current(ctx, plugin.CurrentRequest{Config: t.tj.Settings, CertificateID: strconv.Itoa(t.job.Cert.ID), Label: t.label()})
+		if err != nil {
+			t.log.Warn("target cannot report its current certificate", "error", err)
+			cur = ""
+		}
+		if cur == "" || cur != ts.DeployingSerial {
+			ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+			t.setTS(ts)
+			return t.save()
+		}
+		// Activated, but the previous ref was lost with the earlier run.
+		ts.Phase, ts.StagedRef, ts.PreviousRef = PhaseActivated, "", ""
+		t.setTS(ts)
+		_ = t.save()
+		fallthrough
+
+	case PhaseActivated:
+		ts = t.ts()
+		if ts.DeployingSerial != t.st.Serial {
+			// A newer certificate has been issued since. Put the target
+			// back the way it was; the normal path deploys the new one.
+			err := t.rollback(ctx, ts.PreviousRef, errors.New("interrupted deployment of an older certificate"), false)
+			if t.ts().Phase == "" && t.ts().Serial != t.st.Serial {
+				// Rolled back (or kept); carry on with the current one.
+				t.log.Info("undid an interrupted deployment of an older certificate", "result", err)
+				return nil
+			}
+			return err
+		}
+		return t.finishActivated(ctx, ts.PreviousRef, true)
+	}
+	ts.Phase = ""
+	t.setTS(ts)
+	return t.save()
+}
+
+func (t *targetRun) discard(ctx context.Context, stagedRef string) {
+	if stagedRef == "" {
+		return
+	}
+	dctx, cancel := t.bg(ctx, time.Minute)
+	defer cancel()
+	err := t.tj.Plugin.Discard(dctx, plugin.DiscardRequest{
+		Config: t.tj.Settings, StagedRef: stagedRef, CertificateID: strconv.Itoa(t.job.Cert.ID), Label: t.label(),
+	})
+	if err != nil && !plugin.IsUnsupported(err) && !errors.Is(err, plugin.ErrNotFound) {
+		t.log.Warn("could not discard staged files", "error", err)
+		a := t.entry(audit.StepDiscard, audit.ResultFailed)
+		a.Error = err.Error()
+		_ = t.e.audit(a)
+	}
+}
+
+func (t *targetRun) deployCurrent(ctx context.Context) error {
+	st, tj := t.st, t.tj
+	certID := strconv.Itoa(t.job.Cert.ID)
+
+	key, err := t.job.KeyStore.Export(ctx, plugin.ExportRequest{Config: t.job.KeyStoreConfig, KeyRef: st.KeyRef, Format: tj.Format})
+	if err != nil {
+		t.failStep(audit.StepExport, err)
+		return t.recordFailure(err)
 	}
 	stagedRef, err := tj.Plugin.Stage(ctx, plugin.StageRequest{
 		Config:        tj.Settings,
-		CertificateID: strconv.Itoa(job.Cert.ID),
-		Label:         label,
+		CertificateID: certID,
+		Label:         t.label(),
 		CertPEM:       st.CertPEM,
 		ChainPEM:      st.ChainPEM,
 		FullChainPEM:  st.FullChainPEM,
@@ -453,47 +728,74 @@ func (e *Engine) deployTarget(ctx context.Context, log *slog.Logger, job Job, tj
 		Serial:        st.Serial,
 	})
 	if err != nil {
-		failEntry(audit.StepStage, err)
-		return false, "", err
+		t.failStep(audit.StepStage, err)
+		return t.recordFailure(err)
 	}
-	_ = e.audit(entry(audit.StepStage, audit.ResultOK))
+	ts := t.ts()
+	ts.Phase, ts.StagedRef, ts.DeployingSerial = PhaseStaged, stagedRef, st.Serial
+	t.setTS(ts)
+	if err := t.save(); err != nil {
+		t.discard(ctx, stagedRef)
+		return err
+	}
+	_ = t.e.audit(t.entry(audit.StepStage, audit.ResultOK))
 
-	prevRef, err = tj.Plugin.Activate(ctx, tj.Settings, stagedRef)
+	ts.Phase = PhaseActivating
+	t.setTS(ts)
+	if err := t.save(); err != nil {
+		t.discard(ctx, stagedRef)
+		return err
+	}
+	prevRef, err := tj.Plugin.Activate(ctx, plugin.ActivateRequest{
+		Config: tj.Settings, StagedRef: stagedRef, CertificateID: certID, Label: t.label(),
+	})
 	if err != nil {
-		failEntry(audit.StepActivate, err)
-		return false, "", err
+		t.failStep(audit.StepActivate, err)
+		t.discard(ctx, stagedRef)
+		return t.recordFailure(err)
 	}
-	act := entry(audit.StepActivate, audit.ResultOK)
+	ts.Phase, ts.StagedRef, ts.PreviousRef = PhaseActivated, "", prevRef
+	t.setTS(ts)
+	saveErr := t.save()
+	act := t.entry(audit.StepActivate, audit.ResultOK)
 	act.PreviousRef = prevRef
-	if aerr := e.audit(act); aerr != nil {
+	auditErr := t.e.audit(act)
+	if err := errors.Join(saveErr, auditErr); err != nil {
 		// Without a record of how to undo this, do not leave it live.
-		cause := fmt.Errorf("could not record the activation in the audit log: %w", aerr)
-		return false, prevRef, e.rollback(ctx, log, job, tj, st, prevRef, entry, cause)
+		return t.rollback(ctx, prevRef, fmt.Errorf("could not record the activation: %w", err), true)
 	}
-	log.Info("activated", "serial", st.Serial)
+	t.log.Info("activated", "serial", st.Serial)
+	return t.finishActivated(ctx, prevRef, false)
+}
 
+// finishActivated runs the then command and verification after Activate,
+// and rolls back on failure. recovering is true when finishing a
+// deployment from an earlier run.
+func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recovering bool) error {
+	st, tj := t.st, t.tj
 	if tj.Config.Then != nil {
-		if err := e.runThen(ctx, job, tj, st.Serial, "deploy"); err != nil {
-			failEntry(audit.StepThen, err)
-			return false, prevRef, e.rollback(ctx, log, job, tj, st, prevRef, entry, err)
+		if err := t.runThen(ctx, st.Serial, "deploy"); err != nil {
+			t.failStep(audit.StepThen, err)
+			return t.rollback(ctx, prevRef, err, true)
 		}
-		_ = e.audit(entry(audit.StepThen, audit.ResultOK))
+		_ = t.e.audit(t.entry(audit.StepThen, audit.ResultOK))
 	}
 
 	v := tj.Config.Verify
 	if v == nil {
-		log.Warn("no verify block for this target; the deployment is not checked")
-		a := entry(audit.StepVerify, audit.ResultSkipped)
+		t.log.Warn("no verify block for this target; the deployment is not checked")
+		a := t.entry(audit.StepVerify, audit.ResultSkipped)
 		a.Detail = "no verify block in config"
-		_ = e.audit(a)
-		return true, prevRef, nil
+		_ = t.e.audit(a)
+		t.recordSuccess(st.Serial, st.NotAfter)
+		return nil
 	}
 	leaf, err := certutil.ParseLeaf(st.CertPEM)
 	if err != nil {
-		return false, prevRef, e.rollback(ctx, log, job, tj, st, prevRef, entry, err)
+		return t.rollback(ctx, prevRef, err, true)
 	}
 	if v.SkipChainValidation {
-		log.Warn("chain validation is off for this target (verify.skip_chain_validation); only the served leaf is checked")
+		t.log.Warn("chain validation is off for this target (verify.skip_chain_validation); only the served leaf is checked")
 	}
 	vreq := verify.Request{
 		Host:                v.Host,
@@ -503,80 +805,124 @@ func (e *Engine) deployTarget(ctx context.Context, log *slog.Logger, job Job, tj
 		Roots:               tj.Roots,
 		SkipChainValidation: v.SkipChainValidation,
 	}
-	log.Info("verifying", "address", vreq.Address, "sni", vreq.Host, "window", vreq.Window)
-	if err := e.Verifier.Verify(ctx, vreq); err != nil {
+	t.log.Info("verifying", "address", vreq.Address, "sni", vreq.Host, "window", vreq.Window)
+	if err := t.e.Verifier.Verify(ctx, vreq); err != nil {
 		if tj.Caps.PropagatesAsync {
-			a := entry(audit.StepVerify, audit.ResultReported)
+			a := t.entry(audit.StepVerify, audit.ResultReported)
 			a.Error = err.Error()
 			a.Detail = "target propagates on its own schedule; not rolled back"
-			_ = e.audit(a)
-			log.Error("verification failed; not rolling back because this target propagates on its own schedule", "error", err)
-			return true, prevRef, fmt.Errorf("verify (not rolled back): %w", err)
+			_ = t.e.audit(a)
+			t.log.Error("verification failed; not rolling back because this target propagates on its own schedule", "error", err)
+			t.recordSuccess(st.Serial, st.NotAfter)
+			ts := t.ts()
+			ts.LastError = err.Error()
+			t.setTS(ts)
+			_ = t.save()
+			return fmt.Errorf("verify (not rolled back): %w", err)
 		}
-		failEntry(audit.StepVerify, err)
-		return false, prevRef, e.rollback(ctx, log, job, tj, st, prevRef, entry, err)
+		t.failStep(audit.StepVerify, err)
+		return t.rollback(ctx, prevRef, err, true)
 	}
-	a := entry(audit.StepVerify, audit.ResultOK)
+	a := t.entry(audit.StepVerify, audit.ResultOK)
 	if v.SkipChainValidation {
 		a.Detail = "chain validation skipped by config"
 	}
-	_ = e.audit(a)
-	log.Info("deployed and verified", "serial", st.Serial)
-	return true, prevRef, nil
+	if recovering {
+		a.Detail = strings.TrimPrefix(a.Detail+"; finished an interrupted deployment", "; ")
+	}
+	_ = t.e.audit(a)
+	t.log.Info("deployed and verified", "serial", st.Serial)
+	t.recordSuccess(st.Serial, st.NotAfter)
+	return nil
 }
 
 // rollback undoes an activation and returns cause joined with any rollback
-// error. It runs even if ctx is cancelled.
-func (e *Engine) rollback(ctx context.Context, log *slog.Logger, job Job, tj TargetJob, st *State, prevRef string,
-	entry func(step, result string) audit.Entry, cause error) error {
-	if !tj.Caps.SupportsRollback {
-		a := entry(audit.StepRollback, audit.ResultSkipped)
-		a.Detail = "target does not support rollback"
-		_ = e.audit(a)
-		log.Error("target does not support rollback; it may be left with the new certificate", "error", cause)
-		return fmt.Errorf("%w (target cannot roll back)", cause)
+// error. It runs even if ctx is cancelled. It refuses to restore a
+// certificate that expires within RollbackMinValidity, and cannot roll back
+// without a previous ref.
+//
+// countFailure is false when undoing an interrupted run's deployment, which
+// is not a failure of this target.
+func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, countFailure bool) error {
+	done := func(err error) error {
+		if countFailure {
+			return t.recordFailure(err)
+		}
+		ts := t.ts()
+		ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+		t.setTS(ts)
+		_ = t.save()
+		return err
 	}
-	timeout := e.RollbackTimeout
+	ts := t.ts()
+	keepNew := func(why string) error {
+		a := t.entry(audit.StepRollback, audit.ResultSkipped)
+		a.Detail, a.Error = why, cause.Error()
+		_ = t.e.audit(a)
+		t.log.Error("not rolling back; the target keeps the new certificate, which failed its checks", "reason", why, "error", cause)
+		// The target holds the new certificate now; record that so it is
+		// not activated again on top of itself.
+		ts.Serial, ts.NotAfter = ts.DeployingSerial, t.st.NotAfter
+		ts.Phase, ts.StagedRef, ts.DeployingSerial = "", "", ""
+		ts.LastError = cause.Error()
+		t.setTS(ts)
+		_ = t.save()
+		return fmt.Errorf("%w (not rolled back: %s)", cause, why)
+	}
+
+	switch {
+	case !t.tj.Caps.SupportsRollback:
+		return keepNew("target does not support rollback")
+	case prevRef == "":
+		return keepNew("the previous state is unknown after an interrupted activation")
+	case ts.Serial != "" && !ts.NotAfter.IsZero() && ts.NotAfter.Before(t.e.now().Add(RollbackMinValidity)):
+		return keepNew(fmt.Sprintf("the previous certificate %s expires at %s", ts.Serial, ts.NotAfter.Format(time.RFC3339)))
+	}
+
+	timeout := t.e.RollbackTimeout
 	if timeout == 0 {
-		timeout = 5 * time.Minute
+		timeout = DefaultRollbackTimeout
 	}
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	rctx, cancel := t.bg(ctx, timeout)
 	defer cancel()
 
-	a := entry(audit.StepRollback, audit.ResultOK)
+	a := t.entry(audit.StepRollback, audit.ResultOK)
 	a.PreviousRef = prevRef
-	if err := tj.Plugin.Rollback(rctx, tj.Settings, prevRef); err != nil {
+	err := t.tj.Plugin.Rollback(rctx, plugin.RollbackRequest{
+		Config: t.tj.Settings, PreviousRef: prevRef, CertificateID: strconv.Itoa(t.job.Cert.ID), Label: t.label(),
+	})
+	if err != nil {
 		a.Result, a.Error = audit.ResultFailed, err.Error()
-		_ = e.audit(a)
-		log.Error("rollback failed", "error", err)
-		return errors.Join(cause, fmt.Errorf("rollback failed: %w", err))
+		_ = t.e.audit(a)
+		t.log.Error("rollback failed", "error", err)
+		return done(errors.Join(cause, fmt.Errorf("rollback failed: %w", err)))
 	}
-	if tj.Config.Then != nil {
-		if err := e.runThen(rctx, job, tj, "", "rollback"); err != nil {
+	if t.tj.Config.Then != nil {
+		if err := t.runThen(rctx, "", "rollback"); err != nil {
 			a.Result, a.Error = audit.ResultFailed, err.Error()
 			a.Detail = "files rolled back; then.exec failed afterwards"
-			_ = e.audit(a)
-			log.Error("rolled back, but then.exec failed afterwards", "error", err)
-			return errors.Join(cause, fmt.Errorf("files rolled back, but then.exec failed afterwards: %w", err))
+			_ = t.e.audit(a)
+			t.log.Error("rolled back, but then.exec failed afterwards", "error", err)
+			return done(errors.Join(cause, fmt.Errorf("files rolled back, but then.exec failed afterwards: %w", err)))
 		}
 	}
-	_ = e.audit(a)
-	log.Warn("rolled back to the previous certificate", "cause", cause)
-	return fmt.Errorf("%w (rolled back)", cause)
+	_ = t.e.audit(a)
+	t.log.Warn("rolled back to the previous certificate", "cause", cause)
+	return done(fmt.Errorf("%w (rolled back)", cause))
 }
 
-func (e *Engine) runThen(ctx context.Context, job Job, tj TargetJob, serial, action string) error {
-	run := e.RunThen
+func (t *targetRun) runThen(ctx context.Context, serial, action string) error {
+	run := t.e.RunThen
 	if run == nil {
 		run = execx.Run
 	}
 	env := execx.Env(
 		"KK_ACTION="+action,
-		"KK_CERT_ID="+strconv.Itoa(job.Cert.ID),
+		"KK_CERT_ID="+strconv.Itoa(t.job.Cert.ID),
 		"KK_CERT_SERIAL="+serial,
-		"KK_TARGET_LABEL="+tj.Config.Label,
+		"KK_TARGET_LABEL="+t.label(),
 	)
-	if err := run(ctx, tj.Config.Then.Exec, env, tj.Config.Then.Timeout); err != nil {
+	if err := run(ctx, t.tj.Config.Then.Exec, env, t.tj.Config.Then.Timeout); err != nil {
 		return fmt.Errorf("then.exec: %w", err)
 	}
 	return nil

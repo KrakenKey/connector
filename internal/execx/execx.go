@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/krakenkey/connector/internal/redact"
 )
 
 // SecretEnv lists environment variables never passed to child processes.
@@ -62,7 +64,7 @@ func Run(ctx context.Context, argv []string, env []string, timeout time.Duration
 	if ctx.Err() == context.DeadlineExceeded {
 		err = fmt.Errorf("timed out after %s", timeout)
 	}
-	if o := strings.TrimSpace(out.String()); o != "" {
+	if o := strings.TrimSpace(redact.String(out.String())); o != "" {
 		return fmt.Errorf("%s: %w: %s", argv[0], err, o)
 	}
 	return fmt.Errorf("%s: %w", argv[0], err)

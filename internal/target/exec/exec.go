@@ -15,9 +15,12 @@
 //	KK_TARGET_LABEL    target label
 //
 // A non-zero exit fails the deployment; the command is then run again with
-// the previous files (KK_ACTION=rollback), if there are any. The files of
-// the current and the previous deployment are kept so Rollback can do the
-// same later.
+// the previous files (KK_ACTION=rollback), if there are any.
+//
+// Retention: the files of the current and the previous deployment are kept
+// (each with its private key) so Rollback can run the command again with
+// the previous files. Older deployment directories, and staged directories
+// that were never activated, are removed at the next Stage or Activate.
 package exec
 
 import (
@@ -28,6 +31,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
@@ -37,6 +41,7 @@ import (
 	"time"
 
 	"github.com/krakenkey/connector/internal/execx"
+	"github.com/krakenkey/connector/internal/securefs"
 	"github.com/krakenkey/connector/pkg/plugin"
 )
 
@@ -45,7 +50,8 @@ const DefaultTimeout = 5 * time.Minute
 
 // Config is the exec target's settings.
 type Config struct {
-	// Command is the program and its arguments. No shell is involved.
+	// Command is the program and its arguments. No shell is involved. The
+	// program is an absolute path or a bare name looked up in PATH.
 	Command []string `json:"command"`
 	// Timeout is a Go duration string such as "2m". Default 5m.
 	Timeout string `json:"timeout,omitempty"`
@@ -74,11 +80,38 @@ func (t *Target) Describe(context.Context) (plugin.TargetCapabilities, error) {
 	}, nil
 }
 
-var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var (
+	envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	labelRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	idRe      = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[0-9a-f]{6}$`)
+	lookPath  = osexec.LookPath
+)
 
 type parsed struct {
 	Config
 	timeout time.Duration
+}
+
+// CommandProblem checks the program of a command line: an absolute path
+// that exists, or a bare name found in PATH. Relative paths are refused.
+func CommandProblem(argv []string) string {
+	if len(argv) == 0 || argv[0] == "" {
+		return "command is required"
+	}
+	prog := argv[0]
+	switch {
+	case filepath.IsAbs(prog):
+		if _, err := os.Stat(prog); err != nil {
+			return fmt.Sprintf("command: %v", err)
+		}
+	case strings.ContainsRune(prog, '/') || strings.ContainsRune(prog, filepath.Separator):
+		return fmt.Sprintf("command %q is a relative path; use an absolute path or a name from PATH", prog)
+	default:
+		if _, err := lookPath(prog); err != nil {
+			return fmt.Sprintf("command %q not found in PATH", prog)
+		}
+	}
+	return ""
 }
 
 func parse(raw json.RawMessage) (*parsed, []string) {
@@ -90,14 +123,8 @@ func parse(raw json.RawMessage) (*parsed, []string) {
 	}
 	p := &parsed{Config: c, timeout: DefaultTimeout}
 	var problems []string
-	if len(c.Command) == 0 || c.Command[0] == "" {
-		problems = append(problems, "command is required")
-	} else if !filepath.IsAbs(c.Command[0]) && !strings.Contains(c.Command[0], string(filepath.Separator)) {
-		if _, err := lookPath(c.Command[0]); err != nil {
-			problems = append(problems, fmt.Sprintf("command %q not found in PATH", c.Command[0]))
-		}
-	} else if _, err := os.Stat(c.Command[0]); err != nil {
-		problems = append(problems, fmt.Sprintf("command: %v", err))
+	if pr := CommandProblem(c.Command); pr != "" {
+		problems = append(problems, pr)
 	}
 	if c.Timeout != "" {
 		d, err := time.ParseDuration(c.Timeout)
@@ -121,19 +148,37 @@ func parse(raw json.RawMessage) (*parsed, []string) {
 func mustParse(raw json.RawMessage) (*parsed, error) {
 	p, problems := parse(raw)
 	if len(problems) > 0 {
-		return nil, errors.New("exec target: " + strings.Join(problems, "; "))
+		return nil, fmt.Errorf("%w: exec target: %s", plugin.ErrPermanent, strings.Join(problems, "; "))
 	}
 	return p, nil
 }
 
 // Validate checks the settings.
-func (t *Target) Validate(_ context.Context, raw json.RawMessage) ([]string, error) {
-	_, problems := parse(raw)
+func (t *Target) Validate(_ context.Context, req plugin.TargetValidateRequest) ([]string, error) {
+	_, problems := parse(req.Config)
 	return problems, nil
 }
 
-// Current returns "" because only the command knows what is live.
-func (t *Target) Current(context.Context, json.RawMessage) (string, error) { return "", nil }
+func (t *Target) base(certID, label string) (string, error) {
+	if !labelRe.MatchString(label) || !labelRe.MatchString(certID) {
+		return "", fmt.Errorf("%w: certificate id %q or label %q", plugin.ErrInvalid, certID, label)
+	}
+	return filepath.Join(t.root, certID+"-"+label), nil
+}
+
+// Current returns the serial of the last deployment the command accepted,
+// or "" if there is none.
+func (t *Target) Current(_ context.Context, req plugin.CurrentRequest) (string, error) {
+	base, err := t.base(req.CertificateID, req.Label)
+	if err != nil {
+		return "", err
+	}
+	cur, err := readCurrent(base)
+	if err != nil || cur == "" {
+		return "", nil
+	}
+	return readSerial(cur), nil
+}
 
 type ref struct {
 	// Dir is the deployment directory for Activate, or the previous one
@@ -146,29 +191,27 @@ type ref struct {
 	Serial string `json:"serial"`
 }
 
-var labelRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-
 // Stage writes the files for the command into a new directory.
 func (t *Target) Stage(_ context.Context, req plugin.StageRequest) (string, error) {
 	if _, err := mustParse(req.Config); err != nil {
 		return "", err
 	}
 	if req.Key.Format != plugin.KeyFormatPEM || len(req.Key.Data) == 0 {
-		return "", errors.New("exec target needs the private key as PEM")
+		return "", fmt.Errorf("%w: exec target needs the private key as PEM", plugin.ErrPermanent)
 	}
-	if !labelRe.MatchString(req.Label) || !labelRe.MatchString(req.CertificateID) {
-		return "", fmt.Errorf("invalid certificate id %q or label %q", req.CertificateID, req.Label)
+	base, err := t.base(req.CertificateID, req.Label)
+	if err != nil {
+		return "", err
 	}
-	base := filepath.Join(t.root, req.CertificateID+"-"+req.Label)
 	for _, d := range []string{t.root, base} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			return "", err
-		}
-		if err := os.Chmod(d, 0o700); err != nil {
+		if err := securefs.EnsurePrivateDir(d); err != nil {
 			return "", err
 		}
 	}
 	prev, _ := readCurrent(base)
+	// Directories other than the current one are leftovers from earlier
+	// deployments or from a stage that was never activated.
+	prune(base, prev)
 
 	id := time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + randomHex(3)
 	dir := filepath.Join(base, id)
@@ -180,6 +223,7 @@ func (t *Target) Stage(_ context.Context, req plugin.StageRequest) (string, erro
 		"chain.pem":     []byte(req.ChainPEM),
 		"fullchain.pem": []byte(req.FullChainPEM),
 		"key.pem":       req.Key.Data,
+		"serial":        []byte(req.Serial),
 	}
 	for name, data := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
@@ -191,17 +235,33 @@ func (t *Target) Stage(_ context.Context, req plugin.StageRequest) (string, erro
 	return string(r), nil
 }
 
+// Discard removes a staged directory that was not activated.
+func (t *Target) Discard(_ context.Context, req plugin.DiscardRequest) error {
+	r, err := t.parseRef(req.StagedRef, false)
+	if err != nil {
+		return err
+	}
+	if cur, _ := readCurrent(filepath.Dir(r.Dir)); cur == r.Dir {
+		return nil // activated; nothing to discard
+	}
+	return os.RemoveAll(r.Dir)
+}
+
 // Activate runs the command with the staged files.
-func (t *Target) Activate(ctx context.Context, raw json.RawMessage, stagedRef string) (string, error) {
-	p, err := mustParse(raw)
+func (t *Target) Activate(ctx context.Context, req plugin.ActivateRequest) (string, error) {
+	p, err := mustParse(req.Config)
 	if err != nil {
 		return "", err
 	}
-	r, err := t.parseRef(stagedRef, false)
+	r, err := t.parseRef(req.StagedRef, false)
 	if err != nil {
 		return "", err
+	}
+	if _, err := os.Stat(r.Dir); errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("%w: staged deployment %s", plugin.ErrNotFound, filepath.Base(r.Dir))
 	}
 	if err := t.run(ctx, p, r, "deploy"); err != nil {
+		_ = os.RemoveAll(r.Dir)
 		// The command may have applied part of the change. Run it again
 		// with the previous files so the system is back where it was.
 		if r.Prev != "" && t.inside(r.Prev) {
@@ -222,18 +282,22 @@ func (t *Target) Activate(ctx context.Context, raw json.RawMessage, stagedRef st
 	return string(prev), nil
 }
 
-// Rollback runs the command again with the previous files.
-func (t *Target) Rollback(ctx context.Context, raw json.RawMessage, previousRef string) error {
-	p, err := mustParse(raw)
+// Rollback runs the command again with the previous files. If nothing was
+// deployed before, it cannot undo the command's effect and says so.
+func (t *Target) Rollback(ctx context.Context, req plugin.RollbackRequest) error {
+	p, err := mustParse(req.Config)
 	if err != nil {
 		return err
 	}
-	r, err := t.parseRef(previousRef, true)
+	r, err := t.parseRef(req.PreviousRef, true)
 	if err != nil {
 		return err
 	}
 	if r.Dir == "" {
-		return errors.New("exec target: nothing was deployed before, so there is nothing to roll back to")
+		return fmt.Errorf("%w: exec target: nothing was deployed before, so there is nothing to roll back to", plugin.ErrPermanent)
+	}
+	if _, err := os.Stat(r.Dir); errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: previous deployment %s", plugin.ErrNotFound, filepath.Base(r.Dir))
 	}
 	if err := t.run(ctx, p, r, "rollback"); err != nil {
 		return err
@@ -244,20 +308,25 @@ func (t *Target) Rollback(ctx context.Context, raw json.RawMessage, previousRef 
 func (t *Target) parseRef(s string, allowEmpty bool) (ref, error) {
 	var r ref
 	if err := json.Unmarshal([]byte(s), &r); err != nil {
-		return r, fmt.Errorf("invalid ref %q", s)
+		return r, fmt.Errorf("%w: ref %q", plugin.ErrInvalid, s)
 	}
 	if r.Dir == "" && allowEmpty {
 		return r, nil
 	}
 	if !t.inside(r.Dir) {
-		return r, fmt.Errorf("ref directory %q is not under %s", r.Dir, t.root)
+		return r, fmt.Errorf("%w: ref directory %q is not a deployment under %s", plugin.ErrInvalid, r.Dir, t.root)
 	}
 	return r, nil
 }
 
+// inside reports whether dir is <root>/<cert>-<label>/<id>.
 func (t *Target) inside(dir string) bool {
 	rel, err := filepath.Rel(t.root, dir)
-	return err == nil && rel != "." && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	return len(parts) == 2 && labelRe.MatchString(parts[0]) && idRe.MatchString(parts[1])
 }
 
 func (t *Target) run(ctx context.Context, p *parsed, r ref, action string) error {
@@ -281,9 +350,6 @@ func (t *Target) run(ctx context.Context, p *parsed, r ref, action string) error
 	if err := execx.Run(ctx, p.Command, execx.Env(env...), p.timeout); err != nil {
 		return fmt.Errorf("exec target (%s): %w", action, err)
 	}
-	if serial != "" {
-		_ = os.WriteFile(filepath.Join(r.Dir, "serial"), []byte(serial), 0o600)
-	}
 	return nil
 }
 
@@ -300,15 +366,15 @@ func readCurrent(base string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, strings.TrimSpace(string(b))), nil
+	name := strings.TrimSpace(string(b))
+	if !idRe.MatchString(name) {
+		return "", fmt.Errorf("bad current marker %q", name)
+	}
+	return filepath.Join(base, name), nil
 }
 
 func writeCurrent(base, dir string) error {
-	tmp := filepath.Join(base, ".current.tmp")
-	if err := os.WriteFile(tmp, []byte(filepath.Base(dir)+"\n"), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(base, "current"))
+	return securefs.WriteFile(filepath.Join(base, "current"), []byte(filepath.Base(dir)+"\n"))
 }
 
 // prune removes deployment directories other than keep.
@@ -319,7 +385,7 @@ func prune(base string, keep ...string) {
 	}
 	for _, e := range entries {
 		full := filepath.Join(base, e.Name())
-		if e.IsDir() && !slices.Contains(keep, full) {
+		if e.IsDir() && idRe.MatchString(e.Name()) && !slices.Contains(keep, full) {
 			_ = os.RemoveAll(full)
 		}
 	}
@@ -330,5 +396,3 @@ func randomHex(n int) string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
-
-var lookPath = osexec.LookPath

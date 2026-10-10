@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/krakenkey/connector/pkg/plugin"
@@ -124,6 +125,19 @@ func (k *KeyStore) Export(_ context.Context, req plugin.ExportRequest) (plugin.K
 		Format: plugin.KeyFormatPEM,
 		Data:   pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}),
 	}, nil
+}
+
+// KeyRefs lists the keys held for a certificate.
+func (k *KeyStore) KeyRefs(certificateID string) ([]string, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var refs []string
+	for ref := range k.keys {
+		if strings.HasPrefix(ref, certificateID+"/") {
+			refs = append(refs, ref)
+		}
+	}
+	return refs, nil
 }
 
 // Release forgets the key.

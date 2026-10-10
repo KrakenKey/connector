@@ -40,10 +40,15 @@ type Client struct {
 // token and never logged or included in errors.
 func NewClient(baseURL, apiKey, userAgent string) *Client {
 	return &Client{
-		baseURL:             strings.TrimRight(baseURL, "/"),
-		apiKey:              apiKey,
-		userAgent:           userAgent,
-		httpClient:          &http.Client{Timeout: 30 * time.Second},
+		baseURL:   strings.TrimRight(baseURL, "/"),
+		apiKey:    apiKey,
+		userAgent: userAgent,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+			// Never follow redirects: the bearer token must only go to the
+			// configured API URL.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 		MaxRateLimitWait:    5 * time.Minute,
 		MaxRateLimitRetries: 3,
 		PollInterval:        10 * time.Second,
@@ -109,6 +114,12 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		}
 		apiErr.StatusCode = resp.StatusCode
 
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			msg, _ := json.Marshal(fmt.Sprintf("unexpected redirect to %q; check krakenkey.api_url", resp.Header.Get("Location")))
+			apiErr.RawMessage = msg
+			return apiErr
+		}
+
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
 			authErr := &AuthError{Message: apiErr.Message()}
@@ -130,23 +141,26 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	}
 }
 
+// maxRetryAfter caps what a Retry-After header can ask for.
+const maxRetryAfter = 7 * 24 * time.Hour
+
 // parseRetryAfter reads a Retry-After header in seconds or HTTP date form.
-// A missing or unreadable value means defaultRetryAfter; the result is
-// never below one second, so callers cannot spin.
+// A missing or unreadable value means defaultRetryAfter. The result is at
+// least one second, so callers cannot spin, and at most maxRetryAfter.
 func parseRetryAfter(v string, now time.Time) time.Duration {
 	v = strings.TrimSpace(v)
 	d := defaultRetryAfter
 	if v != "" {
-		if secs, err := strconv.Atoi(v); err == nil {
+		if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+			if secs > int64(maxRetryAfter/time.Second) {
+				secs = int64(maxRetryAfter / time.Second)
+			}
 			d = time.Duration(secs) * time.Second
 		} else if t, err := http.ParseTime(v); err == nil {
 			d = t.Sub(now)
 		}
 	}
-	if d < time.Second {
-		d = time.Second
-	}
-	return d
+	return min(max(d, time.Second), maxRetryAfter)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -191,7 +205,8 @@ func (c *Client) GetCertChain(ctx context.Context, id int) (*Chain, error) {
 
 // WaitForIssuance polls a certificate until it is issued with a leaf other
 // than previousCrt, or fails, or IssuanceTimeout passes. Transient errors
-// are retried at PollInterval; a 401 stops at once.
+// (network, 5xx) are retried at PollInterval. Client errors (401, 403, 404
+// and other 4xx) and rate limits the client did not wait out stop at once.
 func (c *Client) WaitForIssuance(ctx context.Context, id int, previousCrt string) (*Cert, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.IssuanceTimeout)
 	defer cancel()
@@ -199,17 +214,10 @@ func (c *Client) WaitForIssuance(ctx context.Context, id int, previousCrt string
 	var lastErr error
 	for {
 		cert, err := c.GetCert(ctx, id)
-		var authErr *AuthError
 		var rl *RateLimitError
 		switch {
-		case errors.As(err, &authErr):
+		case IsClientError(err), errors.As(err, &rl):
 			return nil, err
-		case errors.As(err, &rl):
-			lastErr = err
-			if err := c.sleep(ctx, rl.RetryAfter); err != nil {
-				return nil, waitErr(id, err, lastErr)
-			}
-			continue
 		case err != nil:
 			if ctx.Err() != nil {
 				return nil, waitErr(id, ctx.Err(), err)

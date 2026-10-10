@@ -3,7 +3,9 @@ package file
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -52,7 +54,7 @@ func deploy(t *testing.T, tg Target, b bundle) string {
 	if err != nil {
 		t.Fatalf("Stage: %v", err)
 	}
-	prev, err := tg.Activate(ctx, b.req.Config, staged)
+	prev, err := tg.Activate(ctx, plugin.ActivateRequest{Config: b.req.Config, StagedRef: staged})
 	if err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
@@ -88,7 +90,7 @@ func TestValidate(t *testing.T) {
 		{fmt.Sprintf(`{"dir":%q,"files":{"cert":"c","key":"k"},"permissions":"x"}`, dir), []string{`unknown field "permissions"`}},
 	}
 	for _, c := range cases {
-		problems, err := tg.Validate(context.Background(), json.RawMessage(c.cfg))
+		problems, err := tg.Validate(context.Background(), plugin.TargetValidateRequest{Config: json.RawMessage(c.cfg)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -112,7 +114,7 @@ func TestDeployWritesFilesAtomically(t *testing.T) {
 	cfg := settings(t, dir, `,"mode":"0640"`)
 	b := newBundle(t, ca, cfg)
 
-	if s, err := tg.Current(ctx, cfg); err != nil || s != "" {
+	if s, err := tg.Current(ctx, plugin.CurrentRequest{Config: cfg}); err != nil || s != "" {
 		t.Fatalf("Current before deploy = %q, %v", s, err)
 	}
 
@@ -124,7 +126,7 @@ func TestDeployWritesFilesAtomically(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "cert.pem")); !os.IsNotExist(err) {
 		t.Fatalf("cert.pem exists after Stage: %v", err)
 	}
-	if _, err := tg.Activate(ctx, cfg, staged); err != nil {
+	if _, err := tg.Activate(ctx, plugin.ActivateRequest{Config: cfg, StagedRef: staged}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -148,7 +150,7 @@ func TestDeployWritesFilesAtomically(t *testing.T) {
 			}
 		}
 	}
-	if s, err := tg.Current(ctx, cfg); err != nil || s != b.serial {
+	if s, err := tg.Current(ctx, plugin.CurrentRequest{Config: cfg}); err != nil || s != b.serial {
 		t.Errorf("Current = %q, %v; want %s", s, err, b.serial)
 	}
 
@@ -173,13 +175,17 @@ func TestRollbackRestoresPreviousFiles(t *testing.T) {
 	second := newBundle(t, ca, cfg)
 	prev := deploy(t, tg, second)
 
-	if s, _ := tg.Current(ctx, cfg); s != second.serial {
+	current := func() string {
+		s, _ := tg.Current(ctx, plugin.CurrentRequest{Config: cfg})
+		return s
+	}
+	if s := current(); s != second.serial {
 		t.Fatalf("Current = %s, want second %s", s, second.serial)
 	}
-	if err := tg.Rollback(ctx, cfg, prev); err != nil {
+	if err := tg.Rollback(ctx, plugin.RollbackRequest{Config: cfg, PreviousRef: prev}); err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
-	if s, _ := tg.Current(ctx, cfg); s != first.serial {
+	if s := current(); s != first.serial {
 		t.Fatalf("Current after rollback = %s, want first %s", s, first.serial)
 	}
 	if got := read(t, filepath.Join(dir, "key.pem")); got != string(first.req.Key.Data) {
@@ -200,7 +206,7 @@ func TestRollbackOfFirstDeployRemovesFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	prev := deploy(t, tg, newBundle(t, testca.New(t), cfg))
-	if err := tg.Rollback(ctx, cfg, prev); err != nil {
+	if err := tg.Rollback(ctx, plugin.RollbackRequest{Config: cfg, PreviousRef: prev}); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"cert.pem", "fullchain.pem", "key.pem"} {
@@ -249,11 +255,177 @@ func TestInvalidRefs(t *testing.T) {
 	dir := t.TempDir()
 	cfg := settings(t, dir, "")
 	for _, ref := range []string{"", "{}", `{"id":"../x"}`, "not json"} {
-		if _, err := New().Activate(context.Background(), cfg, ref); err == nil {
+		if _, err := New().Activate(context.Background(), plugin.ActivateRequest{Config: cfg, StagedRef: ref}); err == nil {
 			t.Errorf("Activate accepted %q", ref)
 		}
-		if err := New().Rollback(context.Background(), cfg, ref); err == nil {
+		if err := New().Rollback(context.Background(), plugin.RollbackRequest{Config: cfg, PreviousRef: ref}); err == nil {
 			t.Errorf("Rollback accepted %q", ref)
 		}
+	}
+}
+
+func TestDiscardAndStaleTempFiles(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	tg := New()
+	cfg := settings(t, dir, "")
+	b := newBundle(t, testca.New(t), cfg)
+
+	staged, err := tg.Stage(ctx, b.req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tg.Discard(ctx, plugin.DiscardRequest{Config: cfg, StagedRef: staged}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tg.Discard(ctx, plugin.DiscardRequest{Config: cfg, StagedRef: staged}); err != nil {
+		t.Fatalf("second Discard: %v", err)
+	}
+	assertNoTemps(t, dir)
+
+	// A staged file left by a crashed run is removed by the next Stage.
+	stale := filepath.Join(dir, ".key.pem.kk-staged-20260101T000000.000000000Z-abcdef")
+	if err := os.WriteFile(stale, []byte("old key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	staged, err = tg.Stage(ctx, b.req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale staged key not removed: %v", err)
+	}
+	// Activate with a missing staged file fails and removes the rest.
+	var sr stagedRef
+	_ = json.Unmarshal([]byte(staged), &sr)
+	_ = os.Remove(filepath.Join(dir, stagedName("cert.pem", sr.ID)))
+	if _, err := tg.Activate(ctx, plugin.ActivateRequest{Config: cfg, StagedRef: staged}); !errors.Is(err, plugin.ErrNotFound) {
+		t.Fatalf("Activate with a missing staged file: %v", err)
+	}
+	assertNoTemps(t, dir)
+}
+
+func assertNoTemps(t *testing.T, dir string) {
+	t.Helper()
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".kk-") {
+			t.Errorf("leftover temp file %s", e.Name())
+		}
+	}
+}
+
+func TestSymlinkedBackupDirIsRefused(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	outside := t.TempDir()
+	// Something an attacker would like deleted or overwritten.
+	victim := filepath.Join(outside, "20260101T000000.000000000Z-aaaaaa")
+	if err := os.Mkdir(victim, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(victim, "precious"), []byte("keep"), 0o600)
+	if err := os.Symlink(outside, filepath.Join(dir, BackupDir)); err != nil {
+		t.Fatal(err)
+	}
+
+	tg := New()
+	cfg := settings(t, dir, "")
+	ca := testca.New(t)
+	for range 4 {
+		b := newBundle(t, ca, cfg)
+		staged, err := tg.Stage(ctx, b.req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = tg.Activate(ctx, plugin.ActivateRequest{Config: cfg, StagedRef: staged})
+		if err == nil || !strings.Contains(err.Error(), "must be a directory, not a symlink") {
+			t.Fatalf("Activate with a symlinked backup dir: %v", err)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(victim, "precious")); err != nil || string(b) != "keep" {
+		t.Errorf("file outside the target dir was touched: %q %v", b, err)
+	}
+	entries, _ := os.ReadDir(outside)
+	if len(entries) != 1 {
+		t.Errorf("files written outside the target dir: %d entries", len(entries))
+	}
+	assertNoTemps(t, dir)
+	// Nothing was activated.
+	if _, err := os.Stat(filepath.Join(dir, "key.pem")); !os.IsNotExist(err) {
+		t.Errorf("key.pem written although activation failed: %v", err)
+	}
+}
+
+func TestSymlinkedLiveFileOutsideIsNotRead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	secret := filepath.Join(t.TempDir(), "shadow")
+	_ = os.WriteFile(secret, []byte("secret"), 0o600)
+	// cert.pem points outside the target dir; backing it up must not copy
+	// the outside file into the backup set.
+	if err := os.Symlink(secret, filepath.Join(dir, "cert.pem")); err != nil {
+		t.Fatal(err)
+	}
+	tg := New()
+	cfg := settings(t, dir, "")
+	b := newBundle(t, testca.New(t), cfg)
+	staged, err := tg.Stage(ctx, b.req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.Activate(ctx, plugin.ActivateRequest{Config: cfg, StagedRef: staged}); err == nil {
+		t.Fatal("Activate followed a symlink out of the target dir")
+	}
+	_ = filepath.WalkDir(filepath.Join(dir, BackupDir), func(p string, d fs.DirEntry, _ error) error {
+		if d != nil && !d.IsDir() {
+			if b, _ := os.ReadFile(p); string(b) == "secret" {
+				t.Errorf("outside file copied into %s", p)
+			}
+		}
+		return nil
+	})
+}
+
+func TestPruneLeavesForeignEntries(t *testing.T) {
+	dir := t.TempDir()
+	tg := New()
+	cfg := settings(t, dir, "")
+	ca := testca.New(t)
+	deploy(t, tg, newBundle(t, ca, cfg))
+	foreign := filepath.Join(dir, BackupDir, "notes")
+	if err := os.Mkdir(foreign, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for range 4 {
+		deploy(t, tg, newBundle(t, ca, cfg))
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Errorf("pruning removed a directory it did not create: %v", err)
+	}
+}
+
+func TestBackupDirMustBePrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits")
+	}
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, BackupDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chmod(filepath.Join(dir, BackupDir), 0o755)
+	tg := New()
+	cfg := settings(t, dir, "")
+	b := newBundle(t, testca.New(t), cfg)
+	staged, _ := tg.Stage(context.Background(), b.req)
+	if _, err := tg.Activate(context.Background(), plugin.ActivateRequest{Config: cfg, StagedRef: staged}); err == nil ||
+		!strings.Contains(err.Error(), "want 0700") {
+		t.Fatalf("err = %v", err)
 	}
 }

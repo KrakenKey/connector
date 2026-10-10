@@ -232,3 +232,52 @@ func TestDescribe(t *testing.T) {
 		t.Errorf("caps = %+v", caps)
 	}
 }
+
+func TestPublicKeyAndKeyRefs(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	if refs, err := s.KeyRefs("5"); err != nil || len(refs) != 0 {
+		t.Fatalf("KeyRefs on an empty store = %v, %v", refs, err)
+	}
+	var made []string
+	for range 2 {
+		csr, err := s.CreateCSR(ctx, plugin.CSRRequest{CertificateID: "5", Names: []string{"a.example.com"}, KeyType: plugin.KeyTypeECDSAP256})
+		if err != nil {
+			t.Fatal(err)
+		}
+		made = append(made, csr.KeyRef)
+		req, _ := certutil.ParseCSR(csr.PEM)
+		der, err := s.PublicKey(ctx, plugin.PublicKeyRequest{KeyRef: csr.KeyRef})
+		if err != nil || string(der) != string(req.RawSubjectPublicKeyInfo) {
+			t.Errorf("PublicKey = %x, %v", der, err)
+		}
+	}
+	refs, err := s.KeyRefs("5")
+	if err != nil || len(refs) != 2 {
+		t.Fatalf("KeyRefs = %v, %v", refs, err)
+	}
+	for _, r := range made {
+		if !slicesContains(refs, r) {
+			t.Errorf("KeyRefs missing %s", r)
+		}
+	}
+	_ = s.Release(ctx, plugin.ReleaseRequest{KeyRef: made[0]})
+	if _, err := s.PublicKey(ctx, plugin.PublicKeyRequest{KeyRef: made[0]}); !errors.Is(err, plugin.ErrNotFound) {
+		t.Errorf("PublicKey of a released key: %v", err)
+	}
+	if _, err := s.Export(ctx, plugin.ExportRequest{KeyRef: made[0], Format: plugin.KeyFormatPEM}); !errors.Is(err, plugin.ErrNotFound) {
+		t.Errorf("Export of a released key: %v", err)
+	}
+	if problems, _ := s.Validate(ctx, plugin.KeyStoreValidateRequest{Config: json.RawMessage(`{"x":1}`)}); len(problems) != 1 {
+		t.Errorf("Validate = %v", problems)
+	}
+}
+
+func slicesContains(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}

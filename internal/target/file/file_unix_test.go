@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/krakenkey/connector/internal/testca"
+	"github.com/krakenkey/connector/pkg/plugin"
 )
 
 func TestOwner(t *testing.T) {
@@ -25,7 +26,7 @@ func TestOwner(t *testing.T) {
 	}
 	dir := t.TempDir()
 	cfg := settings(t, dir, fmt.Sprintf(`,"owner":%q`, u.Username+":"+g.Name))
-	if problems, _ := New().Validate(context.Background(), cfg); len(problems) > 0 {
+	if problems, _ := New().Validate(context.Background(), plugin.TargetValidateRequest{Config: cfg}); len(problems) > 0 {
 		t.Fatalf("problems: %q", problems)
 	}
 	deploy(t, New(), newBundle(t, testca.New(t), cfg))

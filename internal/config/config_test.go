@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ check_interval: 6h
 data_dir: /var/lib/krakenkey-connector
 audit_log: /var/log/krakenkey-connector/audit.jsonl
 plugins:
-  azure-keyvault: { version: 0.1.0 }
+  azure-keyvault: { version: 0.1.0, sha256: "0000000000000000000000000000000000000000000000000000000000000000" }
 certificates:
   - id: 1043
     names: [api.example.com]
@@ -46,7 +47,7 @@ func TestParseExample(t *testing.T) {
 	if cfg.CheckInterval != 6*time.Hour || cfg.AuditLog != "/var/log/krakenkey-connector/audit.jsonl" {
 		t.Errorf("top level = %+v", cfg)
 	}
-	if cfg.Plugins["azure-keyvault"].Version != "0.1.0" {
+	if cfg.Plugins["azure-keyvault"].Version != "0.1.0" || cfg.Plugins["azure-keyvault"].CallTimeout != DefaultCallTimeout {
 		t.Errorf("plugins = %+v", cfg.Plugins)
 	}
 	c := cfg.Certificates[0]
@@ -156,10 +157,17 @@ plugins:
   Bad_Name: { path: /x }
   nover: {}
   badsum: { version: 1.0.0, sha256: abc }
+  nosum: { version: 1.0.0 }
+  slow: { path: /x, call_timeout: 10ms }
 certificates:
   - id: 0
     names: []
     targets: []
+  - id: 6
+    names: [api.example.com]
+    targets:
+      - { label: w, plugin: file, verify: { host: other.example.com } }
+      - { label: rel, plugin: file, then: { exec: [./reload.sh] } }
   - id: 5
     names: [ok.example.com, ok.example.com, "bad name", localhost]
     key_store: { plugin: vault, key_type: rsa-1024 }
@@ -182,6 +190,10 @@ certificates:
 			"plugins.Bad_Name: name must be lowercase",
 			"plugins.nover: set version or path",
 			"plugins.badsum: sha256 must be 64 hex characters",
+			"plugins.nosum: sha256 is required for plugins installed by version",
+			"plugins.slow: call_timeout must be at least 1s",
+			`certificate 6: target w: verify: host "other.example.com" is not one of the certificate's names`,
+			`certificate 6: target rel: then.exec "./reload.sh" is a relative path`,
 			"certificates[0]: id must be a positive",
 			"certificates[0]: names must list at least one",
 			"certificates[0]: targets must list at least one",
@@ -222,6 +234,24 @@ certificates:
 				}
 			}
 		})
+	}
+}
+
+func TestVerifyHostWildcard(t *testing.T) {
+	t.Setenv("KK_API_URL", "")
+	base := `
+certificates:
+  - id: 1
+    names: ["*.example.com"]
+    targets: [{ label: x, plugin: file, verify: { host: %s } }]
+`
+	if _, err := Parse(strings.NewReader(fmt.Sprintf(base, "api.example.com"))); err != nil {
+		t.Errorf("one label under the wildcard: %v", err)
+	}
+	for _, h := range []string{"a.b.example.com", "example.com"} {
+		if _, err := Parse(strings.NewReader(fmt.Sprintf(base, h))); err == nil {
+			t.Errorf("%s accepted for *.example.com", h)
+		}
 	}
 }
 

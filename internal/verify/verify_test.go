@@ -200,7 +200,7 @@ func TestVerifySameSerialDifferentKeyIsAMismatch(t *testing.T) {
 	if !errors.As(err, &mm) || !mm.SameSerial {
 		t.Fatalf("err = %v, want a same-serial mismatch", err)
 	}
-	if !strings.Contains(err.Error(), "different public key") {
+	if !strings.Contains(err.Error(), "not the issued certificate") {
 		t.Errorf("message = %q", err)
 	}
 }

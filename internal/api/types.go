@@ -2,7 +2,10 @@
 package api
 
 import (
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -20,7 +23,7 @@ const (
 )
 
 // FallbackRenewBefore is used to work out when to renew when the API does
-// not send renewAfter (older API versions).
+// not send renewAfter and the leaf cannot be parsed.
 const FallbackRenewBefore = 30 * 24 * time.Hour
 
 // Cert is a TLS certificate record from GET /certs/tls/:id.
@@ -36,17 +39,37 @@ type Cert struct {
 	FailureReason string     `json:"failureReason,omitempty"`
 }
 
-// RenewAt returns when the certificate should be renewed: renewAfter when
-// the API sends it, otherwise 30 days before expiry. ok is false when
-// neither is known.
-func (c *Cert) RenewAt() (t time.Time, fromAPI bool, ok bool) {
+// Renewal time sources reported by RenewAt.
+const (
+	RenewSourceAPI      = "renewAfter from the API"
+	RenewSourceLifetime = "two thirds of the certificate lifetime (the API sent no renewAfter)"
+	RenewSourceExpiry   = "30 days before expiry (the API sent no renewAfter)"
+)
+
+// RenewAt returns when the certificate should be renewed and where that
+// time came from: renewAfter when the API sends it; otherwise two thirds of
+// the way from the leaf's notBefore to its notAfter; otherwise 30 days
+// before expiresAt. ok is false when none of these is known.
+func (c *Cert) RenewAt() (t time.Time, source string, ok bool) {
 	if c.RenewAfter != nil {
-		return *c.RenewAfter, true, true
+		return *c.RenewAfter, RenewSourceAPI, true
+	}
+	if leaf, err := parseLeaf(c.CrtPem); err == nil && leaf.NotAfter.After(leaf.NotBefore) {
+		life := leaf.NotAfter.Sub(leaf.NotBefore)
+		return leaf.NotBefore.Add(life * 2 / 3), RenewSourceLifetime, true
 	}
 	if c.ExpiresAt != nil {
-		return c.ExpiresAt.Add(-FallbackRenewBefore), false, true
+		return c.ExpiresAt.Add(-FallbackRenewBefore), RenewSourceExpiry, true
 	}
-	return time.Time{}, false, false
+	return time.Time{}, "", false
+}
+
+func parseLeaf(pemData string) (*x509.Certificate, error) {
+	block, _ := pem.Decode([]byte(pemData))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, errors.New("no certificate")
+	}
+	return x509.ParseCertificate(block.Bytes)
 }
 
 // CertResponse is returned by POST /certs/tls/:id/renew.
@@ -109,6 +132,21 @@ type RateLimitError struct {
 
 func (e *RateLimitError) Error() string {
 	return fmt.Sprintf("KrakenKey API rate limit: %s (retry after %s)", e.Message, e.RetryAfter)
+}
+
+// IsClientError reports whether err is a 4xx answer other than 429: the
+// request will not succeed by repeating it.
+func IsClientError(err error) bool {
+	var nf *NotFoundError
+	var auth *AuthError
+	var apiErr *APIError
+	switch {
+	case errors.As(err, &nf), errors.As(err, &auth):
+		return true
+	case errors.As(err, &apiErr):
+		return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != 429
+	}
+	return false
 }
 
 // IssuanceFailedError means the certificate went to status failed.

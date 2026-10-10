@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/krakenkey/connector/internal/api"
 	"github.com/krakenkey/connector/internal/config"
 	"github.com/krakenkey/connector/internal/deploy"
+	execTarget "github.com/krakenkey/connector/internal/target/exec"
 	"github.com/krakenkey/connector/internal/verify"
 	"github.com/krakenkey/connector/pkg/plugin"
 )
@@ -79,6 +81,16 @@ func BuildJob(ctx context.Context, cert config.Certificate, r Resolver) (deploy.
 	if job.KeyStoreConfig, err = cert.KeyStore.SettingsJSON(); err != nil {
 		rep.Problems = append(rep.Problems, err.Error())
 	}
+	if ks != nil && ksCaps != nil {
+		problems, err := ks.Validate(ctx, plugin.KeyStoreValidateRequest{Config: job.KeyStoreConfig, CertificateID: strconv.Itoa(cert.ID)})
+		switch {
+		case plugin.IsUnsupported(err):
+		case err != nil:
+			rep.Problems = append(rep.Problems, err.Error())
+		default:
+			rep.Problems = append(rep.Problems, problems...)
+		}
+	}
 
 	for _, tc := range cert.Targets {
 		tr := TargetReport{Label: tc.Label, Plugin: tc.Plugin}
@@ -103,7 +115,9 @@ func BuildJob(ctx context.Context, cert config.Certificate, r Resolver) (deploy.
 		}
 		tj.Caps, tr.Caps = caps, &caps
 
-		if problems, err := t.Validate(ctx, tj.Settings); err != nil {
+		if problems, err := t.Validate(ctx, plugin.TargetValidateRequest{
+			Config: tj.Settings, CertificateID: strconv.Itoa(cert.ID), Label: tc.Label,
+		}); err != nil {
 			problem(err.Error())
 		} else {
 			for _, p := range problems {
@@ -122,6 +136,11 @@ func BuildJob(ctx context.Context, cert config.Certificate, r Resolver) (deploy.
 				}
 			} else {
 				tj.Format, tr.Format = f, f
+			}
+		}
+		if tc.Then != nil {
+			if p := execTarget.CommandProblem(tc.Then.Exec); p != "" {
+				problem("then.exec: " + p)
 			}
 		}
 		if v := tc.Verify; v != nil {
@@ -162,8 +181,8 @@ type RunOptions struct {
 }
 
 // RunOnce runs one pass. Certificates are independent: one failing does
-// not stop the others, except for an authentication failure, which stops
-// the pass at once.
+// not stop the others, except for an authentication failure or a rate
+// limit the client could not wait out, which stop the pass at once.
 func (c *Connector) RunOnce(ctx context.Context, opts RunOptions) error {
 	runID := newRunID()
 	log := c.Log.With("run_id", runID)
@@ -190,8 +209,7 @@ func (c *Connector) RunOnce(ctx context.Context, opts RunOptions) error {
 		if err != nil {
 			log.Error("certificate failed", "certificate_id", cert.ID, "error", err)
 			errs = append(errs, err)
-			var authErr *api.AuthError
-			if errors.As(err, &authErr) {
+			if stopsPass(err) {
 				break
 			}
 		}
@@ -223,6 +241,14 @@ func (c *Connector) Run(ctx context.Context) error {
 		case <-t.C:
 		}
 	}
+}
+
+// stopsPass reports whether err should end the pass: the API key was
+// rejected, or KrakenKey asked the connector to back off.
+func stopsPass(err error) bool {
+	var authErr *api.AuthError
+	var rl *api.RateLimitError
+	return errors.As(err, &authErr) || errors.As(err, &rl)
 }
 
 func firstProblem(r *CertReport) string {

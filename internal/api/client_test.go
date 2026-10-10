@@ -2,10 +2,17 @@ package api
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,9 +62,9 @@ func TestGetCertWithRenewAfter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	at, fromAPI, ok := cert.RenewAt()
-	if !ok || !fromAPI || !at.Equal(time.Date(2026, 12, 1, 12, 0, 0, 0, time.UTC)) {
-		t.Errorf("RenewAt = %v %v %v", at, fromAPI, ok)
+	at, source, ok := cert.RenewAt()
+	if !ok || source != RenewSourceAPI || !at.Equal(time.Date(2026, 12, 1, 12, 0, 0, 0, time.UTC)) {
+		t.Errorf("RenewAt = %v %v %v", at, source, ok)
 	}
 	if cert.ManagedBy == nil || *cert.ManagedBy != "connector" {
 		t.Errorf("managedBy = %v", cert.ManagedBy)
@@ -74,14 +81,77 @@ func TestRenewAfterFallback(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		at, fromAPI, ok := cert.RenewAt()
-		if !ok || fromAPI || !at.Equal(time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)) {
-			t.Errorf("%s: RenewAt = %v %v %v, want 30 days before expiry", body, at, fromAPI, ok)
+		at, source, ok := cert.RenewAt()
+		if !ok || source != RenewSourceExpiry || !at.Equal(time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)) {
+			t.Errorf("%s: RenewAt = %v %v %v, want 30 days before expiry", body, at, source, ok)
 		}
 	}
 	var none Cert
 	if _, _, ok := none.RenewAt(); ok {
 		t.Error("RenewAt with no dates reported ok")
+	}
+}
+
+func TestRenewAtTwoThirdsOfLifetime(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	nb := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: nb, NotAfter: nb.Add(6 * 24 * time.Hour)}
+	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	pemData := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	expires := nb.Add(6 * 24 * time.Hour)
+	c := Cert{CrtPem: pemData, ExpiresAt: &expires}
+	at, source, ok := c.RenewAt()
+	// A six-day certificate renews after four days, not 30 days before
+	// expiry (which would be before it was issued).
+	if !ok || source != RenewSourceLifetime || !at.Equal(nb.Add(4*24*time.Hour)) {
+		t.Errorf("RenewAt = %v %q %v", at, source, ok)
+	}
+}
+
+func TestRedirectsAreRefused(t *testing.T) {
+	var leaked atomic.Bool
+	other := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			leaked.Store(true)
+		}
+	}))
+	defer other.Close()
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/steal", http.StatusTemporaryRedirect)
+	})
+	_, err := c.GetCert(context.Background(), 1)
+	if err == nil || !strings.Contains(err.Error(), "unexpected redirect") {
+		t.Fatalf("err = %v", err)
+	}
+	if leaked.Load() {
+		t.Error("API key sent to the redirect target")
+	}
+}
+
+func TestWaitForIssuanceStopsOnClientErrors(t *testing.T) {
+	for _, code := range []int{http.StatusForbidden, http.StatusNotFound, http.StatusBadRequest} {
+		var calls atomic.Int32
+		c, rec := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			calls.Add(1)
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(`{"statusCode":` + strconv.Itoa(code) + `,"message":"no"}`))
+		})
+		if _, err := c.WaitForIssuance(context.Background(), 1, ""); err == nil || !IsClientError(err) {
+			t.Errorf("%d: err = %v", code, err)
+		}
+		if calls.Load() != 1 || len(rec.sleeps) != 0 {
+			t.Errorf("%d: polled %d times", code, calls.Load())
+		}
+	}
+	// A rate limit the client will not wait out ends the wait too.
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "86400")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	_, err := c.WaitForIssuance(context.Background(), 1, "")
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		t.Errorf("429: err = %v", err)
 	}
 }
 
@@ -200,6 +270,9 @@ func TestParseRetryAfter(t *testing.T) {
 		"garbage":                       defaultRetryAfter,
 		"0":                             time.Second,
 		"-5":                            time.Second,
+		"99999999999999999999":          defaultRetryAfter, // not an int64
+		"9223372036":                    maxRetryAfter,     // would overflow as a Duration
+		"Sat, 10 Oct 2099 12:00:00 GMT": maxRetryAfter,
 		"30":                            30 * time.Second,
 		"Sat, 10 Oct 2026 12:02:00 GMT": 2 * time.Minute,
 	}

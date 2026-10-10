@@ -1,11 +1,19 @@
 // Package file is the built-in target that writes PEM files into a
 // directory, for servers such as nginx, HAProxy or Caddy.
 //
+// Every file system operation goes through an os.Root opened on the target
+// directory, so symlinks cannot make the target read, write or delete
+// anything outside it. Files are created with O_EXCL and their owner and
+// mode are set on the open file descriptor before it is closed.
+//
 // Each file is replaced atomically: the new content is written to a temp
 // file in the same directory and renamed over the old one. Before that, the
-// old files are hard-linked (or copied) into
-// <dir>/.krakenkey-previous/<stage id>/ so Rollback can put them back. The
-// two most recent backups are kept.
+// old files are copied into
+// <dir>/.krakenkey-previous/<stage id>/ so Rollback can put them back.
+//
+// Retention: the two most recent backup sets are kept, and each holds a
+// copy of the private key that was live before. The backup directory must
+// be a real directory owned by the connector's user with mode 0700.
 package file
 
 import (
@@ -29,6 +37,7 @@ import (
 	"time"
 
 	"github.com/krakenkey/connector/internal/certutil"
+	"github.com/krakenkey/connector/internal/securefs"
 	"github.com/krakenkey/connector/pkg/plugin"
 )
 
@@ -98,8 +107,8 @@ func (Target) Describe(context.Context) (plugin.TargetCapabilities, error) {
 }
 
 // Validate checks the settings and that the directory exists.
-func (Target) Validate(_ context.Context, raw json.RawMessage) ([]string, error) {
-	_, problems := parse(raw)
+func (Target) Validate(_ context.Context, req plugin.TargetValidateRequest) ([]string, error) {
+	_, problems := parse(req.Config)
 	return problems, nil
 }
 
@@ -109,7 +118,13 @@ type parsed struct {
 	keyMode  fs.FileMode
 }
 
-var safeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var (
+	safeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	// idRe matches stage ids, which name staged files and backup sets.
+	idRe = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[0-9a-f]{6}$`)
+	// tempRe matches the temp files this target leaves while working.
+	tempRe = regexp.MustCompile(`^\..+\.kk-(staged|restore)-[0-9A-Za-z.\-]+$`)
+)
 
 func parse(raw json.RawMessage) (*parsed, []string) {
 	var c Config
@@ -202,23 +217,37 @@ func lookupOwner(owner string) (int, int, error) {
 func mustParse(raw json.RawMessage) (*parsed, error) {
 	p, problems := parse(raw)
 	if len(problems) > 0 {
-		return nil, errors.New("file target: " + strings.Join(problems, "; "))
+		return nil, fmt.Errorf("%w: file target: %s", plugin.ErrPermanent, strings.Join(problems, "; "))
 	}
 	return p, nil
 }
 
+// open parses the settings and opens the target directory as a Root.
+func open(raw json.RawMessage) (*parsed, *os.Root, error) {
+	p, err := mustParse(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	root, err := os.OpenRoot(p.Dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open %s: %w", p.Dir, err)
+	}
+	return p, root, nil
+}
+
 // Current returns the serial of the certificate in the cert (or fullchain)
 // file, or "" when there is none.
-func (Target) Current(_ context.Context, raw json.RawMessage) (string, error) {
-	p, err := mustParse(raw)
+func (Target) Current(_ context.Context, req plugin.CurrentRequest) (string, error) {
+	p, root, err := open(req.Config)
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = root.Close() }()
 	name := p.Files.Cert
 	if name == "" {
 		name = p.Files.FullChain
 	}
-	data, err := os.ReadFile(filepath.Join(p.Dir, name))
+	data, err := root.ReadFile(name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", nil
 	}
@@ -245,168 +274,284 @@ type previousRef struct {
 
 func stagedName(name, id string) string { return "." + name + ".kk-staged-" + id }
 
+func newID() string {
+	return time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + randomHex(3)
+}
+
 // Stage writes the new files next to the live ones under temporary names,
-// with their final mode and owner.
+// with their final mode and owner. Leftover temp files from an earlier,
+// interrupted run are removed first.
 func (Target) Stage(_ context.Context, req plugin.StageRequest) (string, error) {
-	p, err := mustParse(req.Config)
+	p, root, err := open(req.Config)
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = root.Close() }()
 	if req.Key.Format != plugin.KeyFormatPEM || len(req.Key.Data) == 0 {
-		return "", errors.New("file target needs the private key as PEM")
+		return "", fmt.Errorf("%w: file target needs the private key as PEM", plugin.ErrPermanent)
 	}
-	id := time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + randomHex(3)
+	sweepTemps(root)
+
+	id := newID()
 	contents := map[string][]byte{
 		"cert":      []byte(req.CertPEM),
 		"chain":     []byte(req.ChainPEM),
 		"fullchain": []byte(req.FullChainPEM),
 		"key":       req.Key.Data,
 	}
-	var written []string
-	cleanup := func() {
-		for _, w := range written {
-			_ = os.Remove(w)
-		}
-	}
 	for _, e := range p.Files.entries() {
 		mode := DefaultCertMode
 		if e.kind == "key" {
 			mode = p.keyMode
 		}
-		path := filepath.Join(p.Dir, stagedName(e.name, id))
-		if err := writeNew(path, contents[e.kind], mode, p.uid, p.gid); err != nil {
-			cleanup()
+		if err := writeNew(root, stagedName(e.name, id), contents[e.kind], mode, p.uid, p.gid); err != nil {
+			removeStaged(root, p, id)
 			return "", fmt.Errorf("stage %s: %w", e.name, err)
 		}
-		written = append(written, path)
 	}
 	ref, _ := json.Marshal(stagedRef{ID: id})
 	return string(ref), nil
 }
 
+// Discard removes staged files. Unknown ids are ignored.
+func (Target) Discard(_ context.Context, req plugin.DiscardRequest) error {
+	p, root, err := open(req.Config)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	var sr stagedRef
+	if err := json.Unmarshal([]byte(req.StagedRef), &sr); err != nil || !idRe.MatchString(sr.ID) {
+		return fmt.Errorf("%w: staged ref %q", plugin.ErrInvalid, req.StagedRef)
+	}
+	removeStaged(root, p, sr.ID)
+	return nil
+}
+
+func removeStaged(root *os.Root, p *parsed, id string) {
+	for _, e := range p.Files.entries() {
+		_ = root.Remove(stagedName(e.name, id))
+	}
+}
+
+// sweepTemps removes staged and restore temp files left by an interrupted
+// run. Only one connector process uses a data directory at a time, and
+// each target is staged and then activated or discarded before the next,
+// so any such file found here is stale.
+func sweepTemps(root *os.Root) {
+	d, err := root.Open(".")
+	if err != nil {
+		return
+	}
+	names, _ := d.Readdirnames(-1)
+	_ = d.Close()
+	for _, n := range names {
+		if tempRe.MatchString(n) {
+			if info, err := root.Lstat(n); err == nil && info.Mode().IsRegular() {
+				_ = root.Remove(n)
+			}
+		}
+	}
+}
+
+// backupRoot returns a Root for the backup directory, creating it if
+// needed. It must be a real directory, owned by the connector's user, with
+// no group or other access.
+func backupRoot(root *os.Root) (*os.Root, error) {
+	if err := root.Mkdir(BackupDir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return nil, fmt.Errorf("create %s: %w", BackupDir, err)
+	}
+	if err := checkPrivateDir(root, BackupDir); err != nil {
+		return nil, err
+	}
+	return root.OpenRoot(BackupDir)
+}
+
+func checkPrivateDir(root *os.Root, name string) error {
+	info, err := root.Lstat(name)
+	if err != nil {
+		return err
+	}
+	switch {
+	case info.Mode()&fs.ModeSymlink != 0 || !info.IsDir():
+		return fmt.Errorf("%w: %s must be a directory, not a symlink or file", plugin.ErrPermanent, name)
+	case !securefs.OwnedByMe(info):
+		return fmt.Errorf("%w: %s is not owned by the user running the connector", plugin.ErrPermanent, name)
+	case runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0:
+		return fmt.Errorf("%w: %s has mode %04o, want 0700", plugin.ErrPermanent, name, info.Mode().Perm())
+	}
+	return nil
+}
+
 // Activate backs up the live files and renames the staged files over them.
-func (Target) Activate(_ context.Context, raw json.RawMessage, stagedRefJSON string) (string, error) {
-	p, err := mustParse(raw)
+// On failure it restores what it already swapped and removes the staged
+// files, so the directory is never left with a mix of old and new files.
+func (Target) Activate(_ context.Context, req plugin.ActivateRequest) (prevJSON string, err error) {
+	p, root, err := open(req.Config)
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = root.Close() }()
 	var sr stagedRef
-	if err := json.Unmarshal([]byte(stagedRefJSON), &sr); err != nil || !safeName.MatchString(sr.ID) {
-		return "", fmt.Errorf("invalid staged ref %q", stagedRefJSON)
+	if err := json.Unmarshal([]byte(req.StagedRef), &sr); err != nil || !idRe.MatchString(sr.ID) {
+		return "", fmt.Errorf("%w: staged ref %q", plugin.ErrInvalid, req.StagedRef)
+	}
+	defer func() {
+		if err != nil {
+			removeStaged(root, p, sr.ID)
+		}
+	}()
+	for _, e := range p.Files.entries() {
+		if _, err := root.Lstat(stagedName(e.name, sr.ID)); err != nil {
+			return "", fmt.Errorf("%w: staged file for %s: %v", plugin.ErrNotFound, e.name, err)
+		}
 	}
 
-	backup := filepath.Join(p.Dir, BackupDir, sr.ID)
-	if err := os.MkdirAll(backup, 0o700); err != nil {
-		return "", fmt.Errorf("create backup dir: %w", err)
+	backups, err := backupRoot(root)
+	if err != nil {
+		return "", err
 	}
+	defer func() { _ = backups.Close() }()
+	if err := backups.Mkdir(sr.ID, 0o700); err != nil {
+		return "", fmt.Errorf("create backup set: %w", err)
+	}
+	set, err := backups.OpenRoot(sr.ID)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = set.Close() }()
+
 	prev := previousRef{ID: sr.ID}
 	for _, e := range p.Files.entries() {
-		live := filepath.Join(p.Dir, e.name)
-		if _, err := os.Lstat(live); errors.Is(err, fs.ErrNotExist) {
+		if _, err := root.Lstat(e.name); errors.Is(err, fs.ErrNotExist) {
 			continue
 		} else if err != nil {
 			return "", err
 		}
-		if err := preserve(live, filepath.Join(backup, e.name)); err != nil {
+		if err := preserve(root, e.name, set, e.name); err != nil {
 			return "", fmt.Errorf("back up %s: %w", e.name, err)
 		}
 		prev.Present = append(prev.Present, e.name)
 	}
-	prevJSON, _ := json.Marshal(prev)
+	_ = syncRoot(set)
+	out, _ := json.Marshal(prev)
 
 	var done []entry
 	for _, e := range p.Files.entries() {
-		if err := os.Rename(filepath.Join(p.Dir, stagedName(e.name, sr.ID)), filepath.Join(p.Dir, e.name)); err != nil {
-			// Put back whatever was already swapped, so the directory is
-			// never left with a mix of old and new files.
-			restoreErr := restore(p, prev, done)
-			for _, rest := range p.Files.entries() {
-				_ = os.Remove(filepath.Join(p.Dir, stagedName(rest.name, sr.ID)))
-			}
+		if err := root.Rename(stagedName(e.name, sr.ID), e.name); err != nil {
+			restoreErr := restore(root, set, prev, done)
 			return "", errors.Join(fmt.Errorf("activate %s: %w", e.name, err), restoreErr)
 		}
 		done = append(done, e)
 	}
-	syncDir(p.Dir)
-	pruneBackups(filepath.Join(p.Dir, BackupDir), keepBackups)
-	return string(prevJSON), nil
+	_ = syncRoot(root)
+	pruneBackups(backups, sr.ID, keepBackups)
+	return string(out), nil
 }
 
-// Rollback puts back the files that were live before Activate.
-func (Target) Rollback(_ context.Context, raw json.RawMessage, previousRefJSON string) error {
-	p, err := mustParse(raw)
+// Rollback puts back the files that were live before Activate, and removes
+// files that did not exist then.
+func (Target) Rollback(_ context.Context, req plugin.RollbackRequest) error {
+	p, root, err := open(req.Config)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = root.Close() }()
 	var prev previousRef
-	if err := json.Unmarshal([]byte(previousRefJSON), &prev); err != nil || !safeName.MatchString(prev.ID) {
-		return fmt.Errorf("invalid previous ref %q", previousRefJSON)
+	if err := json.Unmarshal([]byte(req.PreviousRef), &prev); err != nil || !idRe.MatchString(prev.ID) {
+		return fmt.Errorf("%w: previous ref %q", plugin.ErrInvalid, req.PreviousRef)
 	}
-	return restore(p, prev, p.Files.entries())
+	backups, err := backupRoot(root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = backups.Close() }()
+	if err := checkPrivateDir(backups, prev.ID); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: backup set %s", plugin.ErrNotFound, prev.ID)
+		}
+		return err
+	}
+	set, err := backups.OpenRoot(prev.ID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = set.Close() }()
+	return restore(root, set, prev, p.Files.entries())
 }
 
-func restore(p *parsed, prev previousRef, entries []entry) error {
-	backup := filepath.Join(p.Dir, BackupDir, prev.ID)
+func restore(root, set *os.Root, prev previousRef, entries []entry) error {
 	var errs []error
 	for _, e := range entries {
-		live := filepath.Join(p.Dir, e.name)
 		if !slices.Contains(prev.Present, e.name) {
-			if err := os.Remove(live); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if err := root.Remove(e.name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				errs = append(errs, err)
 			}
 			continue
 		}
-		tmp := filepath.Join(p.Dir, "."+e.name+".kk-restore-"+randomHex(3))
-		if err := preserve(filepath.Join(backup, e.name), tmp); err != nil {
+		tmp := "." + e.name + ".kk-restore-" + randomHex(3)
+		if err := preserve(set, e.name, root, tmp); err != nil {
 			errs = append(errs, fmt.Errorf("restore %s: %w", e.name, err))
 			continue
 		}
-		if err := os.Rename(tmp, live); err != nil {
-			_ = os.Remove(tmp)
+		if err := root.Rename(tmp, e.name); err != nil {
+			_ = root.Remove(tmp)
 			errs = append(errs, fmt.Errorf("restore %s: %w", e.name, err))
 		}
 	}
-	syncDir(p.Dir)
+	_ = syncRoot(root)
 	return errors.Join(errs...)
 }
 
-// preserve makes dst a copy of src with the same mode and owner, using a
-// hard link when possible.
-func preserve(src, dst string) error {
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	}
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	in, err := os.Open(src)
+// preserve makes dstName in dst a copy of srcName in src, with the same
+// mode and owner. Both names are resolved inside their roots.
+func preserve(src *os.Root, srcName string, dst *os.Root, dstName string) error {
+	in, err := src.OpenFile(srcName, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = in.Close() }()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", srcName)
+	}
 	data, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
-	uid, gid := fileOwner(info)
-	return writeNew(dst, data, info.Mode().Perm(), uid, gid)
+	uid, gid := securefs.Owner(info)
+	return writeNew(dst, dstName, data, info.Mode().Perm(), uid, gid)
 }
 
-// writeNew creates path (which must not exist) with exactly mode, sets the
-// owner, and syncs it.
-func writeNew(path string, data []byte, mode fs.FileMode, uid, gid int) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+// writeNew creates name in root (it must not exist), writes data, and sets
+// owner and mode on the open descriptor before closing it.
+func writeNew(root *os.Root, name string, data []byte, mode fs.FileMode, uid, gid int) error {
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
 	ok := false
 	defer func() {
 		if !ok {
-			_ = os.Remove(path)
+			_ = root.Remove(name)
 		}
 	}()
 	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if uid != -1 || gid != -1 {
+		if err := f.Chown(uid, gid); err != nil {
+			_ = f.Close()
+			return err
+		}
+	}
+	// After chown, which can clear setuid/setgid bits, and after writing,
+	// so the content is never readable more widely than the final mode.
+	if err := f.Chmod(mode); err != nil {
 		_ = f.Close()
 		return err
 	}
@@ -417,44 +562,45 @@ func writeNew(path string, data []byte, mode fs.FileMode, uid, gid int) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if uid != -1 || gid != -1 {
-		if err := os.Lchown(path, uid, gid); err != nil {
-			return err
-		}
-	}
-	// Set the mode after chown, which can clear setuid/setgid bits, and
-	// after writing, so the content is never readable more widely than the
-	// final mode allows.
-	if err := os.Chmod(path, mode); err != nil {
-		return err
-	}
 	ok = true
 	return nil
 }
 
-func pruneBackups(dir string, keep int) {
-	entries, err := os.ReadDir(dir)
+// pruneBackups keeps the newest keep backup sets, never removing current,
+// and only touches directories whose names are stage ids.
+func pruneBackups(backups *os.Root, current string, keep int) {
+	d, err := backups.Open(".")
 	if err != nil {
 		return
 	}
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			names = append(names, e.Name())
+	names, _ := d.Readdirnames(-1)
+	_ = d.Close()
+	var sets []string
+	for _, n := range names {
+		if !idRe.MatchString(n) {
+			continue
 		}
+		if info, err := backups.Lstat(n); err != nil || !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
+			continue
+		}
+		sets = append(sets, n)
 	}
-	slices.Sort(names) // ids start with a UTC timestamp
-	for len(names) > keep {
-		_ = os.RemoveAll(filepath.Join(dir, names[0]))
-		names = names[1:]
+	slices.Sort(sets) // ids start with a UTC timestamp
+	for len(sets) > keep {
+		if sets[0] != current {
+			_ = backups.RemoveAll(sets[0])
+		}
+		sets = sets[1:]
 	}
 }
 
-func syncDir(dir string) {
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
+func syncRoot(r *os.Root) error {
+	d, err := r.Open(".")
+	if err != nil {
+		return err
 	}
+	defer func() { _ = d.Close() }()
+	return d.Sync()
 }
 
 func randomHex(n int) string {

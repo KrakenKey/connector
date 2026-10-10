@@ -32,6 +32,7 @@ const (
 	DefaultVerifyPort    = 443
 	DefaultVerifyWindow  = 10 * time.Minute
 	DefaultThenTimeout   = 2 * time.Minute
+	DefaultCallTimeout   = 5 * time.Minute
 	MinCheckInterval     = time.Minute
 )
 
@@ -69,8 +70,11 @@ type PluginSpec struct {
 	Version string `yaml:"version"`
 	// Path overrides the binary location.
 	Path string `yaml:"path"`
-	// SHA256 is the expected checksum of the binary, hex encoded. Optional.
+	// SHA256 is the expected checksum of the binary, hex encoded. Required
+	// for plugins installed by version; optional with path.
 	SHA256 string `yaml:"sha256"`
+	// CallTimeout bounds each call to the plugin. Default 5m.
+	CallTimeout time.Duration `yaml:"call_timeout"`
 }
 
 // Certificate is one KrakenKey certificate the connector manages.
@@ -210,6 +214,12 @@ func (c *Config) applyDefaults() {
 	if c.AuditLog == "" {
 		c.AuditLog = filepath.Join(c.DataDir, "audit.jsonl")
 	}
+	for name, spec := range c.Plugins {
+		if spec.CallTimeout == 0 {
+			spec.CallTimeout = DefaultCallTimeout
+			c.Plugins[name] = spec
+		}
+	}
 	for i := range c.Certificates {
 		cert := &c.Certificates[i]
 		if cert.KeyStore.Plugin == "" {
@@ -280,6 +290,11 @@ func (c *Config) Validate() error {
 			if b, err := hex.DecodeString(spec.SHA256); err != nil || len(b) != 32 {
 				add("plugins.%s: sha256 must be 64 hex characters", name)
 			}
+		} else if spec.Path == "" {
+			add("plugins.%s: sha256 is required for plugins installed by version", name)
+		}
+		if spec.CallTimeout < time.Second {
+			add("plugins.%s: call_timeout must be at least 1s", name)
 		}
 	}
 
@@ -347,6 +362,8 @@ func (c *Config) Validate() error {
 			if t.Then != nil {
 				if len(t.Then.Exec) == 0 || t.Then.Exec[0] == "" {
 					add("%s: then.exec needs a command", tw)
+				} else if prog := t.Then.Exec[0]; !filepath.IsAbs(prog) && strings.ContainsAny(prog, `/\`) {
+					add("%s: then.exec %q is a relative path; use an absolute path or a name from PATH", tw, prog)
 				}
 				if t.Then.Timeout < 0 {
 					add("%s: then.timeout must not be negative", tw)
@@ -354,6 +371,9 @@ func (c *Config) Validate() error {
 			}
 			if v := t.Verify; v != nil {
 				errs = append(errs, v.validate(tw)...)
+				if v.Host != "" && len(cert.Names) > 0 && !coveredBy(strings.ToLower(v.Host), cert.Names) {
+					add("%s: verify: host %q is not one of the certificate's names %v", tw, v.Host, cert.Names)
+				}
 			}
 		}
 	}
@@ -418,6 +438,22 @@ func (c *Config) FindCertificate(id int) (Certificate, bool) {
 		}
 	}
 	return Certificate{}, false
+}
+
+// coveredBy reports whether host is one of names, or matches a wildcard
+// name in them for exactly one label.
+func coveredBy(host string, names []string) bool {
+	for _, n := range names {
+		if host == n {
+			return true
+		}
+		if suffix, ok := strings.CutPrefix(n, "*."); ok {
+			if label, rest, found := strings.Cut(host, "."); found && label != "" && rest == suffix {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func validDNSName(n string) bool {

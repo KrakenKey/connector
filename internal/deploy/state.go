@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"github.com/krakenkey/connector/internal/securefs"
 )
 
 // State is what the connector remembers about one certificate between
@@ -17,12 +19,20 @@ type State struct {
 	CertificateID int    `json:"certificate_id"`
 	KeyStore      string `json:"key_store"`
 	// KeyRef is the key store's reference to the key of the current
-	// certificate.
-	KeyRef       string `json:"key_ref"`
-	Serial       string `json:"serial"`
-	CertPEM      string `json:"cert_pem"`
-	ChainPEM     string `json:"chain_pem"`
-	FullChainPEM string `json:"fullchain_pem"`
+	// certificate, and KeySPKI the SHA-256 of that key's
+	// SubjectPublicKeyInfo (hex).
+	KeyRef       string    `json:"key_ref"`
+	KeySPKI      string    `json:"key_spki_sha256"`
+	Serial       string    `json:"serial"`
+	NotAfter     time.Time `json:"not_after"`
+	CertPEM      string    `json:"cert_pem"`
+	ChainPEM     string    `json:"chain_pem"`
+	FullChainPEM string    `json:"fullchain_pem"`
+	// Pending is a key whose CSR was sent to KrakenKey but whose
+	// certificate the connector has not seen yet. It is recorded before
+	// the renewal request, so a renewal that completes after the connector
+	// stopped waiting is picked up instead of renewed again.
+	Pending *PendingKey `json:"pending,omitempty"`
 	// Targets maps target labels to what is deployed there.
 	Targets map[string]TargetState `json:"targets"`
 	// RetiredKeys are earlier keys that some target may still use. They
@@ -31,12 +41,37 @@ type State struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+// PendingKey is a key with a renewal in flight.
+type PendingKey struct {
+	KeyRef    string    `json:"key_ref"`
+	SPKI      string    `json:"spki_sha256"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Deployment phases recorded while a target is being changed, so a later
+// run can finish or undo a deployment that was interrupted.
+const (
+	PhaseStaged     = "staged"     // Stage returned StagedRef
+	PhaseActivating = "activating" // Activate called, result unknown
+	PhaseActivated  = "activated"  // Activate returned PreviousRef; not verified yet
+)
+
 // TargetState is what the connector knows about one target.
 type TargetState struct {
-	// Serial is the certificate last deployed to the target successfully.
-	Serial string `json:"serial,omitempty"`
-	// PreviousRef is the target's reference from the last Activate.
-	PreviousRef string    `json:"previous_ref,omitempty"`
+	// Serial is the certificate last deployed to the target successfully,
+	// and NotAfter its expiry.
+	Serial   string    `json:"serial,omitempty"`
+	NotAfter time.Time `json:"not_after,omitzero"`
+	// Phase, DeployingSerial, StagedRef and PreviousRef describe a
+	// deployment in progress.
+	Phase           string `json:"phase,omitempty"`
+	DeployingSerial string `json:"deploying_serial,omitempty"`
+	StagedRef       string `json:"staged_ref,omitempty"`
+	PreviousRef     string `json:"previous_ref,omitempty"`
+	// Failures counts failed deployments in a row; NextAttempt is the
+	// earliest time the next one is tried.
+	Failures    int       `json:"failures,omitempty"`
+	NextAttempt time.Time `json:"next_attempt,omitzero"`
 	LastError   string    `json:"last_error,omitempty"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
@@ -46,10 +81,10 @@ type StateStore struct {
 	dir string
 }
 
-// OpenStateStore creates <dataDir>/state (0700) if needed.
+// OpenStateStore creates <dataDir>/state (0700) if needed and checks it.
 func OpenStateStore(dataDir string) (*StateStore, error) {
 	dir := filepath.Join(dataDir, "state")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := securefs.EnsurePrivateDir(dir); err != nil {
 		return nil, fmt.Errorf("state dir: %w", err)
 	}
 	return &StateStore{dir: dir}, nil
@@ -78,33 +113,13 @@ func (s *StateStore) Load(id int) (*State, error) {
 	return &st, nil
 }
 
-// Save writes the state atomically.
+// Save writes the state atomically and syncs the directory.
 func (s *StateStore) Save(st *State) error {
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(s.dir, ".state-*")
-	if err != nil {
-		return fmt.Errorf("save state: %w", err)
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp.Name(), s.path(st.CertificateID)); err != nil {
+	if err := securefs.WriteFile(s.path(st.CertificateID), data); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
 	return nil

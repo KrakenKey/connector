@@ -267,7 +267,7 @@ func (discardAudit) Write(audit.Entry) error { return nil }
 
 func TestValidateReport(t *testing.T) {
 	ca := testca.New(t)
-	_, apiSrv := newFakeKrakenKey(t, ca, 1043)
+	kk, apiSrv := newFakeKrakenKey(t, ca, 1043)
 	tmp := t.TempDir()
 	cfg := writeConfig(t, fmt.Sprintf(`
 krakenkey: { api_url: %q }
@@ -289,6 +289,8 @@ certificates:
 `, apiSrv.URL, filepath.Join(tmp, "data")))
 	host := pluginhost.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer host.Close()
+	manual := "manual"
+	kk.certs[1043].AutoRenew, kk.certs[1043].ManagedBy = true, &manual
 
 	var out bytes.Buffer
 	n := Validate(context.Background(), cfg, host, api.NewClient(cfg.KrakenKey.APIURL, "kk_test", "test"), &out)
@@ -304,12 +306,14 @@ certificates:
 		"PROBLEM: KrakenKey has no certificate 404",
 		"verify: TLS to api.example.com:443 with SNI api.example.com, window 10m0s, chain checked against system roots",
 		"target hook (exec): key as pem, rollback supported",
+		"WARNING: KrakenKey also renews certificate 1043 on its own (autoRenew is on)",
+		`WARNING: KrakenKey reports certificate 1043 as managed by "manual"`,
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report does not contain %q", want)
 		}
 	}
-	if n != 4 || !strings.Contains(report, "4 problem(s), 1 warning(s)") {
+	if n != 4 || !strings.Contains(report, "4 problem(s), 3 warning(s)") {
 		t.Errorf("problems = %d\n%s", n, report)
 	}
 }

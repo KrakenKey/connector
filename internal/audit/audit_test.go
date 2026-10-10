@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,5 +66,47 @@ func TestLogAppendsJSONLines(t *testing.T) {
 		if info.Mode().Perm() != 0o600 {
 			t.Errorf("mode %o, want 600", info.Mode().Perm())
 		}
+	}
+}
+
+func TestLogScrubsSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := make([]byte, 5000)
+	for i := range long {
+		long[i] = 'x'
+	}
+	_ = l.Write(Entry{Step: StepThen, Result: ResultFailed,
+		Error:  "hook printed -----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMG\n-----END PRIVATE KEY----- and kk_live_abcdefghijkl",
+		Detail: string(long)})
+	_ = l.Close()
+	data, _ := os.ReadFile(path)
+	if strings.Contains(string(data), "MIGHAgEAMBMG") || strings.Contains(string(data), "abcdefghijkl") {
+		t.Errorf("secret reached the audit log: %s", data)
+	}
+	if len(data) > 3000 {
+		t.Errorf("entry not capped: %d bytes", len(data))
+	}
+}
+
+func TestOpenRefusesLoosePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits")
+	}
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chmod(path, 0o644)
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+		t.Errorf("err = %v", err)
+	}
+	link := filepath.Join(t.TempDir(), "link.jsonl")
+	_ = os.Symlink(path, link)
+	if _, err := Open(link); err == nil {
+		t.Error("Open followed a symlink")
 	}
 }

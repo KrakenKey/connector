@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -64,7 +67,7 @@ func TestRunNeedsAPIKey(t *testing.T) {
 	t.Setenv("KK_API_URL", "")
 	var out, errOut bytes.Buffer
 	code := run([]string{"run", "--once", "--config", writeConfig(t)}, &out, &errOut)
-	if code != exitUsage || !strings.Contains(errOut.String(), "KK_API_KEY is not set") {
+	if code != exitUsage || !strings.Contains(errOut.String(), "no API key") {
 		t.Errorf("exit %d, stderr %s", code, errOut.String())
 	}
 }
@@ -109,5 +112,78 @@ func TestValidateInvalidConfig(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "INVALID") {
 		t.Errorf("output %q", out.String())
+	}
+}
+
+func TestAPIKeySources(t *testing.T) {
+	t.Setenv("KK_API_KEY", "kk_from_env")
+	t.Setenv("KK_API_KEY_FILE", "")
+	t.Setenv("CREDENTIALS_DIRECTORY", "")
+	key, src, err := loadAPIKey(nil)
+	if err != nil || key != "kk_from_env" || src != "KK_API_KEY" {
+		t.Errorf("env: %q %q %v", key, src, err)
+	}
+	if os.Getenv("KK_API_KEY") != "" {
+		t.Error("KK_API_KEY left in the environment")
+	}
+
+	dir := t.TempDir()
+	cred := filepath.Join(dir, "kk_api_key")
+	_ = os.WriteFile(cred, []byte("kk_from_credential\n"), 0o400)
+	t.Setenv("CREDENTIALS_DIRECTORY", dir)
+	t.Setenv("KK_API_KEY", "kk_from_env")
+	key, src, err = loadAPIKey(nil)
+	if err != nil || key != "kk_from_credential" || !strings.Contains(src, cred) {
+		t.Errorf("credential: %q %q %v", key, src, err)
+	}
+
+	file := filepath.Join(t.TempDir(), "key")
+	_ = os.WriteFile(file, []byte(" kk_from_file "), 0o600)
+	t.Setenv("KK_API_KEY_FILE", file)
+	key, _, err = loadAPIKey(nil)
+	if err != nil || key != "kk_from_file" {
+		t.Errorf("file: %q %v", key, err)
+	}
+
+	_ = os.Chmod(file, 0o644)
+	if _, _, err := loadAPIKey(nil); err == nil || !strings.Contains(err.Error(), "readable by other users") {
+		t.Errorf("world-readable key file: %v", err)
+	}
+	t.Setenv("KK_API_KEY_FILE", filepath.Join(dir, "missing"))
+	if _, _, err := loadAPIKey(nil); err == nil {
+		t.Error("missing key file accepted")
+	}
+}
+
+func TestRunOnceExitCodes(t *testing.T) {
+	cases := map[string]struct {
+		status int
+		header map[string]string
+		want   int
+	}{
+		"certificate error": {http.StatusNotFound, nil, exitFailed},
+		"key rejected":      {http.StatusUnauthorized, nil, exitAuth},
+		"rate limited":      {http.StatusTooManyRequests, map[string]string{"Retry-After": "86400"}, exitRateLimit},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				for k, v := range c.header {
+					w.Header().Set(k, v)
+				}
+				w.WriteHeader(c.status)
+				_, _ = w.Write([]byte(`{"statusCode":` + strconv.Itoa(c.status) + `,"message":"x"}`))
+			}))
+			defer srv.Close()
+			t.Setenv("KK_API_KEY", "kk_test")
+			t.Setenv("KK_API_KEY_FILE", "")
+			t.Setenv("CREDENTIALS_DIRECTORY", "")
+			t.Setenv("KK_API_URL", srv.URL)
+			var out, errOut bytes.Buffer
+			code := run([]string{"run", "--once", "--config", writeConfig(t)}, &out, &errOut)
+			if code != c.want {
+				t.Errorf("exit %d, want %d\n%s", code, c.want, errOut.String())
+			}
+		})
 	}
 }

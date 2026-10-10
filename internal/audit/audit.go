@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/krakenkey/connector/internal/redact"
+	"github.com/krakenkey/connector/internal/securefs"
 )
 
 // Steps.
@@ -18,7 +21,10 @@ const (
 	StepRenew     = "renew"
 	StepIssued    = "issued"
 	StepComplete  = "complete"
+	StepExport    = "export_key"
 	StepStage     = "stage"
+	StepDiscard   = "discard"
+	StepRecover   = "recover"
 	StepActivate  = "activate"
 	StepThen      = "then"
 	StepVerify    = "verify"
@@ -66,17 +72,32 @@ type Log struct {
 }
 
 // Open opens (or creates) the audit log at path with mode 0600, creating
-// its directory with mode 0700 when missing.
+// its directory with mode 0700 when missing. An existing log must be a
+// regular file owned by the connector's user with no group or other
+// access.
 func Open(path string) (*Log, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("audit log: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if _, err := os.Lstat(path); err == nil {
+		if err := securefs.CheckPrivate(path); err != nil {
+			return nil, fmt.Errorf("audit log: %w", err)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND|syscallNoFollow, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("audit log: %w", err)
 	}
 	return &Log{f: f, now: time.Now}, nil
 }
+
+// maxField caps the error and detail text kept per entry.
+const maxField = 1024
+
+// Scrub removes private keys and KrakenKey API keys from s and caps its
+// length. Command output and plugin errors pass through it before they
+// reach the audit log.
+func Scrub(s string) string { return redact.Limit(redact.String(s), maxField) }
 
 // Write appends e. A zero Time is set to now.
 func (l *Log) Write(e Entry) error {
@@ -85,6 +106,7 @@ func (l *Log) Write(e Entry) error {
 	if e.Time.IsZero() {
 		e.Time = l.now().UTC()
 	}
+	e.Error, e.Detail = Scrub(e.Error), Scrub(e.Detail)
 	line, err := json.Marshal(e)
 	if err != nil {
 		return err

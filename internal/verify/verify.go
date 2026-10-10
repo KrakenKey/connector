@@ -4,6 +4,7 @@
 package verify
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -22,8 +23,8 @@ type Request struct {
 	Host string
 	// Address is the host:port to dial.
 	Address string
-	// Expected is the issued leaf. The served leaf must have the same serial
-	// number and public key.
+	// Expected is the issued leaf. The served leaf must be identical to it
+	// (same DER bytes, so the same serial number and public key).
 	Expected *x509.Certificate
 	// Window is how long to keep retrying while the old certificate is
 	// still served or the endpoint is unreachable. Zero means one attempt.
@@ -49,7 +50,7 @@ type MismatchError struct {
 func (e *MismatchError) Error() string {
 	switch {
 	case e.SameSerial:
-		return fmt.Sprintf("%s (SNI %s) serves serial %s with a different public key than the issued certificate",
+		return fmt.Sprintf("%s (SNI %s) serves serial %s, but not the issued certificate (different contents or public key)",
 			e.Address, e.Host, e.ServedSerial)
 	case e.ServedSerial != "":
 		return fmt.Sprintf("%s (SNI %s) still serves serial %s, want %s", e.Address, e.Host, e.ServedSerial, e.WantSerial)
@@ -119,8 +120,9 @@ func (v *Verifier) Verify(ctx context.Context, req Request) error {
 		if err == nil {
 			leaf := chain[0]
 			served := certutil.SerialHex(leaf.SerialNumber)
-			sameKey := certutil.SamePublicKey(req.Expected.PublicKey, leaf.PublicKey)
-			if served == want && sameKey {
+			// The served leaf must be byte for byte the issued certificate,
+			// which also pins its serial number and public key.
+			if bytes.Equal(leaf.Raw, req.Expected.Raw) {
 				if req.SkipChainValidation {
 					return nil
 				}

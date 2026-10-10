@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,14 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 				bad("%s", p)
 			}
 			tc := cert.Targets[i]
+			if t.Plugin != "" && t.Caps != nil {
+				if tg, err := r.Target(t.Plugin); err == nil {
+					settings, _ := tc.SettingsJSON()
+					if cur, err := tg.Current(ctx, plugin.CurrentRequest{Config: settings, CertificateID: strconv.Itoa(cert.ID), Label: tc.Label}); err == nil && cur != "" {
+						fmt.Fprintf(w, "    installed now: serial %s\n", cur)
+					}
+				}
+			}
 			if tc.Then != nil {
 				fmt.Fprintf(w, "    then: %s (timeout %s)\n", strings.Join(tc.Then.Exec, " "), tc.Then.Timeout)
 			}
@@ -111,14 +120,20 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 		if c.ExpiresAt != nil {
 			fmt.Fprintf(w, ", expires %s", c.ExpiresAt.UTC().Format(time.RFC3339))
 		}
-		if at, fromAPI, ok := c.RenewAt(); ok {
-			src := "renewAfter"
-			if !fromAPI {
-				src = "30 days before expiry; API sent no renewAfter"
-			}
-			fmt.Fprintf(w, ", renew after %s (%s)", at.UTC().Format(time.RFC3339), src)
+		if at, source, ok := c.RenewAt(); ok {
+			fmt.Fprintf(w, ", renew after %s (%s)", at.UTC().Format(time.RFC3339), source)
+		} else {
+			fmt.Fprint(w, ", renewal time unknown")
 		}
 		fmt.Fprintln(w)
+		if c.AutoRenew {
+			warnings++
+			fmt.Fprintf(w, "  WARNING: KrakenKey also renews certificate %d on its own (autoRenew is on). The connector adopts those renewals, but turn auto-renewal off so renewals happen only on the connector's schedule.\n", cert.ID)
+		}
+		if c.ManagedBy != nil && *c.ManagedBy != "connector" {
+			warnings++
+			fmt.Fprintf(w, "  WARNING: KrakenKey reports certificate %d as managed by %q, not by a connector.\n", cert.ID, *c.ManagedBy)
+		}
 		if c.Status == api.StatusRevoked {
 			bad("certificate %d is revoked", cert.ID)
 		}

@@ -31,17 +31,17 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"time"
 
 	"github.com/krakenkey/connector/internal/certutil"
+	"github.com/krakenkey/connector/internal/securefs"
 	"github.com/krakenkey/connector/pkg/plugin"
 )
 
 // ErrInsecurePermissions means a directory or key file is accessible to
 // users other than the owner.
-var ErrInsecurePermissions = errors.New("insecure permissions")
+var ErrInsecurePermissions = securefs.ErrInsecure
 
 // SupportedKeyTypes are the key types this key store creates.
 var SupportedKeyTypes = []plugin.KeyType{
@@ -63,56 +63,20 @@ var _ plugin.KeyStore = (*Store)(nil)
 
 // Open prepares the key directory under dataDir, creating it with mode
 // 0700 when missing, and refuses to continue if dataDir, any directory
-// below keys/, or any key file is readable or writable by group or others.
+// below keys/, or any key file is a symlink, owned by another user, or
+// readable or writable by group or others.
 func Open(dataDir string) (*Store, error) {
-	if err := ensureDir(dataDir); err != nil {
+	if err := securefs.EnsurePrivateDir(dataDir); err != nil {
 		return nil, err
 	}
 	dir := filepath.Join(dataDir, "keys")
-	if err := ensureDir(dir); err != nil {
+	if err := securefs.EnsurePrivateDir(dir); err != nil {
 		return nil, err
 	}
-	if err := checkTree(dir); err != nil {
+	if err := securefs.CheckTree(dir); err != nil {
 		return nil, err
 	}
 	return &Store{dir: dir, now: time.Now}, nil
-}
-
-func ensureDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
-	}
-	return checkPerm(dir)
-}
-
-func checkPerm(path string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&fs.ModeSymlink != 0 {
-		return fmt.Errorf("%w: %s is a symlink", ErrInsecurePermissions, path)
-	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		want := "600"
-		if info.IsDir() {
-			want = "700"
-		}
-		return fmt.Errorf("%w: %s has mode %04o; run: chmod %s %s", ErrInsecurePermissions, path, perm, want, path)
-	}
-	return nil
-}
-
-func checkTree(root string) error {
-	return filepath.WalkDir(root, func(path string, _ fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		return checkPerm(path)
-	})
 }
 
 // Describe reports PEM keys that can be exported.
@@ -124,16 +88,24 @@ func (s *Store) Describe(context.Context) (plugin.KeyStoreCapabilities, error) {
 	}, nil
 }
 
+// Validate rejects any settings: the local key store has none.
+func (s *Store) Validate(_ context.Context, req plugin.KeyStoreValidateRequest) ([]string, error) {
+	if err := noSettings(req.Config); err != nil {
+		return []string{err.Error()}, nil
+	}
+	return nil, nil
+}
+
 // CreateCSR generates a key, stores it, and returns a CSR for names.
 func (s *Store) CreateCSR(_ context.Context, req plugin.CSRRequest) (plugin.CSR, error) {
 	if err := noSettings(req.Config); err != nil {
-		return plugin.CSR{}, err
+		return plugin.CSR{}, fmt.Errorf("%w: %v", plugin.ErrPermanent, err)
 	}
 	if !certIDRe.MatchString(req.CertificateID) {
-		return plugin.CSR{}, fmt.Errorf("invalid certificate id %q", req.CertificateID)
+		return plugin.CSR{}, fmt.Errorf("%w: certificate id %q", plugin.ErrInvalid, req.CertificateID)
 	}
 	if len(req.Names) == 0 {
-		return plugin.CSR{}, errors.New("no names for the CSR")
+		return plugin.CSR{}, fmt.Errorf("%w: no names for the CSR", plugin.ErrInvalid)
 	}
 	key, err := generate(req.KeyType)
 	if err != nil {
@@ -152,18 +124,53 @@ func (s *Store) CreateCSR(_ context.Context, req plugin.CSRRequest) (plugin.CSR,
 	}
 
 	certDir := filepath.Join(s.dir, req.CertificateID)
-	if err := ensureDir(certDir); err != nil {
+	if err := securefs.EnsurePrivateDir(certDir); err != nil {
 		return plugin.CSR{}, err
 	}
 	keyID := s.now().UTC().Format("20060102T150405Z") + "-" + randomHex(4)
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	if err := writeFile(filepath.Join(certDir, keyID+".key"), keyPEM); err != nil {
+	if err := securefs.WriteFile(filepath.Join(certDir, keyID+".key"), keyPEM); err != nil {
 		return plugin.CSR{}, err
 	}
 	return plugin.CSR{
 		PEM:    string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})),
 		KeyRef: req.CertificateID + "/" + keyID,
 	}, nil
+}
+
+// PublicKey returns the key's SubjectPublicKeyInfo.
+func (s *Store) PublicKey(_ context.Context, req plugin.PublicKeyRequest) ([]byte, error) {
+	keyPath, err := s.path(req.KeyRef, ".key")
+	if err != nil {
+		return nil, err
+	}
+	key, err := readKey(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	return x509.MarshalPKIXPublicKey(key.Public())
+}
+
+// KeyRefs lists the keys stored for a certificate. The core uses it to
+// remove keys that its state no longer refers to.
+func (s *Store) KeyRefs(certificateID string) ([]string, error) {
+	if !certIDRe.MatchString(certificateID) {
+		return nil, fmt.Errorf("%w: certificate id %q", plugin.ErrInvalid, certificateID)
+	}
+	entries, err := os.ReadDir(filepath.Join(s.dir, certificateID))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var refs []string
+	for _, e := range entries {
+		if id, ok := strings.CutSuffix(e.Name(), ".key"); ok && keyIDRe.MatchString(id) {
+			refs = append(refs, certificateID+"/"+id)
+		}
+	}
+	return refs, nil
 }
 
 // Complete stores the issued certificate next to its key, after checking
@@ -182,10 +189,10 @@ func (s *Store) Complete(_ context.Context, req plugin.CompleteRequest) (string,
 		return "", err
 	}
 	if !certutil.SamePublicKey(key.Public(), leaf.PublicKey) {
-		return "", errors.New("certificate does not match the stored key")
+		return "", fmt.Errorf("%w: certificate does not match the stored key", plugin.ErrPermanent)
 	}
 	crtPath := strings.TrimSuffix(keyPath, ".key") + ".crt"
-	if err := writeFile(crtPath, []byte(strings.TrimSpace(req.CertPEM)+"\n"+strings.TrimSpace(req.ChainPEM)+"\n")); err != nil {
+	if err := securefs.WriteFile(crtPath, []byte(strings.TrimSpace(req.CertPEM)+"\n"+strings.TrimSpace(req.ChainPEM)+"\n")); err != nil {
 		return "", err
 	}
 	return req.KeyRef, nil
@@ -194,13 +201,16 @@ func (s *Store) Complete(_ context.Context, req plugin.CompleteRequest) (string,
 // Export returns the key as PKCS#8 PEM. PFX is not supported.
 func (s *Store) Export(_ context.Context, req plugin.ExportRequest) (plugin.KeyMaterial, error) {
 	if req.Format != plugin.KeyFormatPEM {
-		return plugin.KeyMaterial{}, fmt.Errorf("local key store exports only pem, not %q", req.Format)
+		return plugin.KeyMaterial{}, fmt.Errorf("%w: local key store exports only pem, not %q", plugin.ErrPermanent, req.Format)
 	}
 	keyPath, err := s.path(req.KeyRef, ".key")
 	if err != nil {
 		return plugin.KeyMaterial{}, err
 	}
-	if err := checkPerm(keyPath); err != nil {
+	if err := securefs.CheckPrivate(keyPath); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return plugin.KeyMaterial{}, fmt.Errorf("%w: key %s", plugin.ErrNotFound, req.KeyRef)
+		}
 		return plugin.KeyMaterial{}, err
 	}
 	data, err := os.ReadFile(keyPath)
@@ -221,7 +231,7 @@ func (s *Store) Release(_ context.Context, req plugin.ReleaseRequest) error {
 			return fmt.Errorf("release key %s: %w", req.KeyRef, err)
 		}
 	}
-	return nil
+	return securefs.SyncDir(filepath.Dir(keyPath))
 }
 
 // path maps a key ref to a file, rejecting anything that is not a ref this
@@ -229,7 +239,7 @@ func (s *Store) Release(_ context.Context, req plugin.ReleaseRequest) error {
 func (s *Store) path(ref, ext string) (string, error) {
 	certID, keyID, ok := strings.Cut(ref, "/")
 	if !ok || !certIDRe.MatchString(certID) || !keyIDRe.MatchString(keyID) {
-		return "", fmt.Errorf("invalid key ref %q", ref)
+		return "", fmt.Errorf("%w: key ref %q", plugin.ErrInvalid, ref)
 	}
 	return filepath.Join(s.dir, certID, keyID+ext), nil
 }
@@ -259,11 +269,14 @@ func generate(kt plugin.KeyType) (crypto.Signer, error) {
 	case plugin.KeyTypeRSA3072:
 		return rsa.GenerateKey(rand.Reader, 3072)
 	}
-	return nil, fmt.Errorf("local key store cannot create %q keys", kt)
+	return nil, fmt.Errorf("%w: local key store cannot create %q keys", plugin.ErrPermanent, kt)
 }
 
 func readKey(path string) (crypto.Signer, error) {
 	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%w: key file %s", plugin.ErrNotFound, filepath.Base(path))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read key: %w", err)
 	}
@@ -280,32 +293,6 @@ func readKey(path string) (crypto.Signer, error) {
 		return nil, fmt.Errorf("key %s cannot sign", path)
 	}
 	return signer, nil
-}
-
-// writeFile writes data to path with mode 0600 through a temp file and
-// rename, so a crash never leaves a half-written key.
-func writeFile(path string, data []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
 }
 
 func randomHex(n int) string {
