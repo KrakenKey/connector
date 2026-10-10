@@ -8,6 +8,15 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+### Added
+
+- `azure-keyvault` key store plugin (`plugins/azure-keyvault`): Azure Key
+  Vault creates the key and the CSR and keeps the issued certificate, so the
+  key leaves the vault only for exportable certificates whose targets need
+  PEM or PFX. Targets such as Application Gateway get the versioned secret id.
+  Plugin modules live under `plugins/`, with a `go.work` workspace for local
+  development; CI tests and lints each plugin module.
+
 ## [v0.1.0] - 2026-10-10
 
 First release.
