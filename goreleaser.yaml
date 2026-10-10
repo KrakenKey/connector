@@ -8,6 +8,7 @@ builds:
     binary: krakenkey-connector
     env:
       - CGO_ENABLED=0
+      - GOWORK=off
     flags:
       - -trimpath
     ldflags:
@@ -22,14 +23,104 @@ builds:
       - amd64
       - arm64
 
+  # The plugins maintained in this repository. Each is its own Go module and
+  # is built from its own go.mod (GOWORK=off), with the same version as the
+  # connector: a release tag ships the connector and these plugins together.
+  - id: plugin-aws-acm
+    dir: plugins/aws-acm
+    main: ./cmd/krakenkey-connector-plugin-aws-acm
+    binary: krakenkey-connector-plugin-aws-acm
+    env:
+      - CGO_ENABLED=0
+      - GOWORK=off
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+  - id: plugin-azure-keyvault
+    dir: plugins/azure-keyvault
+    main: ./cmd/krakenkey-connector-plugin-azure-keyvault
+    binary: krakenkey-connector-plugin-azure-keyvault
+    env:
+      - CGO_ENABLED=0
+      - GOWORK=off
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+  - id: plugin-azure-appgateway
+    dir: plugins/azure-appgateway
+    main: ./cmd/krakenkey-connector-plugin-azure-appgateway
+    binary: krakenkey-connector-plugin-azure-appgateway
+    env:
+      - CGO_ENABLED=0
+      - GOWORK=off
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
 archives:
   - id: connector
+    ids: [connector]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
     files:
       - LICENSE
       - README.md
       - CHANGELOG.md
+
+  # One archive per plugin and platform, so a host downloads and installs
+  # only the plugins it runs. checksums.txt covers these too.
+  - id: plugin-aws-acm
+    ids: [plugin-aws-acm]
+    name_template: "krakenkey-connector-plugin-aws-acm_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - src: plugins/aws-acm/README.md
+        strip_parent: true
+
+  - id: plugin-azure-keyvault
+    ids: [plugin-azure-keyvault]
+    name_template: "krakenkey-connector-plugin-azure-keyvault_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - src: plugins/azure-keyvault/README.md
+        strip_parent: true
+
+  - id: plugin-azure-appgateway
+    ids: [plugin-azure-appgateway]
+    name_template: "krakenkey-connector-plugin-azure-appgateway_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - src: plugins/azure-appgateway/README.md
+        strip_parent: true
 
 checksum:
   name_template: checksums.txt
@@ -51,10 +142,19 @@ signs:
 
 dockers_v2:
   - id: connector
-    ids: [connector]
+    # The image carries the plugins too, under
+    # /usr/lib/krakenkey-connector/plugins/<name>/<version>/, with a
+    # plugins.lock that Dockerfile.goreleaser writes from these binaries.
+    ids:
+      - connector
+      - plugin-aws-acm
+      - plugin-azure-keyvault
+      - plugin-azure-appgateway
     images:
       - ghcr.io/krakenkey/connector
     dockerfile: Dockerfile.goreleaser
+    build_args:
+      VERSION: "{{ .Version }}"
     platforms:
       - linux/amd64
       - linux/arm64
