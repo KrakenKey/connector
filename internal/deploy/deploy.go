@@ -141,6 +141,31 @@ func (e *RejectedError) Error() string {
 	return "issued certificate rejected, nothing deployed: " + e.Reason
 }
 
+// BlocksDeployment marks a rejection as a failure on the connector's side.
+func (e *RejectedError) BlocksDeployment() bool { return true }
+
+// BlockedError wraps a failure on the connector's side (key store, config)
+// that kept a certificate from being renewed or deployed. Status reports
+// show such failures as failed deployments. Failures on KrakenKey's side
+// (issuance failed, API errors) are not BlockedErrors.
+type BlockedError struct{ Err error }
+
+func (e *BlockedError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the wrapped error.
+func (e *BlockedError) Unwrap() error { return e.Err }
+
+// BlocksDeployment marks the error as a failure on the connector's side.
+func (e *BlockedError) BlocksDeployment() bool { return true }
+
+// IsBlocked reports whether err, or an error it wraps, is a failure on the
+// connector's side that kept a certificate from being deployed: any error
+// with a BlocksDeployment method that returns true.
+func IsBlocked(err error) bool {
+	var b interface{ BlocksDeployment() bool }
+	return errors.As(err, &b) && b.BlocksDeployment()
+}
+
 func (e *Engine) now() time.Time {
 	if e.Now != nil {
 		return e.Now()
@@ -326,7 +351,7 @@ func (r *run) renew(ctx context.Context, cert *api.Cert, oldSerial, reason strin
 		KeyType:       job.Cert.KeyStore.KeyType,
 	})
 	if err != nil {
-		return fail(audit.StepCreateCSR, err)
+		return fail(audit.StepCreateCSR, &BlockedError{Err: err})
 	}
 	req, err := certutil.ParseCSR(csr.PEM)
 	if err == nil && !certutil.SameNames(certutil.CSRNames(req), job.Cert.Names) {
@@ -334,7 +359,7 @@ func (r *run) renew(ctx context.Context, cert *api.Cert, oldSerial, reason strin
 	}
 	if err != nil {
 		r.releaseKey(ctx, csr.KeyRef, "unused key from a bad CSR")
-		return fail(audit.StepCreateCSR, fmt.Errorf("key store returned a bad CSR: %w", err))
+		return fail(audit.StepCreateCSR, &BlockedError{Err: fmt.Errorf("key store returned a bad CSR: %w", err)})
 	}
 	a := r.entry(audit.StepCreateCSR, audit.ResultOK)
 	a.Detail = reason
@@ -417,7 +442,7 @@ func (r *run) finishIssued(ctx context.Context, issued *api.Cert, keyRef, spki s
 	} else if errors.Is(err, plugin.ErrNotFound) {
 		return reject("the key store no longer holds the key for this certificate")
 	} else if !plugin.IsUnsupported(err) {
-		return err
+		return &BlockedError{Err: fmt.Errorf("key store: %w", err)}
 	}
 
 	fullChain := r.fullChain(ctx, issued, leaf)
@@ -428,7 +453,7 @@ func (r *run) finishIssued(ctx context.Context, issued *api.Cert, keyRef, spki s
 		a := r.entry(audit.StepComplete, audit.ResultFailed)
 		a.Error = err.Error()
 		_ = r.e.audit(a)
-		return err
+		return &BlockedError{Err: err}
 	}
 
 	if st.KeyRef != "" && st.KeyRef != newRef && !slices.Contains(st.RetiredKeys, st.KeyRef) {

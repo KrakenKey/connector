@@ -164,8 +164,21 @@ type ReportTarget struct {
 // ReportTime formats t for ReportTarget.UpdatedAt.
 func ReportTime(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
 
+// ReportResult is KrakenKey's answer to a report. Certificates the
+// connector may not manage are skipped and listed in
+// RejectedCertificateIDs; the rest are stored.
+type ReportResult struct {
+	Accepted               int   `json:"accepted"`
+	RejectedCertificateIDs []int `json:"rejectedCertificateIds"`
+}
+
 // Report sends the connector's deployment status. KrakenKey accepts it
-// only with a key issued to a connector.
-func (c *Client) Report(ctx context.Context, r Report) error {
-	return c.do(ctx, http.MethodPost, "/connectors/report", r, nil)
+// only with a key issued to a connector. Any 2xx is success; an empty
+// answer (204) gives an empty result.
+func (c *Client) Report(ctx context.Context, r Report) (*ReportResult, error) {
+	var res ReportResult
+	if err := c.do(ctx, http.MethodPost, "/connectors/report", r, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
 }

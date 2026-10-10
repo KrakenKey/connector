@@ -226,7 +226,8 @@ token exchange works.
 
 After every pass, failed ones included, an enrolled connector tells
 KrakenKey what is deployed where, so the dashboard can show it and alert on
-failures. For each configured certificate and target it sends:
+failures. The report covers the certificates the pass processed (all of
+them, or the one given with `--cert`). For each of their targets it sends:
 
 - the state: `pending` (nothing deployed yet, or a newer certificate is
   waiting to be deployed), `staged`, `activated` (not verified yet),
@@ -238,11 +239,22 @@ failures. For each configured certificate and target it sends:
   most 200 characters;
 - when that state was recorded.
 
+When something on the connector's side keeps a certificate from being
+renewed or deployed (a key store error, a config problem, an issued
+certificate that fails the connector's checks), every target of that
+certificate is reported as `failed`, so KrakenKey alerts. When the problem
+is on KrakenKey's side, such as an issuance that failed because of a
+missing DNS record, the targets stay `pending` with the error: KrakenKey
+alerts on those itself.
+
 The report comes from the connector's state files. It carries no key
-material and nothing about your systems beyond target labels. A report that
-cannot be sent is logged as a warning; it never changes the outcome or exit
-code of a pass. When the pass stopped because KrakenKey refused the
-credentials or asked the connector to back off, no report is sent.
+material and nothing about your systems beyond target labels. If KrakenKey
+skips certificates the connector is not allowed to manage, the connector
+logs a warning with their ids: check the ids in the config and the
+connector's restrictions in the dashboard. A report that cannot be sent is
+logged as a warning; it never changes the outcome or exit code of a pass.
+When the pass stopped because KrakenKey refused the credentials or asked
+the connector to back off, no report is sent.
 
 Connectors that use an API key instead of enrolment do not report.
 

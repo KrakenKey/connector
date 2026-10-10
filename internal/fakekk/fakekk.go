@@ -49,6 +49,12 @@ type Server struct {
 	// ReportStatus, if set, is returned by /connectors/report instead of
 	// storing the report.
 	ReportStatus int
+	// RejectCertificateIDs are certificates the connector may not manage:
+	// /connectors/report skips them and lists them in its answer.
+	RejectCertificateIDs map[int]bool
+	// ReportNoContent makes /connectors/report answer 204 with no body,
+	// as an earlier version of the contract had it.
+	ReportNoContent bool
 
 	mu          sync.Mutex
 	tokens      map[string]string // enrolment token -> connector name
@@ -343,11 +349,17 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(body["certificates"], &certs); err != nil || len(certs) > 500 {
 		s.t.Errorf("report: certificates: %v (%d)", err, len(certs))
 	}
+	accepted, rejected := 0, []int{}
 	for _, c := range certs {
 		allowed(s.t, "report certificate", c, "certificateId", "targets")
 		var id int
 		if json.Unmarshal(c["certificateId"], &id) != nil || id <= 0 {
 			s.t.Errorf("report: certificateId %s", c["certificateId"])
+		}
+		if s.RejectCertificateIDs[id] {
+			rejected = append(rejected, id)
+		} else {
+			accepted++
 		}
 		var targets []map[string]json.RawMessage
 		if err := json.Unmarshal(c["targets"], &targets); err != nil || targets == nil || len(targets) > 50 {
@@ -384,7 +396,11 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.reports = append(s.reports, raw)
-	w.WriteHeader(http.StatusNoContent)
+	if s.ReportNoContent {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accepted": accepted, "rejectedCertificateIds": rejected})
 }
 
 func allowed(t *testing.T, what string, m map[string]json.RawMessage, keys ...string) {

@@ -1041,3 +1041,27 @@ func TestOutcomesAreRecorded(t *testing.T) {
 		})
 	}
 }
+
+func TestBlockedFailures(t *testing.T) {
+	cases := map[string]struct {
+		prepare func(e *env)
+		blocked bool
+	}{
+		"key store cannot create the key": {func(e *env) { e.job.Cert.KeyStore.KeyType = plugin.KeyTypeRSA2048 }, true},
+		"issued certificate rejected":     {func(e *env) { e.api.issueNames = []string{"evil.example.com"} }, true},
+		"issuance failed in KrakenKey":    {func(e *env) { e.api.failIssue = "CNAME missing" }, false},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t, "a")
+			c.prepare(e)
+			err := e.process(t, false)
+			if err == nil || IsBlocked(err) != c.blocked {
+				t.Errorf("IsBlocked(%v) = %v, want %v", err, IsBlocked(err), c.blocked)
+			}
+		})
+	}
+	if IsBlocked(nil) || IsBlocked(errors.New("x")) || !IsBlocked(fmt.Errorf("wrapped: %w", &BlockedError{Err: errors.New("x")})) {
+		t.Error("IsBlocked on plain errors")
+	}
+}

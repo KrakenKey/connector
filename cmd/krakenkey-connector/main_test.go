@@ -457,6 +457,27 @@ func TestRunReportsStatusWhenEnrolled(t *testing.T) {
 		t.Errorf("targets %+v", tg)
 	}
 
+	// Certificates the connector may not manage are named in a warning.
+	srv.RejectCertificateIDs = map[int]bool{7: true}
+	errOut.Reset()
+	if code := run([]string{"run", "--once", "--config", cfg}, &out, &errOut); code != exitFailed {
+		t.Errorf("exit %d with a rejected certificate\n%s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "not allowed to manage them") || !strings.Contains(errOut.String(), "certificate_ids=[7]") {
+		t.Errorf("no warning about the rejected certificate\n%s", errOut.String())
+	}
+
+	// An empty 204 answer is still success.
+	srv.RejectCertificateIDs, srv.ReportNoContent = nil, true
+	errOut.Reset()
+	_ = run([]string{"run", "--once", "--config", cfg}, &out, &errOut)
+	if strings.Contains(errOut.String(), "could not report") || strings.Contains(errOut.String(), "not allowed to manage") {
+		t.Errorf("204 treated as a failure\n%s", errOut.String())
+	}
+	if n := len(srv.Reports()); n != 3 {
+		t.Errorf("%d reports, want 3", n)
+	}
+
 	// A report KrakenKey refuses does not change the exit code.
 	srv.ReportStatus = http.StatusInternalServerError
 	errOut.Reset()

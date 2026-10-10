@@ -18,16 +18,23 @@ import (
 
 // ReportSender is the API call the reporter uses.
 type ReportSender interface {
-	Report(ctx context.Context, r api.Report) error
+	Report(ctx context.Context, r api.Report) (*api.ReportResult, error)
 }
 
 // ReportTimeout bounds sending a report. It runs even when the pass was
 // cancelled, so a stopping connector still says where it left off.
 const ReportTimeout = 10 * time.Second
 
-// Reporter sends the deployment status of every configured certificate and
-// target to KrakenKey after each pass. The state store is the source: what
-// is deployed where, and how the last deployment ended.
+// Reporter sends the deployment status of the certificates a pass
+// processed, and all their targets, to KrakenKey. The state store is the
+// source: what is deployed where, and how the last deployment ended.
+//
+// Failures on the connector's side that kept a certificate from being
+// renewed or deployed (deploy.IsBlocked: key store errors, config
+// problems, an issued certificate the checks rejected) show as failed on
+// every target of that certificate, so KrakenKey alerts. Failures on
+// KrakenKey's side, such as a failed issuance, leave targets pending with
+// the error: KrakenKey alerts on those itself.
 type Reporter struct {
 	API    ReportSender
 	State  *deploy.StateStore
@@ -47,28 +54,42 @@ func (r *Reporter) now() time.Time {
 }
 
 // Send builds the reports and sends them. Failures are logged, never
-// returned: reporting must not fail a pass. certErrs holds this pass's
-// error per certificate, shown for targets that are still waiting for
-// their first deployment.
-func (r *Reporter) Send(ctx context.Context, certErrs map[int]error) {
-	reports := r.Build(certErrs)
+// returned: reporting must not fail a pass. results holds every
+// certificate the pass processed, with its error or nil.
+func (r *Reporter) Send(ctx context.Context, results map[int]error) {
+	reports := r.Build(results)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ReportTimeout)
 	defer cancel()
+	var rejected []int
 	for _, rep := range reports {
-		if err := r.API.Report(ctx, rep); err != nil {
+		res, err := r.API.Report(ctx, rep)
+		if err != nil {
 			r.Log.Warn("could not report deployment status to KrakenKey", "error", err)
 			return
 		}
+		if res != nil {
+			rejected = append(rejected, res.RejectedCertificateIDs...)
+		}
 	}
-	r.Log.Debug("deployment status reported", "certificates", len(r.Config.Certificates))
+	if len(rejected) > 0 {
+		r.Log.Warn("KrakenKey did not take the status of some certificates: this connector is not allowed to manage them; "+
+			"check the certificate ids in the config and the connector's restrictions in the dashboard",
+			"certificate_ids", rejected)
+	}
+	r.Log.Debug("deployment status reported", "certificates", len(results))
 }
 
-// Build returns the reports for every configured certificate, split so
-// that none has more than api.MaxReportCertificates certificates.
-func (r *Reporter) Build(certErrs map[int]error) []api.Report {
+// Build returns the reports for the certificates in results, in config
+// order, split so that none has more than api.MaxReportCertificates
+// certificates.
+func (r *Reporter) Build(results map[int]error) []api.Report {
 	var certs []api.ReportCertificate
 	for _, cert := range r.Config.Certificates {
-		certs = append(certs, r.certificate(cert, certErrs[cert.ID]))
+		certErr, processed := results[cert.ID]
+		if !processed {
+			continue
+		}
+		certs = append(certs, r.certificate(cert, certErr))
 	}
 	var reports []api.Report
 	for len(certs) > 0 {
@@ -130,7 +151,14 @@ func (r *Reporter) target(st *deploy.State, tc config.Target, certErr error) api
 	default:
 		rt.State = api.DeployVerified
 	}
-	if rt.State == api.DeployPending && certErr != nil {
+	switch {
+	case certErr == nil:
+	case deploy.IsBlocked(certErr) && rt.State != api.DeployStaged && rt.State != api.DeployActivated:
+		// The certificate could not be renewed or deployed because of
+		// something on the connector's side; the target keeps whatever it
+		// has (rt.Serial).
+		rt.State, rt.Error, updated = api.DeployFailed, certErr.Error(), r.now()
+	case rt.State == api.DeployPending:
 		rt.Error, updated = certErr.Error(), r.now()
 	}
 	if !known && updated.IsZero() {

@@ -22,14 +22,18 @@ import (
 type sentReports struct {
 	mu      sync.Mutex
 	reports []api.Report
+	result  *api.ReportResult
 	err     error
 }
 
-func (s *sentReports) Report(_ context.Context, r api.Report) error {
+func (s *sentReports) Report(_ context.Context, r api.Report) (*api.ReportResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reports = append(s.reports, r)
-	return s.err
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.result, nil
 }
 
 func reportConfig(t *testing.T, dataDir string) *config.Config {
@@ -76,7 +80,7 @@ func TestReportMapsState(t *testing.T) {
 	}})
 	r := &Reporter{Config: cfg, State: store, Log: slog.New(slog.DiscardHandler), Version: "1.2.3", OS: "linux", Arch: "arm64",
 		Now: func() time.Time { return at.Add(time.Hour) }}
-	reports := r.Build(map[int]error{2: errors.New("certificate 2: KrakenKey API: not found")})
+	reports := r.Build(map[int]error{1: nil, 2: errors.New("certificate 2: KrakenKey API: not found")})
 	if len(reports) != 1 {
 		t.Fatalf("%d reports", len(reports))
 	}
@@ -154,7 +158,11 @@ func TestReportLimits(t *testing.T) {
 	cfg := writeConfig(t, b.String())
 	store, _ := deploy.OpenStateStore(dataDir)
 	r := &Reporter{Config: cfg, State: store, Log: slog.New(slog.DiscardHandler)}
-	reports := r.Build(nil)
+	all := map[int]error{}
+	for _, c := range cfg.Certificates {
+		all[c.ID] = nil
+	}
+	reports := r.Build(all)
 	if len(reports) != 2 || len(reports[0].Certificates) != 500 || len(reports[1].Certificates) != 1 {
 		t.Fatalf("split into %d reports", len(reports))
 	}
@@ -227,3 +235,66 @@ func (f failingAPI) WaitForIssuance(context.Context, int, string) (*api.Cert, er
 	return nil, f.err
 }
 func (f failingAPI) GetCertChain(context.Context, int) (*api.Chain, error) { return nil, f.err }
+
+func TestReportBlockedFailures(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := writeConfig(t, fmt.Sprintf(`
+data_dir: %s
+certificates:
+  - id: 1
+    names: [api.example.com]
+    targets:
+      - { label: live, plugin: exec, command: [/bin/true] }
+      - { label: staged, plugin: exec, command: [/bin/true] }
+      - { label: none, plugin: exec, command: [/bin/true] }
+  - id: 2
+    names: [api.example.com]
+    targets: [{ label: other, plugin: exec, command: [/bin/true] }]
+`, dataDir))
+	store, _ := deploy.OpenStateStore(dataDir)
+	at := time.Date(2026, 10, 10, 14, 0, 0, 0, time.UTC)
+	_ = store.Save(&deploy.State{CertificateID: 1, Serial: "0a", Targets: map[string]deploy.TargetState{
+		"live":   {Serial: "0a", Outcome: deploy.OutcomeVerified, UpdatedAt: at},
+		"staged": {Serial: "0a", Phase: deploy.PhaseStaged, DeployingSerial: "0b", UpdatedAt: at},
+	}})
+	r := &Reporter{Config: cfg, State: store, Log: slog.New(slog.DiscardHandler)}
+
+	type want struct{ state, serial string }
+	cases := map[string]struct {
+		err  error
+		want map[string]want
+	}{
+		"key store failure": {
+			fmt.Errorf("certificate 1: %w", &deploy.BlockedError{Err: errors.New("key store: vault sealed")}),
+			map[string]want{"live": {"failed", "0a"}, "staged": {"staged", "0b"}, "none": {"failed", ""}},
+		},
+		"issued certificate rejected": {
+			fmt.Errorf("certificate 1: %w", &deploy.RejectedError{Reason: "wrong names"}),
+			map[string]want{"live": {"failed", "0a"}, "staged": {"staged", "0b"}, "none": {"failed", ""}},
+		},
+		"issuance failed in KrakenKey": {
+			fmt.Errorf("certificate 1: %w", &api.IssuanceFailedError{Reason: "CNAME missing"}),
+			map[string]want{"live": {"verified", "0a"}, "staged": {"staged", "0b"}, "none": {"pending", ""}},
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			reports := r.Build(map[int]error{1: c.err})
+			if len(reports) != 1 || len(reports[0].Certificates) != 1 {
+				t.Fatalf("report holds certificates that were not processed: %+v", reports)
+			}
+			for _, tg := range reports[0].Certificates[0].Targets {
+				w := c.want[tg.Label]
+				if tg.State != w.state || tg.Serial != w.serial {
+					t.Errorf("%s: %s %q, want %s %q", tg.Label, tg.State, tg.Serial, w.state, w.serial)
+				}
+				if (tg.State == "failed" || tg.State == "pending") && tg.Error == "" {
+					t.Errorf("%s: no error", tg.Label)
+				}
+			}
+		})
+	}
+	if reports := r.Build(map[int]error{}); len(reports) != 0 {
+		t.Errorf("a pass that processed nothing reported %+v", reports)
+	}
+}
