@@ -555,7 +555,11 @@ func skuProblem(gw *armnetwork.ApplicationGateway) string {
 // identity, which it needs to read certificates from Key Vault.
 func identityProblem(gw *armnetwork.ApplicationGateway) string {
 	id := gw.Identity
-	if id != nil && id.Type != nil && strings.Contains(string(*id.Type), string(armnetwork.ResourceIdentityTypeUserAssigned)) &&
+	// ARM returns the type in whatever case it was set with ("userAssigned"
+	// from the Azure CLI, "UserAssigned" from templates), so compare
+	// case-insensitively.
+	if id != nil && id.Type != nil &&
+		strings.Contains(strings.ToLower(string(*id.Type)), strings.ToLower(string(armnetwork.ResourceIdentityTypeUserAssigned))) &&
 		len(id.UserAssignedIdentities) > 0 {
 		return ""
 	}
