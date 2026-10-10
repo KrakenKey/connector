@@ -3,5 +3,6 @@ go 1.26
 use (
 	.
 	./plugins/aws-acm
+	./plugins/azure-appgateway
 	./plugins/azure-keyvault
 )

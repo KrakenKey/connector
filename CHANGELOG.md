@@ -14,6 +14,14 @@ protocol and the KrakenKey API the connector uses.
   Vault creates the key and the CSR and keeps the issued certificate, so the
   key leaves the vault only for exportable certificates whose targets need
   PEM or PFX. Targets such as Application Gateway get the versioned secret id.
+- `azure-appgateway` target plugin (`plugins/azure-appgateway`): points an
+  Application Gateway v2 SSL certificate at a specific Key Vault secret
+  version, so the gateway serves the new certificate as soon as the update
+  finishes, and rolls back by restoring the previous version. Updates use
+  ETag checks so a concurrent change is never overwritten, and rollback
+  refuses when it could not truly restore the earlier state (a versionless
+  secret on the same name, a replaced uploaded certificate, or an entry
+  someone changed since).
 - `aws-acm` target plugin (`plugins/aws-acm`, its own Go module): re-imports
   certificates into an existing imported ACM certificate, so load balancers,
   CloudFront and API Gateway keep using the same ARN. It checks the
