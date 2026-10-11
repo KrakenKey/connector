@@ -8,6 +8,25 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+## [v0.2.0] - 2026-10-11
+
+Linux packages and a Homebrew cask, bundled plugin versions, and Key Vault as
+a deployment target, including implicit targets for key stores whose
+certificate is itself the deployment.
+
+### Upgrading from v0.1.0
+
+- Plugins that ship with the container image or the packages can be
+  declared without `version`; the connector uses the bundled one. Pinned
+  versions keep working, but must be changed on every upgrade.
+- A certificate with the `azure-keyvault` key store gets an implicit target
+  labeled `azure-keyvault`. If one of its configured targets already uses
+  that label for another place, the implicit target is skipped and
+  `validate` warns; rename that target to get it.
+- Key Vault certificates the connector manages now get the tag
+  `krakenkey-connector-previous-version`, which leaves 13 of Key Vault's 15
+  tags for your own.
+
 ### Added
 
 - A plugin declared without `version` (and without `path`) uses the bundled
@@ -48,7 +67,6 @@ protocol and the KrakenKey API the connector uses.
   `plugin.MatchKeyStoreDeployment` and
   `plugin.KeyStoreDeploymentRollbackUnavailable`. Older plugins and
   connectors ignore the new fields and keep today's behavior.
-
 - `azure-keyvault` target: deploys certificates to Key Vault certificates
   as new versions, for services that read them without a version (App
   Service, Container Apps, API Management, Front Door, the AKS Secrets
@@ -100,9 +118,6 @@ protocol and the KrakenKey API the connector uses.
 - The error after a rollback whose `then` command failed says "rolled back,
   but then.exec failed afterwards" (it said "files rolled back"), since
   not every target has files.
-
-### Changed
-
 - `azure-appgateway`: errors keep the HTTP status, Azure's error code and
   the denied action, but no longer Azure's message, which names the
   caller's application and object ids, its tenant and the subscription.
@@ -244,5 +259,6 @@ together under one version.
   The README lists the cloud SDK variables that decide where plugins send
   keys and tokens.
 
-[Unreleased]: https://github.com/KrakenKey/connector/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/KrakenKey/connector/compare/v0.2.0...HEAD
+[v0.2.0]: https://github.com/KrakenKey/connector/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/KrakenKey/connector/releases/tag/v0.1.0
