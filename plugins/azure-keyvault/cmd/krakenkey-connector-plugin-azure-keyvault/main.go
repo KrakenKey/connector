@@ -1,7 +1,8 @@
 // Command krakenkey-connector-plugin-azure-keyvault is a KrakenKey
-// connector key store plugin that keeps keys and certificates in Azure Key
-// Vault. The connector starts it; running it by hand prints a notice and
-// exits.
+// connector plugin for Azure Key Vault: a key store that keeps keys and
+// certificates in Key Vault, and a target that deploys certificates to Key
+// Vault certificates. The connector starts it; running it by hand prints a
+// notice and exits.
 package main
 
 import (
@@ -21,8 +22,10 @@ func main() {
 		Level:      hclog.Info,
 		JSONFormat: true,
 	})
+	ks := keyvault.New(keyvault.Options{Logger: logger})
 	plugin.Serve(plugin.ServeOpts{
-		KeyStore: keyvault.New(keyvault.Options{Logger: logger}),
+		KeyStore: ks,
+		Target:   keyvault.NewTarget(ks),
 		Logger:   logger,
 	})
 }

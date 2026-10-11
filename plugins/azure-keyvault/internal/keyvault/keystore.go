@@ -19,10 +19,10 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/hashicorp/go-hclog"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azcertificates"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets"
+	"github.com/hashicorp/go-hclog"
 	pkcs12 "software.sslmate.com/src/go-pkcs12"
 
 	"github.com/krakenkey/connector/pkg/plugin"
@@ -82,7 +82,10 @@ type vaultClients struct {
 	secrets *azsecrets.Client
 }
 
-var _ plugin.KeyStore = (*KeyStore)(nil)
+var (
+	_ plugin.KeyStore                    = (*KeyStore)(nil)
+	_ plugin.KeyStoreCapabilityValidator = (*KeyStore)(nil)
+)
 
 // New returns a key store.
 func New(opts Options) *KeyStore {
@@ -192,6 +195,27 @@ func (k *KeyStore) Validate(ctx context.Context, req plugin.KeyStoreValidateRequ
 		}
 	}
 	return problems, nil
+}
+
+// ValidateCapabilities is Validate with the capabilities for these
+// settings: keys are exportable only with exportable: true, and the
+// certificate is itself a deployment, which the connector adds as an
+// implicit target (the vault URL and certificate name, served by this
+// plugin's target). Errors from Key Vault are returned as problems, so the
+// capabilities still reach the connector.
+func (k *KeyStore) ValidateCapabilities(ctx context.Context, req plugin.KeyStoreValidateRequest) (plugin.KeyStoreValidation, error) {
+	s, problems := parseConfig(req.Config)
+	if len(problems) > 0 {
+		return plugin.KeyStoreValidation{Problems: problems}, nil
+	}
+	caps, _ := k.Describe(ctx)
+	caps.Exportable = s.exportable
+	caps.ImplicitTarget = &plugin.ImplicitTarget{Config: implicitTargetConfig(s), DeploymentID: deploymentID(s.vaultURL, s.name)}
+	problems, err := k.Validate(ctx, req)
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+	return plugin.KeyStoreValidation{Problems: problems, Capabilities: &caps}, nil
 }
 
 // checkSecretAccess warns when the identity cannot read the certificate's

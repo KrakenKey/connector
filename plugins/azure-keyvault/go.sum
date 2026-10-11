@@ -40,8 +40,8 @@ github.com/jhump/protoreflect v1.17.0 h1:qOEr613fac2lOuTgWN4tPAtLL7fUSbuJL5X5Xum
 github.com/jhump/protoreflect v1.17.0/go.mod h1:h9+vUUL38jiBzck8ck+6G/aeMX8Z4QUY/NiJPwPNi+8=
 github.com/keybase/go-keychain v0.0.1 h1:way+bWYa6lDppZoZcgMbYsvC7GxljxrskdNInRtuthU=
 github.com/keybase/go-keychain v0.0.1/go.mod h1:PdEILRW3i9D8JcdM+FmY6RwkHGnhHxXwkPPMeUgOK1k=
-github.com/krakenkey/connector v0.1.0 h1:pQxg7xhqqPPAPWEZYmj03RT4LKABEYIcV8K1Aomq7Dg=
-github.com/krakenkey/connector v0.1.0/go.mod h1:yia/0ivLBnjz/92pbUsdkw9xwbZ/pQ1e4960dqBnySc=
+github.com/krakenkey/connector v0.1.1-0.20261011114024-35f3b830a2a5 h1:K0s5tbvi7+oneUCLw66BBiJ9KvM6B3HoIx1tILLk3IM=
+github.com/krakenkey/connector v0.1.1-0.20261011114024-35f3b830a2a5/go.mod h1:yia/0ivLBnjz/92pbUsdkw9xwbZ/pQ1e4960dqBnySc=
 github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
 github.com/mattn/go-colorable v0.1.9/go.mod h1:u6P/XSegPjTcexA+o6vUJrdnUu04hMope9wVRipJSqc=

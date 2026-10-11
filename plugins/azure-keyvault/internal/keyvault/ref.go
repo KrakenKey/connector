@@ -117,3 +117,32 @@ func spkiHash(spki []byte) string {
 	sum := sha256.Sum256(spki)
 	return hex.EncodeToString(sum[:])
 }
+
+// secretRef is a versioned secret id, as Export returns for vault_ref:
+// https://<vault>/secrets/<name>/<version>.
+type secretRef struct {
+	vaultURL string
+	name     string
+	version  string
+}
+
+func (r secretRef) String() string { return r.vaultURL + "/secrets/" + r.name + "/" + r.version }
+
+func parseSecretRef(s string) (secretRef, error) {
+	bad := fmt.Errorf("%w: key reference %q is not a Key Vault secret id (https://<vault>/secrets/<name>/<version>)", plugin.ErrPermanent, s)
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" {
+		return secretRef{}, bad
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "secrets" || !objectNameRE.MatchString(parts[1]) || !versionRE.MatchString(parts[2]) {
+		return secretRef{}, bad
+	}
+	return secretRef{vaultURL: "https://" + normHost(u), name: parts[1], version: parts[2]}, nil
+}
+
+// deploymentID says where a certificate lives: the vault URL and the
+// certificate name, which Key Vault compares without regard to case.
+func deploymentID(vaultURL, name string) string {
+	return vaultURL + "/certificates/" + strings.ToLower(name)
+}

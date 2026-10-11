@@ -1,7 +1,15 @@
-# azure-keyvault key store plugin
+# azure-keyvault plugin
 
-A key store plugin for the KrakenKey connector that keeps private keys and
-certificates in [Azure Key Vault](https://learn.microsoft.com/azure/key-vault/certificates/about-certificates).
+A KrakenKey connector plugin for
+[Azure Key Vault](https://learn.microsoft.com/azure/key-vault/certificates/about-certificates).
+It is two things in one binary:
+
+- a **key store** that keeps private keys and certificates in Key Vault
+  (this section and [How it works](#how-it-works)), and
+- a **target** that deploys certificates to Key Vault certificates, so that
+  services which read them without a version pick up each renewal (see
+  [Target](#target)). When Key Vault is the key store, the certificate is
+  deployed there already, and the connector adds that target by itself.
 
 Key Vault generates the key pair and the CSR. The connector sends the CSR to
 KrakenKey, then merges the issued certificate and its chain back into Key
@@ -90,7 +98,8 @@ request alone.
 
 ### Old versions
 
-Each issuance adds a certificate version. `Release` does not delete completed
+Each issuance, and each import by the [target](#target), adds a certificate
+version. `Release` does not delete completed
 versions: Key Vault keeps every version as history, deletes versions only
 together with the whole certificate, and some services may still point at an
 older version. Deleting versions is out of scope for the plugin.
@@ -99,6 +108,178 @@ If your policy requires it, you can disable old versions yourself, but only
 versions that no target serves any more and that a rollback will not need.
 A rollback deploys the previous certificate again and reads its secret; a
 disabled version makes that fail (`this version is disabled in Key Vault`).
+
+## Target
+
+The target deploys a certificate to a Key Vault certificate as its latest
+version. Services that reference the certificate without a version read the
+latest enabled version on their own schedule (see
+[When services pick up a new version](#when-services-pick-up-a-new-version)).
+
+### The key store's own certificate (implicit target)
+
+With `key_store: { plugin: azure-keyvault }` the connector merges every
+issued certificate into `certificate_name` as a new version, so that
+certificate is deployed the moment the key store completes it. The plugin
+tells the connector so, and the connector adds an
+[implicit target](../../README.md#implicit-targets) for it:
+
+- It is labeled with the plugin's name from the `plugins` block (normally
+  `azure-keyvault`), deployed before the other targets, and listed by
+  `validate` as `implicit`.
+- Its settings come from the key store: `vault`, `certificate_name`,
+  `adopt` and `exportable`.
+- `Stage` and `Activate` find the certificate in place and change nothing
+  (no import, no secret read). The previous ref is the version that was the
+  latest before it, so a rollback knows what to put back.
+- Without a `verify` block it is reported as activated but not verified.
+- A configured target with `plugin: azure-keyvault` and the key store's
+  `vault` and `certificate_name` (in any spelling, for example the vault name
+  or its URL) replaces the implicit target. Use one to add `verify` or
+  `then`, or another label. Keep the label `azure-keyvault` to keep the
+  target's deployment history.
+
+**The new version is live before the other targets deploy.** The key store
+merges the certificate when it is issued, so services that read the
+certificate without a version can pick it up before the connector has
+deployed to any other target, and whether or not those deployments
+succeed. If that order matters, have those services pin a version (as the
+[`azure-appgateway`](../azure-appgateway/README.md) target does), or use
+another `certificate_name` for the key store and import into the
+certificate the services read with a separate target.
+
+### Other vaults and certificate names
+
+A configured target for another vault, or another `certificate_name` in the
+same vault, imports the certificate, its chain and its key as a new version
+(PKCS#12, content type `application/x-pkcs12`, which Application Gateway,
+App Service, Front Door and Azure CDN require). Use it to put the same
+certificate in several vaults (regions, a disaster recovery vault, other
+subscriptions), or in a vault when the key is kept somewhere else (the
+built-in `local` key store).
+
+It needs the private key:
+
+- With the `azure-keyvault` key store, the connector hands over a vault
+  reference and the plugin reads the key from the key store's secret
+  itself, so the key does not pass through the connector. The key store
+  needs `exportable: true`; `validate` refuses the pair otherwise.
+- With the `local` key store, the connector hands over the key as PEM.
+
+Before the first import into a certificate that already exists, the plugin
+reads its latest version's ownership tag, with the same rules and `adopt`
+setting as the key store (see [Ownership](#ownership)). Every imported
+version carries the ownership tag and the configured `tags`.
+
+### Target calls
+
+| Connector call | What the plugin does in Key Vault |
+|---|---|
+| `Validate` | Checks the settings and reports the vault URL and certificate name as the deployment id. For a certificate other than the key store's own: reads the latest version's ownership tag, and checks for a soft-deleted certificate with that name. |
+| `Current` | Reads the latest version and returns its serial number; nothing when there is none or it is disabled (versionless consumers cannot read a disabled version). |
+| `Stage` | Reads the latest version. If it is the certificate being deployed, nothing else happens. Otherwise checks ownership, gets the key (reads the source secret for a vault reference), checks that it belongs to the certificate, and builds the PKCS#12 bundle in memory. |
+| `Activate` | Certificate in place: lists the versions to find the one that was the latest before it. Otherwise imports the bundle as a new version and returns the serial of the version it replaced. A failed import leaves the latest version as it was; if the answer is lost, the plugin checks whether the version went in. |
+| `Rollback` | Imports the previous certificate and its key again as a new latest version (see [Rollback](#rollback)). Does nothing if that certificate is already the latest version. |
+| `Discard` | Drops the staged bundle from memory. |
+
+Staged bundles live only in the plugin's memory, for at most an hour, and
+are wiped after `Activate` or `Discard`.
+
+### Rollback
+
+Key Vault always serves the latest enabled version to versionless
+consumers. It cannot make an older version current again, and disabling the
+newer version does not help: consumers that ask for the latest version then
+fail instead of falling back. So a rollback imports the previous certificate
+and its key once more, as a new version. The connector hands them back
+(`rollback_needs_material`):
+
+| Case | Rollback |
+|---|---|
+| Key store's own certificate, `exportable: true` | The previous version's key is read from its secret and imported again with the previous certificate. |
+| Key store's own certificate, `exportable: false` | Refused: the key cannot be read, so the previous certificate cannot be imported again. `validate` warns that rollback is unavailable; a failed deployment keeps the new version and is reported as failed. |
+| Another certificate, `azure-keyvault` key store | As for the key store's own certificate (the key store must be exportable for this target at all). |
+| Another certificate, `local` key store | The previous key is handed over as PEM and imported again. |
+| First deployment (no earlier version) | Refused: Key Vault cannot delete a single version, so the new version stays. |
+
+The plugin reports `propagates_async`: services pick up a new version on
+their own schedule, so a failed `verify` check is reported, not rolled back.
+A rollback happens when a `then` command fails, or when the connector finds
+an interrupted deployment of an older certificate. Rolling back on every
+failed check would import the old certificate again while services may
+already have picked up the new one.
+
+### Target configuration
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `vault` | string | required | Vault name or URL, as for the key store. |
+| `certificate_name` | string | required | Key Vault certificate to deploy to. Created by the first import. |
+| `adopt` | bool | `false` | Let the connector add versions to a certificate it did not create. See [Ownership](#ownership). |
+| `exportable` | bool | `true` | Whether the private key of imported versions can be read from their secret. Application Gateway, App Service and Front Door need it. |
+| `tags` | map | none | Extra tags on every imported version (at most 14; `krakenkey-connector-certificate-id` is set by the connector). |
+
+For the implicit target, all of these come from the key store's settings.
+
+### When services pick up a new version
+
+What Microsoft documents for services that reference a Key Vault
+certificate without a version:
+
+| Service | Picks up a new version | Faster |
+|---|---|---|
+| [Application Gateway v2](https://learn.microsoft.com/azure/application-gateway/key-vault-certs) | polls every 4 hours | any change to the gateway (for example a tag) makes it check at once |
+| [App Service and Functions](https://learn.microsoft.com/azure/app-service/configure-ssl-certificate) | within 24 hours | **Sync** on the imported certificate in the portal |
+| [Container Apps](https://learn.microsoft.com/azure/container-apps/key-vault-certificates-manage) | up to 12 hours | not documented |
+| [API Management custom domains](https://learn.microsoft.com/azure/api-management/configure-custom-domain) | up to 1-2 days | **Sync certificates** in the portal |
+| [API Management named values](https://learn.microsoft.com/azure/api-management/api-management-howto-properties) | within 4 hours | refresh in the portal or through the management REST API |
+| [Front Door Standard/Premium](https://learn.microsoft.com/azure/frontdoor/domain), version **Latest** | up to 72 hours | not documented |
+| [Azure CDN](https://learn.microsoft.com/azure/cdn/cdn-custom-ssl) (Standard Microsoft) | up to 72 hours | not documented |
+| [AKS Secrets Store CSI driver](https://learn.microsoft.com/azure/aks/csi-secrets-store-configuration-options) | every 2 minutes, once rotation is enabled (`--enable-secret-rotation`; off by default) | `--rotation-poll-interval` |
+| [VM Key Vault extension](https://learn.microsoft.com/azure/virtual-machines/extensions/key-vault-linux) | every hour by default (`pollingIntervalInS`, 5 to 60 minutes) | restart the extension's service |
+
+The connector's `verify` check keeps the pass waiting until the endpoint
+serves the new certificate or the window ends, and other certificates wait
+with it. So:
+
+- For services that take hours or days, leave out `verify`. The target is
+  reported as activated but not verified (`activated_unverifiable`), and
+  KrakenKey's own endpoint monitoring can watch the endpoint instead.
+- For services that poll within minutes (the CSI driver with rotation, the
+  VM extension with a short interval), add `verify` with a window a little
+  longer than the poll interval, for example `window: 10m` for a 2 minute
+  rotation interval.
+- To verify a slow service, make it pick up the version in a `then`
+  command (for example a change to the Application Gateway, or a sync of
+  the App Service certificate), and verify with a short window.
+
+A failed check on this target is reported, not rolled back (see
+[Rollback](#rollback)).
+
+### Target permissions
+
+| Call | Key Vault operation | RBAC data action | Access policy |
+|---|---|---|---|
+| `Validate` (other certificates) | Get the latest version; for a missing certificate, check for a soft-deleted one | `certificates/read` | certificates: Get |
+| `Current` | Get the latest version | `certificates/read` | certificates: Get |
+| `Stage` | Get the latest version; for an import, read the source secret when given a vault reference | `certificates/read`; `secrets/getSecret/action` on the key store's vault | certificates: Get; secrets: Get on the key store's vault |
+| `Activate` | List versions (certificate in place), or import | `certificates/read`, `certificates/import/action` | certificates: Get, List, Import |
+| `Rollback` | Get the latest version, read the previous version's secret, import | `certificates/read`, `certificates/import/action`, `secrets/getSecret/action` | certificates: Get, Import; secrets: Get |
+
+For the implicit target alone (no rollback), `certificates/read` is enough;
+with access policies, add certificate permission **List**. Without it the
+deployment still succeeds, but the plugin cannot tell which version was
+live before, so that deployment cannot be rolled back (logged as a
+warning). Rollback adds `certificates/import/action` and
+`secrets/getSecret/action`.
+
+For other certificates, grant `certificates/read` and
+`certificates/import/action` on the destination vault (or scoped to the
+certificate once it exists), and `secrets/getSecret/action` on the key
+store's vault. With the `local` key store, no secret permission is needed.
+
+A 403 names the operation and the permission to grant, as for the key
+store.
 
 ## Configuration
 
@@ -143,35 +324,75 @@ Gateway and App Service cannot.
 
 ```yaml
 plugins:
-  azure-keyvault: { version: 0.1.0, sha256: "<hex>", call_timeout: 5m }
+  azure-keyvault: {}   # the bundled version; see the connector README
 
 certificates:
-  # Key stays in Key Vault; Application Gateway reads it from there.
+  # Key Vault only. App Service and Front Door read the certificate without a
+  # version; the connector adds the implicit target "azure-keyvault" and
+  # reports it as activated but not verified.
+  - id: 1042
+    names: [www.example.com]
+    key_store:
+      plugin: azure-keyvault
+      key_type: rsa-2048
+      vault: kv-prod-tls
+      certificate_name: www-example-com
+
+  # The same, verified: a configured target for the key store's own
+  # certificate replaces the implicit one. An AKS cluster reads it through the
+  # Secrets Store CSI driver with a 2 minute rotation interval.
   - id: 1043
+    names: [api.example.com]
+    key_store:
+      plugin: azure-keyvault
+      key_type: ecdsa-p256
+      vault: kv-prod-tls
+      certificate_name: api-example-com
+    targets:
+      - label: azure-keyvault
+        plugin: azure-keyvault
+        vault: https://kv-prod-tls.vault.azure.net
+        certificate_name: api-example-com
+        verify: { host: api.example.com, window: 10m }
+
+  # One certificate in several vaults: the key lives in the primary vault
+  # (exportable, so it can be copied), and the target imports it into a
+  # second region's vault and a vault in another subscription. Application
+  # Gateway reads a pinned version from the primary vault.
+  - id: 1044
     names: ["*.example.com", example.com]
     key_store:
       plugin: azure-keyvault
       key_type: rsa-2048
       vault: kv-prod-tls
       certificate_name: wildcard-example-com
-      exportable: true            # required by Application Gateway
+      exportable: true
     targets:
+      - label: kv-westeurope
+        plugin: azure-keyvault
+        vault: kv-prod-tls-weu
+        certificate_name: wildcard-example-com
+        tags: { site: westeurope }
+      - label: kv-dr
+        plugin: azure-keyvault
+        vault: kv-dr-tls
+        certificate_name: wildcard-example-com
       - label: appgw-prod
         plugin: azure-appgateway
         # target settings: see the azure-appgateway plugin
 
-  # Key Vault holds the key and the certificate; nginx gets PEM files.
-  - id: 1044
-    names: [api.example.com]
-    key_store:
-      plugin: azure-keyvault
-      key_type: ecdsa-p256
-      vault: https://kv-prod-tls.vault.azure.net
-      certificate_name: api-example-com
+  # Key on the host (local key store), certificate imported into Key Vault
+  # for services there, and written to files for nginx.
+  - id: 1045
+    names: [internal.example.com]
     targets:
+      - label: kv
+        plugin: azure-keyvault
+        vault: kv-prod-tls
+        certificate_name: internal-example-com
       - label: nginx
         plugin: file
-        dir: /etc/nginx/tls/api
+        dir: /etc/nginx/tls/internal
         files: { cert: cert.pem, chain: chain.pem, fullchain: fullchain.pem, key: key.pem }
         then: { exec: [systemctl, reload, nginx] }
 ```
@@ -229,15 +450,16 @@ connector's identity a custom role with only these data actions:
 
 ```json
 {
-  "Name": "KrakenKey connector Key Vault key store",
+  "Name": "KrakenKey connector Key Vault",
   "IsCustom": true,
-  "Description": "Create Key Vault certificates, merge issued certificates and read them for the KrakenKey connector.",
+  "Description": "Create, merge, import and read Key Vault certificates for the KrakenKey connector.",
   "Actions": [],
   "NotActions": [],
   "DataActions": [
     "Microsoft.KeyVault/vaults/certificates/read",
     "Microsoft.KeyVault/vaults/certificates/create/action",
     "Microsoft.KeyVault/vaults/certificates/update/action",
+    "Microsoft.KeyVault/vaults/certificates/import/action",
     "Microsoft.KeyVault/vaults/secrets/getSecret/action"
   ],
   "NotDataActions": [],
@@ -245,7 +467,11 @@ connector's identity a custom role with only these data actions:
 }
 ```
 
-Drop `secrets/getSecret/action` if no target needs the key as PEM or PFX;
+Drop `certificates/import/action` if no target imports certificates (the
+implicit target alone does not, unless it rolls back; see
+[Target permissions](#target-permissions)). Drop
+`secrets/getSecret/action` if no target needs the key as PEM or PFX, nor
+imports it into another certificate, nor rolls back;
 `vault_ref` targets such as Application Gateway do not (the gateway's own
 identity reads the secret instead). Assign the role scoped to the vault, or
 narrower: Key Vault RBAC assignments can be scoped to a single certificate
@@ -259,8 +485,10 @@ allows deleting, purging, importing, backing up and restoring certificates
 and managing certificate issuers and contacts.
 
 With vault access policies instead of RBAC: certificate permissions **Get**,
-**Create** and **Update**; secret permission **Get** only for PEM or PFX
-export. Access policies apply to the whole vault.
+**Create** and **Update** for the key store, plus **List** and **Import** for
+the target; secret permission **Get** only for PEM or PFX export, imports
+from this vault into another certificate, and rollbacks. Access policies
+apply to the whole vault.
 
 | Call | Key Vault operation | RBAC data action | Access policy |
 |---|---|---|---|
@@ -307,13 +535,11 @@ messages do not include them.
 
 ## Limitations
 
-- **Capabilities are per plugin, not per certificate.** The connector asks a
-  plugin for its capabilities without any certificate settings, so this
-  plugin always reports `exportable: true` and provides `vault_ref`, `pem`
-  and `pfx`. For a certificate with `exportable: false`, `validate` cannot
-  tell that a target needing PEM or PFX will not work; the first deployment
-  fails at `Export` with a clear error. Pair such certificates only with
-  targets that accept `vault_ref`.
+- `Describe` has no certificate settings, so it reports exportable keys.
+  The capabilities for each certificate's settings come from `Validate`
+  (`exportable: false` reports keys that cannot be exported), so `validate`
+  refuses a target that needs the key, such as Application Gateway or
+  another Key Vault certificate, for such a certificate.
 - Keys are software-protected (`RSA`, `EC`). HSM-backed keys (`RSA-HSM`,
   `EC-HSM`, Premium vaults) are not offered yet. Managed HSM has no
   certificate objects and is not supported.
