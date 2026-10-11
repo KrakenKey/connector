@@ -43,6 +43,13 @@ const (
 type Location struct {
 	Path   string
 	Source Source
+	// Version is the plugin version that was started: the configured one,
+	// or for a plugin declared without version and path, the only version
+	// in the system plugin directory. Empty for a path setting.
+	Version string
+	// Bundled says that Version was not configured but taken from the
+	// system plugin directory.
+	Bundled bool
 	// SHA256 is the hex checksum of the executable that was started.
 	SHA256 string
 	// PinnedBy lists what SHA256 matched: "config" (the plugin's sha256
@@ -70,6 +77,9 @@ func (h *Host) open(name string) (*os.File, Location, error) {
 	var lock map[string][]byte
 	if system {
 		if lock, err = readLock(h.pluginDir); err != nil {
+			if loc.Bundled {
+				return nil, loc, fmt.Errorf("plugins in the system plugin directory are refused: %w", err)
+			}
 			return nil, loc, fmt.Errorf("version %s is not installed under %s, and plugins in the system plugin directory are refused: %w",
 				spec.Version, filepath.Join(h.dataDir, "plugins"), err)
 		}
@@ -96,7 +106,7 @@ func (h *Host) open(name string) (*os.File, Location, error) {
 		loc.PinnedBy = append(loc.PinnedBy, PinConfig)
 	}
 	if system {
-		key := lockKey(name, spec.Version)
+		key := lockKey(name, loc.Version)
 		want, ok := lock[key]
 		if !ok {
 			_ = f.Close()
@@ -115,25 +125,29 @@ func (h *Host) open(name string) (*os.File, Location, error) {
 // find says where the plugin's executable is and up to which directory
 // its parents are checked: its path setting; or, by version, under
 // <data_dir>/plugins, which needs a sha256 setting; or, when nothing is
-// installed there, under the system plugin directory.
+// installed there, under the system plugin directory. Without version and
+// path, it is the only version in the system plugin directory.
 func (h *Host) find(name string, spec config.PluginSpec) (Location, string, error) {
 	if spec.Path != "" {
 		return Location{Path: spec.Path, Source: SourcePath}, string(filepath.Separator), nil
+	}
+	if spec.Version == "" {
+		return h.findBundled(name)
 	}
 	data := filepath.Join(h.dataDir, "plugins", name, spec.Version, BinaryName(name))
 	_, err := os.Lstat(data)
 	switch {
 	case err == nil:
-		loc := Location{Path: data, Source: SourceDataDir}
+		loc := Location{Path: data, Source: SourceDataDir, Version: spec.Version}
 		if spec.SHA256 == "" {
 			return loc, "", fmt.Errorf("%s is installed under the data directory, which needs sha256 set for the plugin", data)
 		}
 		return loc, h.dataDir, nil
 	case !errors.Is(err, fs.ErrNotExist):
-		return Location{Path: data, Source: SourceDataDir}, "", err
+		return Location{Path: data, Source: SourceDataDir, Version: spec.Version}, "", err
 	}
 	if h.pluginDir == "" {
-		return Location{Path: data, Source: SourceDataDir}, "", fmt.Errorf("version %s is not installed: %s does not exist", spec.Version, data)
+		return Location{Path: data, Source: SourceDataDir, Version: spec.Version}, "", fmt.Errorf("version %s is not installed: %s does not exist", spec.Version, data)
 	}
 	system := filepath.Join(h.pluginDir, name, spec.Version, BinaryName(name))
 	if _, err := os.Lstat(system); errors.Is(err, fs.ErrNotExist) {
@@ -141,9 +155,39 @@ func (h *Host) find(name string, spec config.PluginSpec) (Location, string, erro
 		if have := installedVersions(filepath.Join(h.pluginDir, name)); len(have) > 0 {
 			msg += fmt.Sprintf(" (the system plugin directory has %s; plugins there have the connector's version)", strings.Join(have, ", "))
 		}
-		return Location{Path: data, Source: SourceDataDir}, "", errors.New(msg)
+		return Location{Path: data, Source: SourceDataDir, Version: spec.Version}, "", errors.New(msg)
 	}
-	return Location{Path: system, Source: SourcePluginDir}, string(filepath.Separator), nil
+	return Location{Path: system, Source: SourcePluginDir, Version: spec.Version}, string(filepath.Separator), nil
+}
+
+// findBundled finds a plugin declared without version and path: the only
+// version of it in the system plugin directory. Plugins under
+// <data_dir>/plugins are never picked this way; they need a version and a
+// sha256. The binary is then checked like any other in the system plugin
+// directory, plugins.lock included.
+func (h *Host) findBundled(name string) (Location, string, error) {
+	if h.pluginDir == "" {
+		return Location{}, "", errors.New("no version is set and there is no system plugin directory; set version")
+	}
+	dir := filepath.Join(h.pluginDir, name)
+	if _, err := os.ReadDir(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return Location{}, "", fmt.Errorf("no version is set and the system plugin directory cannot be read: %w", err)
+	}
+	versions := installedVersions(dir)
+	switch len(versions) {
+	case 0:
+		return Location{}, "", fmt.Errorf("no version is set and the system plugin directory has none installed (%s); "+
+			"install the krakenkey-connector package or use the container image, which include it, "+
+			"or set version and sha256 and install the plugin under %s",
+			dir, filepath.Join(h.dataDir, "plugins", name, "<version>"))
+	case 1:
+	default:
+		return Location{}, "", fmt.Errorf("no version is set and the system plugin directory has several (%s in %s); set version to the one to use",
+			strings.Join(versions, ", "), dir)
+	}
+	v := versions[0]
+	loc := Location{Path: filepath.Join(dir, v, BinaryName(name)), Source: SourcePluginDir, Version: v, Bundled: true}
+	return loc, string(filepath.Separator), nil
 }
 
 // installedVersions lists the version directories under dir, for error

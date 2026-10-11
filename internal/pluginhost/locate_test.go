@@ -243,3 +243,147 @@ func TestParseLock(t *testing.T) {
 		}
 	}
 }
+
+func TestBundledPlugin(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a subprocess")
+	}
+	t.Setenv(servePluginEnv, "1")
+	dir, bin, sum := systemDir(t)
+
+	h := systemHost(t, dir, config.PluginSpec{})
+	loc, err := h.CheckPlugin("mem")
+	if err != nil {
+		t.Fatalf("CheckPlugin: %v", err)
+	}
+	want := Location{Path: bin, Source: SourcePluginDir, Version: "1.0.0", Bundled: true, SHA256: sum, PinnedBy: []string{LockFile}}
+	if loc.Path != want.Path || loc.Source != want.Source || loc.Version != want.Version || !loc.Bundled ||
+		loc.SHA256 != want.SHA256 || !slices.Equal(loc.PinnedBy, want.PinnedBy) {
+		t.Errorf("location = %+v, want %+v", loc, want)
+	}
+	tg, err := h.Target("mem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.Describe(context.Background()); err != nil {
+		t.Fatalf("Describe: %v", err)
+	}
+
+	// A sha256 in the config is checked as well.
+	h = systemHost(t, dir, config.PluginSpec{SHA256: sum})
+	if loc, err := h.CheckPlugin("mem"); err != nil || !slices.Equal(loc.PinnedBy, []string{PinConfig, LockFile}) {
+		t.Errorf("CheckPlugin = %+v, %v", loc, err)
+	}
+
+	// An explicit version is not marked as bundled.
+	h = systemHost(t, dir, config.PluginSpec{Version: "1.0.0"})
+	if loc, err := h.CheckPlugin("mem"); err != nil || loc.Bundled || loc.Version != "1.0.0" {
+		t.Errorf("CheckPlugin = %+v, %v", loc, err)
+	}
+}
+
+// A plugin without a version is only ever taken from the system plugin
+// directory, never from <data_dir>/plugins.
+func TestBundledPluginIgnoresDataDir(t *testing.T) {
+	dir, bin, _ := systemDir(t)
+	h := systemHost(t, dir, config.PluginSpec{})
+	exe, _ := selfBinary(t)
+	data, _ := os.ReadFile(exe)
+	local := filepath.Join(h.dataDir, "plugins", "mem", "1.0.0", BinaryName("mem"))
+	if err := os.MkdirAll(filepath.Dir(local), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(local, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	f, loc, err := h.open("mem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if loc.Path != bin || loc.Source != SourcePluginDir || !loc.Bundled {
+		t.Errorf("location = %+v, want the system plugin directory", loc)
+	}
+
+	// With nothing in the system plugin directory, the copy under
+	// data_dir is still not used.
+	if err := os.RemoveAll(filepath.Join(dir, "mem")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.open("mem"); err == nil || !strings.Contains(err.Error(), "has none installed") {
+		t.Errorf("err = %v, want none installed", err)
+	}
+}
+
+func TestBundledPluginRefusals(t *testing.T) {
+	dir, bin, sum := systemDir(t)
+	lockPath := filepath.Join(dir, LockFile)
+	goodLock, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(dir, "mem", "2.0.0")
+
+	tests := []struct {
+		name  string
+		noDir bool
+		setup func(t *testing.T)
+		want  []string
+	}{
+		{name: "not installed", setup: func(t *testing.T) {
+			_ = os.Rename(filepath.Join(dir, "mem"), filepath.Join(dir, "mem.away"))
+		}, want: []string{"no version is set", "has none installed (" + filepath.Join(dir, "mem") + ")", "install the krakenkey-connector package"}},
+		{name: "several versions", setup: func(t *testing.T) { _ = os.MkdirAll(second, 0o755) },
+			want: []string{"has several (1.0.0, 2.0.0 in " + filepath.Join(dir, "mem") + ")", "set version"}},
+		{name: "no system plugin directory", noDir: true,
+			want: []string{"no version is set and there is no system plugin directory; set version"}},
+		{name: "lock missing", setup: func(t *testing.T) { _ = os.Remove(lockPath) },
+			want: []string{"plugins in the system plugin directory are refused", LockFile + " does not exist"}},
+		{name: "lock checksum differs", setup: func(t *testing.T) {
+			writeLock(t, dir, strings.Repeat("0", 64)+"  "+lockKey("mem", "1.0.0")+"\n")
+		}, want: []string{"checksum mismatch", "plugins.lock says 0000"}},
+		{name: "no lock entry", setup: func(t *testing.T) {
+			writeLock(t, dir, sum+"  "+lockKey("mem", "0.9.0")+"\n")
+		}, want: []string{"has no entry for mem/1.0.0/" + BinaryName("mem")}},
+		{name: "binary writable by group", setup: func(t *testing.T) { _ = os.Chmod(bin, 0o775) },
+			want: []string{"writable by group or others"}},
+		{name: "owned by the connector's user, not root", setup: func(t *testing.T) {
+			systemDirOwnUser = false
+			if os.Geteuid() == 0 {
+				_ = os.Chown(bin, 4242, 4242)
+			}
+		}, want: []string{"not root; everything in the system plugin directory must be owned by root"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeLock(t, dir, string(goodLock))
+			if tt.setup != nil {
+				tt.setup(t)
+			}
+			t.Cleanup(func() {
+				systemDirOwnUser = true
+				_ = os.Rename(filepath.Join(dir, "mem.away"), filepath.Join(dir, "mem"))
+				_ = os.RemoveAll(second)
+				_ = os.Chmod(bin, 0o755)
+				if os.Geteuid() == 0 {
+					_ = os.Chown(bin, 0, 0)
+				}
+			})
+			pluginDir := dir
+			if tt.noDir {
+				pluginDir = ""
+			}
+			h := systemHost(t, pluginDir, config.PluginSpec{})
+			_, err := h.Target("mem")
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			for _, w := range tt.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("err = %v, want %q", err, w)
+				}
+			}
+		})
+	}
+}

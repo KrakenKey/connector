@@ -469,6 +469,7 @@ cannot be undone without something to go back to.
 ```yaml
 plugins:
   azure-keyvault: { version: 0.1.0, sha256: "<hex>", call_timeout: 5m }
+  aws-acm: {}   # the bundled version, see below
 ```
 
 The connector finds a plugin's binary, `krakenkey-connector-plugin-<name>`,
@@ -484,6 +485,21 @@ in the first of these places that applies:
    [included plugins](#included-plugins). `sha256` is optional here: the
    binary must match its line in `<plugin_dir>/plugins.lock`, and also the
    `sha256` setting if there is one.
+
+Without `version` and `path`, the connector uses the bundled plugin: the
+only version of it under `<plugin_dir>/<name>/`, checked against
+`plugins.lock` like any plugin there. This is how the
+[container image](#container-image) is meant to be used: the plugins it
+ships carry the connector's version, so a config without versions keeps
+working when you move to a new image. If the system plugin directory has no
+version of the plugin, or more than one, the connector refuses to start it
+and says so; set `version` to choose. A plugin without `version` is never
+taken from `<data_dir>/plugins`, where a plugin always needs `version` and
+`sha256`. `validate` shows the version it used:
+
+```text
+  azure-keyvault 0.2.0 (bundled, version not set): /usr/lib/krakenkey-connector/plugins/azure-keyvault/0.2.0/krakenkey-connector-plugin-azure-keyvault (system plugin dir)
+```
 
 `plugins.lock` lists one binary per line in `sha256sum` format:
 
@@ -557,19 +573,21 @@ needs.
 The image has the plugins in the system plugin directory,
 `/usr/lib/krakenkey-connector/plugins/<name>/<version>/`, owned by root and
 read-only for the connector's user, with a `plugins.lock` written when the
-image was built. Declare a plugin with the connector's version (what
-`krakenkey-connector version` prints, without the leading `v`) and no
-`sha256`:
+image was built. Declare the plugins you use without a version, and the
+connector uses the ones in the image:
 
 ```yaml
 plugins:
-  azure-keyvault: { version: 0.1.0 }
-  azure-appgateway: { version: 0.1.0, call_timeout: 15m }
+  azure-keyvault: {}
+  azure-appgateway: { call_timeout: 15m }
 ```
 
-When you upgrade the image, change the version in the config with it. An
-image built from source with `docker build` uses the `VERSION` build
-argument (default `dev`) as the version.
+The config then keeps working when you upgrade the image. To pin a plugin
+instead, set `version` to the connector's version (what
+`krakenkey-connector version` prints, without the leading `v`), and change
+it whenever you upgrade the image. An image built from source with
+`docker build` uses the `VERSION` build argument (default `dev`) as the
+plugins' version.
 
 ### On a host
 

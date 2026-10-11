@@ -217,7 +217,6 @@ certificates:
 			`data_dir "relative/dir" must be an absolute path`,
 			`plugins.file: "file" is a built-in plugin`,
 			"plugins.Bad_Name: name must be lowercase",
-			"plugins.nover: set version or path",
 			"plugins.badsum: sha256 must be 64 hex characters",
 			"plugins.slow: call_timeout must be at least 1s",
 			`certificate 6: target w: verify: host "other.example.com" is not one of the certificate's names`,
@@ -262,6 +261,34 @@ certificates:
 				}
 			}
 		})
+	}
+}
+
+// A plugin without version or path uses the bundled version, which the
+// plugin host resolves from plugin_dir, so the config accepts it.
+func TestPluginWithoutVersion(t *testing.T) {
+	t.Setenv("KK_API_URL", "")
+	cfg, err := Parse(strings.NewReader(`
+plugins:
+  braces: {}
+  empty:
+  timeout: { call_timeout: 15m }
+certificates:
+  - id: 1
+    names: [a.example.com]
+    targets: [{ label: x, plugin: braces }]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"braces", "empty", "timeout"} {
+		spec, ok := cfg.Plugins[name]
+		if !ok || spec.Version != "" || spec.Path != "" {
+			t.Errorf("plugins.%s = %+v, %v", name, spec, ok)
+		}
+	}
+	if got := cfg.Plugins["timeout"].CallTimeout; got != 15*time.Minute {
+		t.Errorf("call_timeout = %s", got)
 	}
 }
 
