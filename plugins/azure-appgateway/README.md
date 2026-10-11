@@ -214,6 +214,13 @@ reports it as a permanent failure. The connector still retries failed
 targets with backoff, so it keeps failing the same way until the role or the
 config is fixed.
 
+Errors keep the HTTP status, Azure's error code and the denied action, but
+not Azure's message, which names the caller's application and object ids,
+its tenant and the subscription. Token errors keep the HTTP status and the
+Microsoft Entra error code (`AADSTS...`). Ids and token issuer URLs are
+removed from any other error text from the Azure SDK, so none of them reach
+the connector's log or the status reported to KrakenKey.
+
 ## Limitations
 
 - RSA keys only. Microsoft does not document ECDSA listener certificates for
