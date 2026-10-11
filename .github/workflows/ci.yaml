@@ -175,15 +175,44 @@ jobs:
           version=$(jq -r .version dist/metadata.json)
           scripts/check-image-plugins.sh "ghcr.io/krakenkey/connector:v${version}-amd64" "$version" dist
 
-      # The packages must install, carry the same plugin binaries with a
-      # matching plugins.lock, let the service user start every plugin with
-      # `validate --offline`, and remove cleanly. arm64 runs under QEMU.
-      - name: Check the packages
+      # The packages must install, carry the plugin binaries GoReleaser
+      # built with a matching plugins.lock, let the service user start every
+      # plugin with `validate --offline`, and remove cleanly.
+      - name: Check the amd64 packages
         run: |
           version=$(jq -r .version dist/metadata.json)
           scripts/check-packages.sh debian:12 "dist/krakenkey-connector_${version}_linux_amd64.deb"
           scripts/check-packages.sh rockylinux:9 "dist/krakenkey-connector_${version}_linux_amd64.rpm"
-          scripts/check-packages.sh debian:12 "dist/krakenkey-connector_${version}_linux_arm64.deb" linux/arm64
+
+      # The arm64 packages are checked on an arm64 runner: under QEMU the
+      # connector cannot start plugins through /proc/self/fd.
+      - name: Keep the arm64 packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: packages-arm64
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            dist/krakenkey-connector_*_linux_arm64.deb
+            dist/krakenkey-connector_*_linux_arm64.rpm
+            dist/plugin-*_linux_arm64*/krakenkey-connector-plugin-*
+
+  packages-arm64:
+    name: Check the arm64 packages
+    needs: release-snapshot
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages-arm64
+          path: dist
+
+      - name: Check the arm64 packages
+        run: |
+          scripts/check-packages.sh debian:12 dist/krakenkey-connector_*_linux_arm64.deb linux/arm64
+          scripts/check-packages.sh rockylinux:9 dist/krakenkey-connector_*_linux_arm64.rpm linux/arm64
 
   proto:
     name: Generated code is current
