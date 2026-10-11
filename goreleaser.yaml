@@ -44,6 +44,12 @@ builds:
     goarch:
       - amd64
       - arm64
+    hooks:
+      post: &stage-plugin
+        # Copies the binary into the .deb and .rpm system plugin directory
+        # and rewrites its plugins.lock (Linux builds only).
+        - cmd: scripts/stage-package-plugin.sh {{ .Os }} {{ .Arch }} {{ .Path }} {{ .Version }}
+          output: true
 
   - id: plugin-azure-keyvault
     dir: plugins/azure-keyvault
@@ -63,6 +69,8 @@ builds:
     goarch:
       - amd64
       - arm64
+    hooks:
+      post: *stage-plugin
 
   - id: plugin-azure-appgateway
     dir: plugins/azure-appgateway
@@ -82,6 +90,8 @@ builds:
     goarch:
       - amd64
       - arm64
+    hooks:
+      post: *stage-plugin
 
 archives:
   - id: connector
@@ -121,6 +131,199 @@ archives:
       - LICENSE
       - src: plugins/azure-appgateway/README.md
         strip_parent: true
+
+# .deb and .rpm packages for Linux: the connector in /usr/bin, the plugins
+# above in the system plugin directory with their plugins.lock (the same
+# layout and binaries as the container image), and a systemd unit. The
+# plugin builds' post hook stages the plugins under dist/packages/.
+nfpms:
+  - id: connector
+    ids: [connector]
+    package_name: krakenkey-connector
+    file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    vendor: KrakenKey
+    homepage: https://krakenkey.io
+    maintainer: KrakenKey <security@krakenkey.io>
+    description: |-
+      Renews KrakenKey certificates and deploys them to your systems.
+      The connector creates each new private key on this machine (or in
+      your key vault) and sends only the CSR to KrakenKey, then deploys
+      the issued certificate to files, commands, key vaults and cloud load
+      balancers, verifies it and rolls back on failure. Includes the
+      aws-acm, azure-keyvault and azure-appgateway plugins and a systemd
+      unit, krakenkey-connector.service.
+    license: Apache-2.0
+    section: net
+    priority: optional
+    mtime: "{{ .CommitDate }}"
+    contents:
+      # Plugins: root-owned and read-only, as the system plugin directory
+      # requires.
+      - dst: /usr/lib/krakenkey-connector
+        type: dir
+        file_info: &dir
+          mode: 0755
+          owner: root
+          group: root
+          mtime: "{{ .CommitDate }}"
+      - dst: /usr/lib/krakenkey-connector/plugins
+        type: dir
+        file_info: *dir
+      - src: "dist/packages/linux_{{ .Arch }}/plugins/plugins.lock"
+        dst: /usr/lib/krakenkey-connector/plugins/plugins.lock
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+          mtime: "{{ .CommitDate }}"
+      - dst: /usr/lib/krakenkey-connector/plugins/aws-acm
+        type: dir
+        file_info: *dir
+      - dst: "/usr/lib/krakenkey-connector/plugins/aws-acm/{{ .Version }}"
+        type: dir
+        file_info: *dir
+      - src: "dist/packages/linux_{{ .Arch }}/plugins/aws-acm/{{ .Version }}/krakenkey-connector-plugin-aws-acm"
+        dst: "/usr/lib/krakenkey-connector/plugins/aws-acm/{{ .Version }}/krakenkey-connector-plugin-aws-acm"
+        file_info: &bin
+          mode: 0755
+          owner: root
+          group: root
+          mtime: "{{ .CommitDate }}"
+      - dst: /usr/lib/krakenkey-connector/plugins/azure-keyvault
+        type: dir
+        file_info: *dir
+      - dst: "/usr/lib/krakenkey-connector/plugins/azure-keyvault/{{ .Version }}"
+        type: dir
+        file_info: *dir
+      - src: "dist/packages/linux_{{ .Arch }}/plugins/azure-keyvault/{{ .Version }}/krakenkey-connector-plugin-azure-keyvault"
+        dst: "/usr/lib/krakenkey-connector/plugins/azure-keyvault/{{ .Version }}/krakenkey-connector-plugin-azure-keyvault"
+        file_info: *bin
+      - dst: /usr/lib/krakenkey-connector/plugins/azure-appgateway
+        type: dir
+        file_info: *dir
+      - dst: "/usr/lib/krakenkey-connector/plugins/azure-appgateway/{{ .Version }}"
+        type: dir
+        file_info: *dir
+      - src: "dist/packages/linux_{{ .Arch }}/plugins/azure-appgateway/{{ .Version }}/krakenkey-connector-plugin-azure-appgateway"
+        dst: "/usr/lib/krakenkey-connector/plugins/azure-appgateway/{{ .Version }}/krakenkey-connector-plugin-azure-appgateway"
+        file_info: *bin
+
+      - src: packaging/krakenkey-connector.service
+        dst: /usr/lib/systemd/system/krakenkey-connector.service
+        file_info:
+          mode: 0644
+          mtime: "{{ .CommitDate }}"
+
+      # Config: readable by root and the service's group only. Upgrades keep
+      # local edits.
+      - dst: /etc/krakenkey-connector
+        type: dir
+        file_info:
+          mode: 0750
+          owner: root
+          group: krakenkey-connector
+          mtime: "{{ .CommitDate }}"
+      - src: packaging/config.yaml
+        dst: /etc/krakenkey-connector/config.yaml
+        type: config|noreplace
+        file_info: &config
+          mode: 0640
+          owner: root
+          group: krakenkey-connector
+          mtime: "{{ .CommitDate }}"
+      # Without this entry the .deb would give /etc/default the group of
+      # the file below.
+      - dst: /etc/default
+        type: dir
+        packager: deb
+        file_info: *dir
+      - src: packaging/krakenkey-connector.env
+        dst: /etc/default/krakenkey-connector
+        type: config|noreplace
+        packager: deb
+        file_info: *config
+      - src: packaging/krakenkey-connector.env
+        dst: /etc/sysconfig/krakenkey-connector
+        type: config|noreplace
+        packager: rpm
+        file_info: *config
+
+      - dst: /usr/share/doc/krakenkey-connector
+        type: dir
+        file_info: *dir
+      - src: LICENSE
+        dst: /usr/share/doc/krakenkey-connector/LICENSE
+        file_info: &doc
+          mode: 0644
+          mtime: "{{ .CommitDate }}"
+      - src: README.md
+        dst: /usr/share/doc/krakenkey-connector/README.md
+        file_info: *doc
+      - src: CHANGELOG.md
+        dst: /usr/share/doc/krakenkey-connector/CHANGELOG.md
+        file_info: *doc
+    # The preinstall script creates the service user with groupadd and
+    # useradd. Minimal images such as amazonlinux:2023 lack them.
+    overrides:
+      deb:
+        dependencies: [passwd]
+      rpm:
+        dependencies: [shadow-utils]
+    scripts:
+      preinstall: packaging/scripts/preinstall.sh
+      postinstall: packaging/scripts/postinstall.sh
+      preremove: packaging/scripts/preremove.sh
+      postremove: packaging/scripts/postremove.sh
+    rpm:
+      scripts:
+        # RPM runs postinstall before removing the old package's files, so
+        # the restart after an upgrade happens here.
+        posttrans: packaging/scripts/posttrans.sh
+
+# Homebrew cask in KrakenKey/homebrew-tap: the connector only. Plugins are
+# installed from their release archives (see the README), and Homebrew does
+# not run the connector as a service.
+homebrew_casks:
+  - name: krakenkey-connector
+    ids: [connector]
+    binaries: [krakenkey-connector]
+    homepage: https://krakenkey.io
+    description: Renews KrakenKey certificates and deploys them to your systems
+    license: Apache-2.0
+    # Prereleases (vX.Y.Z-rc.1) don't update the tap.
+    skip_upload: auto
+    repository:
+      owner: KrakenKey
+      name: homebrew-tap
+      branch: main
+      git:
+        url: git@github.com:KrakenKey/homebrew-tap.git
+        # Write deploy key for KrakenKey/homebrew-tap, set only in the
+        # release workflow.
+        private_key: '{{ envOrDefault "HOMEBREW_TAP_DEPLOY_KEY" "" }}'
+    commit_author:
+      name: krakenhavoc
+      email: krakenhavoc@protonmail.com
+    commit_msg_template: "chore: update krakenkey-connector to {{ .Tag }}"
+    caveats: |
+      The included plugins are not part of this cask. To use one, install it
+      from the same release under the data directory, with its sha256 in the
+      config: https://github.com/KrakenKey/connector#on-a-host
+
+      Homebrew does not run the connector as a service. Run it with
+      `krakenkey-connector run --config <file>`, or from launchd or cron
+      with `run --once`.
+    hooks:
+      post:
+        # The binary isn't notarized; drop the quarantine flag so macOS runs it.
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/krakenkey-connector"]
+          end
 
 checksum:
   name_template: checksums.txt
