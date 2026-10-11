@@ -153,6 +153,10 @@ type fakeTarget struct {
 	applyThenFail error
 	// failRollback makes Rollback fail without changing anything.
 	failRollback error
+	// failStage makes Stage fail; with serveOnStage the target serves the
+	// certificate anyway, as when a key store made it live.
+	failStage    error
+	serveOnStage bool
 	// rollbackBudget is the time left on the context Rollback got.
 	rollbackBudget time.Duration
 }
@@ -181,6 +185,12 @@ func (f *fakeTarget) Current(context.Context, plugin.CurrentRequest) (string, er
 func (f *fakeTarget) Stage(_ context.Context, req plugin.StageRequest) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failStage != nil {
+		if f.serveOnStage {
+			f.installed, f.live = req.Serial, req.Serial
+		}
+		return "", f.failStage
+	}
 	if req.Key.Format != plugin.KeyFormatPEM || len(req.Key.Data) == 0 {
 		return "", errors.New("no key")
 	}
@@ -831,7 +841,7 @@ func TestThenFailureRollsBack(t *testing.T) {
 	}
 	e2.job.Targets[0].Config.Then = &config.Then{Exec: []string{"fail"}}
 	err = e2.process(t, true)
-	if err == nil || !strings.Contains(err.Error(), "files rolled back, but then.exec failed afterwards") {
+	if err == nil || !strings.Contains(err.Error(), "rolled back, but then.exec failed afterwards") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -1048,7 +1058,7 @@ func TestOutcomesAreRecorded(t *testing.T) {
 		"async": {func(e *env) {
 			e.targets["a"].broken = true
 			e.targets["a"].caps.PropagatesAsync = true
-		}, OutcomeUnverifiable},
+		}, OutcomeVerifyFailed},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

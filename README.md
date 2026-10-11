@@ -560,8 +560,11 @@ them, or the one given with `--cert`). For each of their targets it sends:
 
 - the state: `pending` (nothing deployed yet, or a newer certificate is
   waiting to be deployed), `staged`, `activated` (not verified yet),
-  `verified`, `activated_unverifiable` (no `verify` block, or a target that
-  propagates on its own schedule), `failed` or `rolled_back`;
+  `verified`, `activated_unverifiable` (no `verify` block), `failed` or
+  `rolled_back`. A target that picks up changes on its own schedule and
+  fails its check is reported as `failed`, with an error that says it was
+  not rolled back; later passes check it again until it passes or a newer
+  certificate replaces it;
 - the serial number of the certificate the target has;
 - for failures, a short error message: private keys, API keys and
   enrollment tokens removed, paths under the data directory shortened, at
@@ -601,6 +604,7 @@ Connectors that use an API key instead of enrollment do not report.
 | `certificates[].names` | | DNS names. Must equal the certificate's names. |
 | `certificates[].key_store.plugin` | `local` | Key store plugin. |
 | `certificates[].key_store.key_type` | `ecdsa-p256` | `ecdsa-p256`, `ecdsa-p384`, `rsa-2048`, `rsa-3072` (and `rsa-4096` for plugins that support it). |
+| `certificates[].targets` | | Where the certificate goes. At least one, unless the key store adds one by itself (see [Implicit targets](#implicit-targets)). |
 | `certificates[].targets[].label` | | Name for logs and the audit log. Unique per certificate. |
 | `certificates[].targets[].plugin` | | `file`, `exec`, or an external plugin. |
 | `certificates[].targets[].then.exec` | | Command run after activation and again after a rollback, such as a reload. No shell; the program is an absolute path or a name from `PATH`. |
@@ -608,6 +612,63 @@ Connectors that use an API key instead of enrollment do not report.
 | `certificates[].targets[].verify` | | How to check the deployment. See below. |
 
 Any other keys in a `key_store` or target block are settings for that plugin.
+
+### Implicit targets
+
+Some key stores put the issued certificate where services already read it.
+With the [`azure-keyvault`](plugins/azure-keyvault/README.md) key store, for
+example, the connector merges each renewal into the Key Vault certificate,
+and services that reference it without a version pick up the new version
+from there. Such a key store adds a target by itself, the **implicit
+target**, so the certificate is deployed, reported and alerted on even when
+the config lists no targets:
+
+```yaml
+certificates:
+  - id: 1043
+    names: [api.example.com]
+    key_store: { plugin: azure-keyvault, vault: kv-prod-tls, certificate_name: api-example-com }
+    # no targets: the key store adds one, labeled "azure-keyvault"
+```
+
+The implicit target is labeled with the key store plugin's name from the
+`plugins` block (`azure-keyvault` above), served by the same plugin, and
+deployed first. It needs no exportable key, because the certificate is
+already there. On a normal deployment it finds the certificate in place and
+changes nothing. When it is not in place (after a rollback, or when
+something else added a newer version), the plugin puts it back, and a
+rollback puts the previous certificate back; both need the key, so they work
+only when the key store allows export. It has no `verify` or `then` block,
+so its deployments are reported as activated but not verified. `validate`
+lists it as `implicit`.
+
+To verify it, run a command after it, or give it another label, configure a
+target of the same plugin that deploys to the same place. That target takes
+the implicit target's place:
+
+```yaml
+    targets:
+      - label: azure-keyvault       # keep the label to keep its deployment history
+        plugin: azure-keyvault
+        vault: kv-prod-tls
+        certificate_name: api-example-com
+        verify: { host: api.example.com }
+```
+
+Services that poll the key store can take hours to pick up a new version;
+the key store plugin's README says how long, and what verify window to use.
+
+The plugin tells the connector where a target deploys, so the match does not
+depend on how the settings are spelled. Declare each plugin once: the same
+executable under two names is two plugins to the connector, so a target
+under the other name does not replace the implicit target (`validate` warns
+when it sees that).
+
+If another target already uses the implicit target's label (a config written
+before implicit targets), the implicit target is not added, and `validate`
+warns; rename that target to get it. There is no setting to turn the
+implicit target off. It only reads, except when it has to put a certificate
+back: the current one after a rollback, or the previous one on a rollback.
 
 ### Verify
 
@@ -636,6 +697,12 @@ lists it.
 
 A target without a `verify` block is activated without any check. `validate`
 warns about it.
+
+A failed check rolls the target back, except on targets that pick up
+changes on their own schedule (for example a cloud service that polls a
+vault): there the new certificate stays, the target is reported as
+`failed`, and every later pass checks it again until the check passes or a
+newer certificate replaces it.
 
 ### Built-in key store: `local`
 
@@ -977,6 +1044,19 @@ are exportable or not per vault) implements
 `plugin.KeyStoreCapabilityValidator`. The connector then matches each
 certificate's targets against the capabilities for that certificate's
 settings, so `validate` catches a pair that cannot work.
+
+A key store whose certificate is itself a deployment returns
+`KeyStoreCapabilities.ImplicitTarget` from `ValidateCapabilities`: settings
+for a target of its own plugin and a `DeploymentID` saying where that is. Its
+plugin also serves a target that implements
+`plugin.TargetDeploymentValidator` and returns the same kind of
+`DeploymentID` for its settings. The connector adds the
+[implicit target](#implicit-targets) unless a configured target of that
+plugin reports the same id, sends that target
+`TargetValidateRequest.KeyStoreDeploymentID` so it can skip checks the key
+store already makes, and matches it with `plugin.MatchKeyStoreDeployment`,
+which does not require an exportable key. Two targets of one certificate
+with the same plugin and `DeploymentID` are reported as a problem.
 
 ## Development
 

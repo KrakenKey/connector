@@ -41,6 +41,27 @@
 // Secrets. KeyMaterial carries private keys and passwords. Neither side may
 // log request or response messages that contain it (CreateCSR responses do
 // not; ExportResponse, StageRequest and RollbackRequest do).
+//
+// Key store deployments. Some key stores put the issued certificate where
+// services already read it, as part of Complete (for example a Key Vault
+// certificate that services reference without a version). Such a key store
+// reports an implicit_target from Validate, and the connector then deploys
+// to a target of the key store's own plugin with those settings, even when
+// the config lists no target for it. That target, or a configured target of
+// the same plugin that deploys to the same place (same deployment_id), is
+// the key store's own deployment:
+//
+//   - The connector matches it with the key store without requiring an
+//     exportable key: the certificate is already there. It hands the key
+//     as KEY_FORMAT_VAULT_REF when both sides support that, else in a key
+//     byte format if the key store allows export, else not at all.
+//   - Stage and Activate are called as for any target. They usually find
+//     the certificate in place and change nothing; they must still be able
+//     to put it back after a rollback.
+//   - Rollback works as for any target. A target with
+//     rollback_needs_material gets the previous key in the same format as
+//     for Stage; when the key store does not allow export, the connector
+//     reports rollback as unavailable.
 syntax = "proto3";
 
 package krakenkey.connector.plugin.v1;
@@ -95,6 +116,26 @@ message KeyStoreCapabilities {
   bool exportable = 2;
   // Key types CreateCSR accepts.
   repeated KeyType key_types = 3;
+  // The deployment the key store makes by itself in Complete (see "Key
+  // store deployments" above). Only read from
+  // KeyStoreServiceValidateResponse.capabilities, which has the settings it
+  // depends on; ignored in Describe. Connectors without the
+  // "implicit_target" core feature ignore it.
+  ImplicitTarget implicit_target = 4;
+}
+
+// ImplicitTarget is a target the connector adds to every certificate that
+// uses the key store with these settings. It is served by the key store's
+// own plugin, which must also serve TargetService. The connector labels it
+// with the key store plugin's name from its config.
+message ImplicitTarget {
+  // Target settings, sent as config_json in TargetService calls.
+  bytes config_json = 1;
+  // Where the key store deploys, in the form the plugin's
+  // TargetServiceValidateResponse.deployment_id uses. Required: a
+  // configured target of the same plugin whose Validate returns this id
+  // replaces the implicit target (for example to add a verify block).
+  string deployment_id = 2;
 }
 
 message KeyStoreServiceDescribeRequest {
@@ -244,7 +285,8 @@ message TargetCapabilities {
   int64 default_verify_window_seconds = 5;
   // The target picks up changes on its own schedule (for example a cloud
   // service that polls a vault). The core reports verification failures for
-  // such targets but does not roll them back.
+  // such targets but does not roll them back, and checks them again on
+  // later passes.
   bool propagates_async = 6;
   // Rollback needs the previous certificate and its private key handed
   // back, because the target cannot keep them itself (for example a cloud
@@ -266,6 +308,10 @@ message TargetServiceDescribeRequest {
   //     previous_* fields for targets with rollback_needs_material.
   //   - "keystore_validate_capabilities": the connector uses
   //     KeyStoreServiceValidateResponse.capabilities.
+  //   - "implicit_target": the connector adds the implicit_target a key
+  //     store reports, sends key_store_deployment_id and reads
+  //     deployment_id in TargetService.Validate (see "Key store
+  //     deployments" above).
   repeated string core_features = 1;
   // Opaque, stable id of the connector installation (see "Install id"
   // above).
@@ -284,11 +330,24 @@ message TargetServiceValidateRequest {
   // Opaque, stable id of the connector installation (see "Install id"
   // above).
   string install_id = 4;
+  // The deployment_id of the implicit_target reported by the
+  // certificate's key store. Set only when that key store is served by the
+  // same plugin as this target. A target whose settings have this
+  // deployment_id is the key store's own deployment and may skip checks
+  // the key store already makes (for example who owns the certificate).
+  string key_store_deployment_id = 5;
 }
 
 message TargetServiceValidateResponse {
   // Human readable problems. Empty means the config is usable.
   repeated string problems = 1;
+  // Optional: an opaque, stable id of the place these settings deploy to
+  // (for example a normalized vault URL and certificate name), set even
+  // when there are problems if the settings say where that is. The
+  // connector reports two targets of one certificate with the same plugin
+  // and deployment_id as a problem, and a target whose deployment_id is
+  // the key store's implicit_target replaces that implicit target.
+  string deployment_id = 2;
 }
 
 message CurrentRequest {

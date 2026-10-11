@@ -102,9 +102,13 @@ const (
 // KrakenKey.
 const (
 	OutcomeVerified     = "verified"               // verified with a TLS handshake
-	OutcomeUnverifiable = "activated_unverifiable" // activated, not verified (no verify block, or the target propagates on its own schedule and verification failed)
+	OutcomeUnverifiable = "activated_unverifiable" // activated, not verified (no verify block)
 	OutcomeFailed       = "failed"                 // failed, not rolled back (nothing changed, or the new certificate stayed)
 	OutcomeRolledBack   = "rolled_back"            // failed and rolled back to the previous certificate
+	// OutcomeVerifyFailed: activated on a target that picks up changes on
+	// its own schedule, but the check failed. It keeps the certificate,
+	// is reported as failed, and is checked again on later passes.
+	OutcomeVerifyFailed = "verify_failed"
 )
 
 // TargetState is what the connector knows about one target.

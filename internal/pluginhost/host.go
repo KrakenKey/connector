@@ -142,6 +142,14 @@ func (h *Host) CheckPlugin(name string) (Location, error) {
 	return h.locations[name], nil
 }
 
+// PluginChecksum returns the checksum of the executable the external
+// plugin called name runs, or "" when it has not been started.
+func (h *Host) PluginChecksum(name string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.locations[name].SHA256
+}
+
 // rpc returns a running client for the plugin, starting it, or restarting
 // it if it has exited.
 func (h *Host) rpc(name string) (goplugin.ClientProtocol, error) {
@@ -468,6 +476,18 @@ func (r *remoteTarget) Validate(ctx context.Context, req plugin.TargetValidateRe
 	return t.Validate(ctx, req)
 }
 
+// ValidateDeployment forwards to the plugin, keeping the deployment id it
+// returns for these settings.
+func (r *remoteTarget) ValidateDeployment(ctx context.Context, req plugin.TargetValidateRequest) (plugin.TargetValidation, error) {
+	ctx, cancel := r.ctx(ctx, true)
+	defer cancel()
+	t, err := r.get()
+	if err != nil {
+		return plugin.TargetValidation{}, err
+	}
+	return plugin.ValidateTarget(ctx, t, req)
+}
+
 func (r *remoteTarget) Current(ctx context.Context, req plugin.CurrentRequest) (string, error) {
 	ctx, cancel := r.ctx(ctx, true)
 	defer cancel()
@@ -523,6 +543,8 @@ func (r *remoteTarget) Discard(ctx context.Context, req plugin.DiscardRequest) e
 }
 
 var (
-	_ plugin.KeyStore = (*remoteKeyStore)(nil)
-	_ plugin.Target   = (*remoteTarget)(nil)
+	_ plugin.KeyStore                    = (*remoteKeyStore)(nil)
+	_ plugin.Target                      = (*remoteTarget)(nil)
+	_ plugin.KeyStoreCapabilityValidator = (*remoteKeyStore)(nil)
+	_ plugin.TargetDeploymentValidator   = (*remoteTarget)(nil)
 )

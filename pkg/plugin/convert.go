@@ -101,19 +101,27 @@ func goKeyMaterial(k *pb.KeyMaterial) KeyMaterial {
 }
 
 func pbKeyStoreCaps(c KeyStoreCapabilities) *pb.KeyStoreCapabilities {
-	return &pb.KeyStoreCapabilities{
+	out := &pb.KeyStoreCapabilities{
 		Provides:   pbFormats(c.Provides),
 		Exportable: c.Exportable,
 		KeyTypes:   pbKeyTypes(c.KeyTypes),
 	}
+	if it := c.ImplicitTarget; it != nil {
+		out.ImplicitTarget = &pb.ImplicitTarget{ConfigJson: it.Config, DeploymentId: it.DeploymentID}
+	}
+	return out
 }
 
 func goKeyStoreCaps(c *pb.KeyStoreCapabilities) KeyStoreCapabilities {
-	return KeyStoreCapabilities{
+	out := KeyStoreCapabilities{
 		Provides:   goFormats(c.GetProvides()),
 		Exportable: c.GetExportable(),
 		KeyTypes:   goKeyTypes(c.GetKeyTypes()),
 	}
+	if it := c.GetImplicitTarget(); it != nil {
+		out.ImplicitTarget = &ImplicitTarget{Config: it.GetConfigJson(), DeploymentID: it.GetDeploymentId()}
+	}
+	return out
 }
 
 func pbTargetCaps(c TargetCapabilities) *pb.TargetCapabilities {

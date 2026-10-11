@@ -23,13 +23,14 @@ func (s *targetGRPCServer) Describe(ctx context.Context, req *pb.TargetServiceDe
 
 func (s *targetGRPCServer) Validate(ctx context.Context, req *pb.TargetServiceValidateRequest) (*pb.TargetServiceValidateResponse, error) {
 	ctx = WithInstallID(ctx, req.GetInstallId())
-	problems, err := s.impl.Validate(ctx, TargetValidateRequest{
+	v, err := ValidateTarget(ctx, s.impl, TargetValidateRequest{
 		Config: req.GetConfigJson(), CertificateID: req.GetCertificateId(), Label: req.GetLabel(),
+		KeyStoreDeploymentID: req.GetKeyStoreDeploymentId(),
 	})
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	return &pb.TargetServiceValidateResponse{Problems: problems}, nil
+	return &pb.TargetServiceValidateResponse{Problems: v.Problems, DeploymentId: v.DeploymentID}, nil
 }
 
 func (s *targetGRPCServer) Current(ctx context.Context, req *pb.CurrentRequest) (*pb.CurrentResponse, error) {
@@ -117,13 +118,21 @@ func (c *targetGRPCClient) Describe(ctx context.Context) (TargetCapabilities, er
 }
 
 func (c *targetGRPCClient) Validate(ctx context.Context, req TargetValidateRequest) ([]string, error) {
+	v, err := c.ValidateDeployment(ctx, req)
+	return v.Problems, err
+}
+
+// ValidateDeployment returns the problems and, if the target sent one, the
+// deployment id for these settings.
+func (c *targetGRPCClient) ValidateDeployment(ctx context.Context, req TargetValidateRequest) (TargetValidation, error) {
 	resp, err := c.client.Validate(ctx, &pb.TargetServiceValidateRequest{InstallId: InstallIDFrom(ctx),
 		ConfigJson: req.Config, CertificateId: req.CertificateID, Label: req.Label,
+		KeyStoreDeploymentId: req.KeyStoreDeploymentID,
 	})
 	if err != nil {
-		return nil, fromStatus("target validate", err)
+		return TargetValidation{}, fromStatus("target validate", err)
 	}
-	return resp.GetProblems(), nil
+	return TargetValidation{Problems: resp.GetProblems(), DeploymentID: resp.GetDeploymentId()}, nil
 }
 
 func (c *targetGRPCClient) Current(ctx context.Context, req CurrentRequest) (string, error) {

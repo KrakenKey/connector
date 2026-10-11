@@ -80,7 +80,7 @@ func TestReportMapsState(t *testing.T) {
 	}})
 	r := &Reporter{Config: cfg, State: store, Log: slog.New(slog.DiscardHandler), Version: "1.2.3", OS: "linux", Arch: "arm64",
 		Now: func() time.Time { return at.Add(time.Hour) }}
-	reports := r.Build(map[int]error{1: nil, 2: errors.New("certificate 2: KrakenKey API: not found")})
+	reports := r.Build(map[int]error{1: nil, 2: errors.New("certificate 2: KrakenKey API: not found")}, nil)
 	if len(reports) != 1 {
 		t.Fatalf("%d reports", len(reports))
 	}
@@ -162,7 +162,7 @@ func TestReportLimits(t *testing.T) {
 	for _, c := range cfg.Certificates {
 		all[c.ID] = nil
 	}
-	reports := r.Build(all)
+	reports := r.Build(all, nil)
 	if len(reports) != 2 || len(reports[0].Certificates) != 500 || len(reports[1].Certificates) != 1 {
 		t.Fatalf("split into %d reports", len(reports))
 	}
@@ -279,7 +279,7 @@ certificates:
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			reports := r.Build(map[int]error{1: c.err})
+			reports := r.Build(map[int]error{1: c.err}, nil)
 			if len(reports) != 1 || len(reports[0].Certificates) != 1 {
 				t.Fatalf("report holds certificates that were not processed: %+v", reports)
 			}
@@ -294,7 +294,53 @@ certificates:
 			}
 		})
 	}
-	if reports := r.Build(map[int]error{}); len(reports) != 0 {
+	if reports := r.Build(map[int]error{}, nil); len(reports) != 0 {
 		t.Errorf("a pass that processed nothing reported %+v", reports)
+	}
+}
+
+// TestReportTargetErrorsStayOnTheirTarget checks that a failure of one
+// target is not shown on another target that waits for its deployment,
+// while a failure of the certificate as a whole is.
+func TestReportTargetErrorsStayOnTheirTarget(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	cfg := writeConfig(t, fmt.Sprintf(`
+data_dir: %s
+certificates:
+  - id: 1
+    names: [api.example.com]
+    targets:
+      - { label: a, plugin: exec, command: [/bin/true], verify: { host: api.example.com } }
+      - { label: b, plugin: exec, command: [/bin/true] }
+`, dataDir))
+	store, _ := deploy.OpenStateStore(dataDir)
+	at := time.Date(2026, 10, 10, 14, 0, 0, 0, time.UTC)
+	_ = store.Save(&deploy.State{CertificateID: 1, Serial: "0b", UpdatedAt: at, Targets: map[string]deploy.TargetState{
+		"a": {Serial: "0b", Outcome: deploy.OutcomeVerifyFailed, LastError: "verify failed; not rolled back", UpdatedAt: at},
+		"b": {Serial: "0a", Outcome: deploy.OutcomeVerified, UpdatedAt: at},
+	}})
+	r := &Reporter{Config: cfg, State: store, Log: slog.New(slog.DiscardHandler)}
+
+	targetErr := errors.Join(&deploy.TargetError{Label: "a", Err: errors.New("verify failed; not rolled back")})
+	tg := r.Build(map[int]error{1: targetErr}, nil)[0].Certificates[0].Targets
+	if tg[0].State != api.DeployFailed || tg[0].Error != "verify failed; not rolled back" {
+		t.Errorf("a = %+v", tg[0])
+	}
+	if tg[1].State != api.DeployPending || tg[1].Error != "" {
+		t.Errorf("b got another target's error: %+v", tg[1])
+	}
+	tg = r.Build(map[int]error{1: errors.Join(targetErr, errors.New("save state: disk full"))}, nil)[0].Certificates[0].Targets
+	if !strings.Contains(tg[1].Error, "disk full") {
+		t.Errorf("b lost the certificate's error: %+v", tg[1])
+	}
+	// A verify failure for an older certificate is pending, not failed.
+	_ = store.Save(&deploy.State{CertificateID: 1, Serial: "0c", UpdatedAt: at, Targets: map[string]deploy.TargetState{
+		"a": {Serial: "0b", Outcome: deploy.OutcomeVerifyFailed, LastError: "x", UpdatedAt: at},
+	}})
+	if tg = r.Build(map[int]error{1: nil}, nil)[0].Certificates[0].Targets; tg[0].State != api.DeployPending {
+		t.Errorf("superseded = %+v", tg[0])
+	}
+	if deploy.OnlyTargetErrors(nil) || deploy.OnlyTargetErrors(errors.New("x")) || !deploy.OnlyTargetErrors(&deploy.TargetError{Label: "a", Err: errors.New("x")}) {
+		t.Error("OnlyTargetErrors")
 	}
 }

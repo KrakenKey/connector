@@ -29,6 +29,50 @@ protocol and the KrakenKey API the connector uses.
   running.
 - A Homebrew cask, `krakenkey/tap/krakenkey-connector`, for macOS and Linux.
   It installs the connector only.
+- Implicit targets: a key store whose certificate is itself a deployment
+  (such as a Key Vault certificate that services read without a version)
+  adds a target by itself, labeled with the key store plugin's name. A
+  certificate with such a key store needs no configured targets, and is
+  still deployed, reported to KrakenKey and alerted on, and verified when
+  configured. A configured target of the same plugin that deploys to the
+  same place replaces the implicit one, for example to add a `verify` block
+  or a `then` command (a failing `then` rolls it back). `validate` marks the
+  implicit target. If a configured target already uses the implicit
+  target's label (the key store plugin's name) and deploys somewhere else,
+  the implicit target is not added and `validate` warns.
+- Plugin protocol: `KeyStoreCapabilities.implicit_target` (from the key
+  store's `Validate`), `TargetServiceValidateRequest.key_store_deployment_id`
+  and `TargetServiceValidateResponse.deployment_id`, and the core feature
+  `implicit_target`. In the Go SDK: `plugin.ImplicitTarget`,
+  `plugin.TargetDeploymentValidator`, `plugin.ValidateTarget`,
+  `plugin.MatchKeyStoreDeployment` and
+  `plugin.KeyStoreDeploymentRollbackUnavailable`. Older plugins and
+  connectors ignore the new fields and keep today's behavior.
+
+### Changed
+
+- A certificate whose key store is an external plugin may list no
+  targets; the connector reports it as a problem when the key store adds no
+  target by itself. Certificates with the built-in `local` key store still
+  need at least one target.
+- `validate` reports two targets of one certificate that deploy to the same
+  place (same plugin and deployment id) as a problem, and warns when two
+  plugin names run the same executable and deploy to the same place.
+- A target that picks up changes on its own schedule (`propagates_async`)
+  and fails its check is reported as `failed` instead of
+  `activated_unverifiable`, with an error saying it was not rolled back,
+  and later passes check it again until the check passes or a newer
+  certificate replaces it. A target's failure is no longer copied onto the
+  certificate's other targets that are still waiting in the status report.
+- A deployment of an older certificate that was interrupted after Activate
+  is no longer rolled back when the target already serves the current
+  certificate.
+- When a step before Activate fails on the key store's own deployment but
+  the target serves the new certificate, the target is checked as
+  activated instead of recorded as failed on the old certificate.
+- The error after a rollback whose `then` command failed says "rolled back,
+  but then.exec failed afterwards" (it said "files rolled back"), since
+  not every target has files.
 
 ## [v0.1.0] - 2026-10-10
 
