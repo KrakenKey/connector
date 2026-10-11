@@ -119,6 +119,22 @@ certificates:
 	if w := cfg.Warnings(); len(w) != 1 || !strings.Contains(w[0], "no verify block") {
 		t.Errorf("warnings = %q", w)
 	}
+	if !cfg.KrakenKey.SharesConfig() {
+		t.Error("share_config is off by default")
+	}
+}
+
+func TestShareConfig(t *testing.T) {
+	t.Setenv("KK_API_URL", "")
+	for value, want := range map[string]bool{"true": true, "false": false} {
+		cfg, err := Parse(strings.NewReader(strings.Replace(example, "  api_url:", "  share_config: "+value+"\n  api_url:", 1)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.KrakenKey.SharesConfig() != want {
+			t.Errorf("share_config: %s gives %v", value, !want)
+		}
+	}
 }
 
 func TestAPIURLFromEnv(t *testing.T) {

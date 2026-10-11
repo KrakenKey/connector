@@ -387,3 +387,46 @@ func TestBundledPluginRefusals(t *testing.T) {
 		})
 	}
 }
+
+// TestLocate checks where plugins are reported to come from without
+// starting them.
+func TestLocate(t *testing.T) {
+	dir, bin, _ := systemDir(t)
+	h := New(&config.Config{
+		DataDir:   filepath.Join(t.TempDir(), "data"),
+		PluginDir: dir,
+		Plugins: map[string]config.PluginSpec{
+			"mem":       {},
+			"not-installed":    {Version: "1.0.0"},
+			"local-bin": {Version: "2.0.0", SHA256: strings.Repeat("ab", 32)},
+			"by-path":   {Path: "/opt/plugin"},
+			"missing":   {},
+		},
+	}, quiet())
+	t.Cleanup(h.Close)
+	data := filepath.Join(h.dataDir, "plugins", "local-bin", "2.0.0", BinaryName("local-bin"))
+	if err := os.MkdirAll(filepath.Dir(data), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(data, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, want := range map[string]Location{
+		"file":      {Source: SourceBuiltin},
+		"exec":      {Source: SourceBuiltin},
+		"local":     {Source: SourceBuiltin},
+		"unknown":   {},
+		"mem":       {Path: bin, Source: SourcePluginDir, Version: "1.0.0", Bundled: true},
+		"not-installed":    {Path: filepath.Join(h.dataDir, "plugins", "not-installed", "1.0.0", BinaryName("not-installed")), Source: SourceDataDir, Version: "1.0.0"},
+		"local-bin": {Path: data, Source: SourceDataDir, Version: "2.0.0"},
+		"by-path":   {Path: "/opt/plugin", Source: SourcePath},
+		// Not installed: it would come from the system plugin directory.
+		"missing": {Source: SourcePluginDir},
+	} {
+		got := h.Locate(name)
+		if got.Path != want.Path || got.Source != want.Source || got.Version != want.Version || got.Bundled != want.Bundled {
+			t.Errorf("%s: %+v, want %+v", name, got, want)
+		}
+	}
+}

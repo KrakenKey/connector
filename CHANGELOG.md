@@ -8,6 +8,18 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+### Added
+
+- An enrolled connector sends KrakenKey a read-only summary of its config
+  after passes, so the dashboard can show the certificates, key stores,
+  targets (implicit ones included) and plugin versions. Settings come from
+  an allowlist: commands, file owners and modes, tags, cloud account ids,
+  ARNs, plugin paths and anything from the environment are never sent. The
+  summary is sent when it changes and at least once a day; KrakenKey
+  versions without the route are skipped quietly. Set
+  `krakenkey.share_config: false` to turn it off, which also deletes a
+  summary sent before. See "Config summary" in the README.
+
 ## [v0.2.0] - 2026-10-11
 
 Linux packages and a Homebrew cask, bundled plugin versions, and Key Vault as

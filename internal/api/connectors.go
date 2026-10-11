@@ -2,7 +2,11 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -181,4 +185,127 @@ func (c *Client) Report(ctx context.Context, r Report) (*ReportResult, error) {
 		return nil, err
 	}
 	return &res, nil
+}
+
+// Config summary limits from the API contract. Certificates and targets
+// per certificate share the report's limits.
+const (
+	MaxConfigPlugins       = 50
+	MaxConfigNames         = 100
+	MaxConfigSettings      = 10
+	MaxConfigSettingValue  = 256
+	MaxConfigVersion       = 64
+	MaxConfigKeyType       = 32
+	MaxConfigCheckInterval = 7 * 24 * 60 * 60 // seconds
+)
+
+// Plugin sources in a config summary.
+const (
+	PluginSourceBundled = "bundled"
+	PluginSourceDataDir = "data_dir"
+	PluginSourcePath    = "path"
+	PluginSourceBuiltin = "builtin"
+)
+
+// ConfigSummary is a read-only summary of the connector's config for the
+// dashboard. It holds only allowlisted settings: no commands, file
+// owners, tags, cloud account ids or secrets. Its JSON encoding, with
+// settings keys sorted as encoding/json does, is what ConfigSummaryHash
+// hashes, so the field order is part of the contract.
+type ConfigSummary struct {
+	Version              string              `json:"version"`
+	CheckIntervalSeconds *int                `json:"checkIntervalSeconds"`
+	Plugins              []ConfigPlugin      `json:"plugins"`
+	Certificates         []ConfigCertificate `json:"certificates"`
+	Truncated            bool                `json:"truncated"`
+}
+
+// ConfigPlugin is one plugin in a ConfigSummary.
+type ConfigPlugin struct {
+	Name string `json:"name"`
+	// Version is null for plugins run from a path setting.
+	Version *string `json:"version"`
+	// Source is one of the PluginSource constants.
+	Source string `json:"source"`
+}
+
+// ConfigCertificate is one certificate in a ConfigSummary.
+type ConfigCertificate struct {
+	CertificateID int            `json:"certificateId"`
+	Names         []string       `json:"names"`
+	KeyStore      ConfigKeyStore `json:"keyStore"`
+	Targets       []ConfigTarget `json:"targets"`
+}
+
+// ConfigKeyStore is a certificate's key store in a ConfigSummary.
+type ConfigKeyStore struct {
+	Plugin   string         `json:"plugin"`
+	KeyType  *string        `json:"keyType"`
+	Settings map[string]any `json:"settings"`
+}
+
+// ConfigTarget is one target in a ConfigSummary.
+type ConfigTarget struct {
+	Label  string `json:"label"`
+	Plugin string `json:"plugin"`
+	// Implicit is true for the target the key store added by itself.
+	Implicit bool `json:"implicit"`
+	// RunsCommand is true for exec targets and targets with then.
+	RunsCommand bool           `json:"runsCommand"`
+	Verify      *ConfigVerify  `json:"verify"`
+	Settings    map[string]any `json:"settings"`
+}
+
+// ConfigVerify is a target's verify block in a ConfigSummary, without
+// address and ca_file.
+type ConfigVerify struct {
+	Host                *string `json:"host"`
+	Port                *int    `json:"port"`
+	SkipChainValidation bool    `json:"skipChainValidation"`
+}
+
+// ConfigSummaryHash returns the lowercase hex sha256 of the summary's
+// canonical JSON encoding.
+func ConfigSummaryHash(s ConfigSummary) (string, error) {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return "", fmt.Errorf("encode config summary: %w", err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// configSummaryBody is the body of PUT /connectors/config: the hash, then
+// the summary's fields.
+type configSummaryBody struct {
+	Hash string `json:"hash"`
+	ConfigSummary
+}
+
+// PutConfigSummary stores the connector's config summary with KrakenKey.
+// hash is ConfigSummaryHash(s). KrakenKey accepts it only with a key
+// issued to a connector; KrakenKey versions without the route answer 404
+// or 405 (see IsMissingRoute).
+func (c *Client) PutConfigSummary(ctx context.Context, hash string, s ConfigSummary) error {
+	return c.do(ctx, http.MethodPut, "/connectors/config", configSummaryBody{Hash: hash, ConfigSummary: s}, nil)
+}
+
+// DeleteConfigSummary clears the config summary KrakenKey stored for the
+// connector, if any.
+func (c *Client) DeleteConfigSummary(ctx context.Context) error {
+	return c.do(ctx, http.MethodDelete, "/connectors/config", nil, nil)
+}
+
+// IsMissingRoute reports whether err is a 404 or 405: the KrakenKey
+// version does not have the route.
+func IsMissingRoute(err error) bool {
+	var nf *NotFoundError
+	var apiErr *APIError
+	switch {
+	case errors.As(err, &nf):
+		return true
+	case errors.As(err, &apiErr):
+		return apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusMethodNotAllowed
+	}
+	return false
 }

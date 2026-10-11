@@ -13,6 +13,11 @@
 
 krakenkey:
   api_url: https://api.krakenkey.io
+  # An enrolled connector shows a read-only summary of this file in the
+  # dashboard: certificates, targets, plugin versions and a few settings
+  # such as directories and vault names, never commands or secrets. Set
+  # this to false to keep it from KrakenKey.
+  # share_config: true
 
 # Time between passes.
 check_interval: 6h
