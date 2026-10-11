@@ -41,7 +41,7 @@ type targetSettings struct {
 }
 
 // Key Vault allows 15 tags per object, names up to 512 characters and
-// values up to 256. One tag is the ownership tag.
+// values up to 256. Two tags are the connector's own.
 const (
 	maxTags     = 15
 	maxTagName  = 512
@@ -78,7 +78,7 @@ func parseTargetConfig(raw json.RawMessage) (targetSettings, []string) {
 		problems = append(problems, fmt.Sprintf("certificate_name %q is not a valid Key Vault object name (1-127 letters, digits and hyphens)", c.CertificateName))
 	}
 	if len(c.Tags) > maxUserTags {
-		problems = append(problems, fmt.Sprintf("tags: at most %d tags (Key Vault allows %d, and the connector sets %s)", maxUserTags, maxTags, tagCertificateID))
+		problems = append(problems, fmt.Sprintf("tags: at most %d tags (Key Vault allows %d, and the connector sets %s and %s)", maxUserTags, maxTags, tagCertificateID, tagPreviousVersion))
 	}
 	names := make([]string, 0, len(c.Tags))
 	for k := range c.Tags {
@@ -90,8 +90,8 @@ func parseTargetConfig(raw json.RawMessage) (targetSettings, []string) {
 		switch {
 		case k == "" || utf8.RuneCountInString(k) > maxTagName:
 			problems = append(problems, fmt.Sprintf("tags: name %q must be 1-%d characters", k, maxTagName))
-		case strings.EqualFold(k, tagCertificateID):
-			problems = append(problems, fmt.Sprintf("tags: %s is set by the connector", tagCertificateID))
+		case strings.EqualFold(k, tagCertificateID), strings.EqualFold(k, tagPreviousVersion):
+			problems = append(problems, fmt.Sprintf("tags: %s is set by the connector", k))
 		case utf8.RuneCountInString(v) > maxTagValue:
 			problems = append(problems, fmt.Sprintf("tags: value of %q is longer than %d characters", k, maxTagValue))
 		}

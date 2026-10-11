@@ -57,24 +57,23 @@ type Target struct {
 }
 
 // stagedImport is what Stage prepared. It lives only in this process's
-// memory; the staged ref the connector stores is a random id.
+// memory, for at most stagedTTL; the staged ref the connector stores is a
+// random id.
 type stagedImport struct {
 	vaultURL string
 	name     string
 	leaf     *x509.Certificate
-	// pfx is the bundle to import, or nil when the certificate is already
-	// the latest version.
-	pfx   []byte
+	chain    []*x509.Certificate
+	// key is the private key to import, or nil when the certificate is
+	// already the latest version.
+	key   crypto.Signer
 	at    time.Time
 	timer *time.Timer
 }
 
-func (s *stagedImport) wipe() {
-	for i := range s.pfx {
-		s.pfx[i] = 0
-	}
-	s.pfx = nil
-}
+// wipe drops the reference to the key. Go gives no way to overwrite a
+// parsed private key reliably, so this only makes it unreachable sooner.
+func (s *stagedImport) wipe() { s.key = nil }
 
 // stagedTTL bounds how long staged material waits for Activate. The
 // connector activates right after staging.
@@ -151,7 +150,7 @@ func (t *Target) ValidateDeployment(ctx context.Context, req plugin.TargetValida
 		return v, nil
 	}
 	if req.CertificateID != "" {
-		own, err := checkOwner(ctx, c, s.name, req.CertificateID)
+		own, err := checkVersionOwner(ctx, c, s.name, req.CertificateID)
 		if err != nil {
 			v.Problems = append(v.Problems, err.Error())
 			return v, nil
@@ -242,9 +241,7 @@ func (t *Target) Stage(ctx context.Context, req plugin.StageRequest) (string, er
 		if err != nil {
 			return "", err
 		}
-		if st.pfx, err = pkcs12.LegacyDES.Encode(key, leaf, chain, ""); err != nil {
-			return "", fmt.Errorf("%w: building the PKCS#12 bundle: %v", plugin.ErrPermanent, err)
-		}
+		st.key, st.chain = key, chain
 	}
 	return t.keep(st), nil
 }
@@ -310,8 +307,8 @@ func (t *Target) Activate(ctx context.Context, req plugin.ActivateRequest) (stri
 		// answer was lost. What was live before is the version before it.
 		return t.previousRef(ctx, c, s.name, cert), nil
 	}
-	if st.pfx == nil {
-		return "", fmt.Errorf("%w: certificate %s is no longer the latest version of %q in %s; staging again",
+	if st.key == nil {
+		return "", fmt.Errorf("%w: certificate %s was the latest version of %q in %s when it was staged, but is not any more; the connector deploys it again on a later pass",
 			plugin.ErrUnavailable, serialOf(st.leaf), s.name, s.vaultURL)
 	}
 	if err := t.checkOwner(ctx, c, s, req.CertificateID); err != nil {
@@ -321,56 +318,98 @@ func (t *Target) Activate(ctx context.Context, req plugin.ActivateRequest) (stri
 	if cur != nil {
 		prev = refPrefix + serialOf(cur)
 	}
-	if err := t.importPFX(ctx, c, s, req.CertificateID, st.pfx, st.leaf); err != nil {
+	if err := t.importCert(ctx, c, s, req.CertificateID, st.key, st.leaf, st.chain, versionOf(cert)); err != nil {
 		return "", err
 	}
 	return prev, nil
 }
 
-// previousRef returns the ref of the newest enabled version created before
-// the given one, which versionless consumers used until it was added. It
-// returns "" when there is none, and also when the versions cannot be
-// listed (logged): the deployment stands, but cannot be rolled back.
+// previousRef returns the ref of the version that was the latest before
+// cur, which versionless consumers used until cur was added, or "" when
+// there was none, it is disabled, or it cannot be told (logged): the
+// deployment stands, but cannot be rolled back.
+//
+// Versions the connector creates name the version they replaced in the
+// tag krakenkey-connector-previous-version. For other versions it falls
+// back to creation times, which Key Vault keeps to the second only, so it
+// gives up when two versions share the second that decides.
 func (t *Target) previousRef(ctx context.Context, c *vaultClients, name string, cur azcertificates.Certificate) string {
-	if cur.ID == nil || cur.Attributes == nil || cur.Attributes.Created == nil {
+	if cur.ID == nil {
 		return ""
 	}
-	curVersion := cur.ID.Version()
-	created := *cur.Attributes.Created
-	var best *azcertificates.CertificateProperties
+	prevVersion := deref(cur.Tags[tagPreviousVersion])
+	if prevVersion == "" {
+		var ok bool
+		if prevVersion, ok = t.previousByTime(ctx, c, name, cur); !ok || prevVersion == "" {
+			return ""
+		}
+	}
+	prev, leaf, err := getVersion(ctx, c, name, prevVersion)
+	if err != nil {
+		if !errors.Is(err, plugin.ErrNotFound) {
+			t.ks.opts.Logger.Warn("cannot read the previous version; this deployment cannot be rolled back",
+				"certificate_name", name, "error", err.Error())
+		}
+		return ""
+	}
+	if prev.Attributes != nil && prev.Attributes.Enabled != nil && !*prev.Attributes.Enabled {
+		return "" // consumers could not use it either
+	}
+	return refPrefix + serialOf(leaf)
+}
+
+// previousByTime finds the version created last before cur. ok is false
+// when that cannot be told: the versions cannot be listed, or a version
+// shares the decisive second with cur or with the candidate.
+func (t *Target) previousByTime(ctx context.Context, c *vaultClients, name string, cur azcertificates.Certificate) (string, bool) {
+	if cur.Attributes == nil || cur.Attributes.Created == nil {
+		return "", false
+	}
+	curVersion, created := cur.ID.Version(), cur.Attributes.Created.Truncate(time.Second)
+	var best string
+	var bestAt time.Time
+	tie := false
 	pager := c.certs.NewListCertificatePropertiesVersionsPager(name, nil)
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
 			t.ks.opts.Logger.Warn("cannot list the certificate's versions; this deployment cannot be rolled back",
 				"certificate_name", name, "error", classify(opListVersions, name, err).Error())
-			return ""
+			return "", false
 		}
 		for _, v := range page.Value {
 			if v == nil || v.ID == nil || v.Attributes == nil || v.Attributes.Created == nil || v.ID.Version() == curVersion {
 				continue
 			}
-			if v.Attributes.Enabled != nil && !*v.Attributes.Enabled {
-				continue
-			}
-			if !v.Attributes.Created.Before(created) {
-				continue
-			}
-			if best == nil || v.Attributes.Created.After(*best.Attributes.Created) {
-				best = v
+			at := v.Attributes.Created.Truncate(time.Second)
+			switch {
+			case !at.Before(created):
+				if at.Equal(created) {
+					t.ks.opts.Logger.Warn("another version was created in the same second as the current one; cannot tell which was live before, so this deployment cannot be rolled back",
+						"certificate_name", name)
+					return "", false
+				}
+			case best == "" || at.After(bestAt):
+				best, bestAt, tie = v.ID.Version(), at, false
+			case at.Equal(bestAt):
+				tie = true
 			}
 		}
 	}
-	if best == nil {
+	if tie {
+		t.ks.opts.Logger.Warn("two versions were created in the same second before the current one; cannot tell which was live before, so this deployment cannot be rolled back",
+			"certificate_name", name)
+		return "", false
+	}
+	return best, true
+}
+
+// versionOf returns a certificate's version id, or "".
+func versionOf(cert azcertificates.Certificate) string {
+	if cert.ID == nil {
 		return ""
 	}
-	_, leaf, err := getVersion(ctx, c, name, best.ID.Version())
-	if err != nil {
-		t.ks.opts.Logger.Warn("cannot read the previous version; this deployment cannot be rolled back",
-			"certificate_name", name, "error", err.Error())
-		return ""
-	}
-	return refPrefix + serialOf(leaf)
+	return cert.ID.Version()
 }
 
 // Rollback imports the certificate that was the latest version before the
@@ -403,7 +442,7 @@ func (t *Target) Rollback(ctx context.Context, req plugin.RollbackRequest) error
 			return fmt.Errorf("%w: was handed certificate %s, but %s was the latest version before", plugin.ErrPermanent, serialOf(leaf), prev)
 		}
 	}
-	_, cur, err := latest(ctx, c, s.name)
+	curCert, cur, err := latest(ctx, c, s.name)
 	if err != nil {
 		return err
 	}
@@ -421,12 +460,7 @@ func (t *Target) Rollback(ctx context.Context, req plugin.RollbackRequest) error
 	if err != nil {
 		return fmt.Errorf("cannot put certificate %s back: %w", prev, err)
 	}
-	pfx, err := pkcs12.LegacyDES.Encode(key, leaf, chain, "")
-	if err != nil {
-		return fmt.Errorf("%w: building the PKCS#12 bundle: %v", plugin.ErrPermanent, err)
-	}
-	defer wipeBytes(pfx)
-	return t.importPFX(ctx, c, s, req.CertificateID, pfx, leaf)
+	return t.importCert(ctx, c, s, req.CertificateID, key, leaf, chain, versionOf(curCert))
 }
 
 // Discard drops staged material. Unknown refs are fine.
@@ -446,7 +480,7 @@ func (t *Target) checkOwner(ctx context.Context, c *vaultClients, s targetSettin
 	if !certIDRE.MatchString(certID) {
 		return fmt.Errorf("%w: certificate id %q is missing or not usable in a tag", plugin.ErrInvalid, certID)
 	}
-	own, err := checkOwner(ctx, c, s.name, certID)
+	own, err := checkVersionOwner(ctx, c, s.name, certID)
 	if err != nil {
 		return err
 	}
@@ -456,10 +490,18 @@ func (t *Target) checkOwner(ctx context.Context, c *vaultClients, s targetSettin
 	return nil
 }
 
-// importPFX imports pfx as a new version, tagged with the ownership tag
-// and the configured tags. When the call fails, it checks whether the
-// version went in anyway (a lost answer) before reporting the failure.
-func (t *Target) importPFX(ctx context.Context, c *vaultClients, s targetSettings, certID string, pfx []byte, leaf *x509.Certificate) error {
+// importCert imports the certificate, its chain and key as a new version,
+// tagged with the ownership tag, the version it replaces (prevVersion,
+// may be empty) and the configured tags. When the call fails, it checks
+// whether the version went in anyway (a lost answer) before reporting the
+// failure.
+//
+// The bundle is PKCS#12 without a password: a password sent next to it in
+// the same request would protect nothing, so the key is protected in
+// transit by TLS to Key Vault alone. The bundle's buffer is overwritten
+// after the call, as far as Go allows (the base64 copy is a string and
+// cannot be).
+func (t *Target) importCert(ctx context.Context, c *vaultClients, s targetSettings, certID string, key crypto.Signer, leaf *x509.Certificate, chain []*x509.Certificate, prevVersion string) error {
 	if !certIDRE.MatchString(certID) {
 		return fmt.Errorf("%w: certificate id %q is missing or not usable in a tag", plugin.ErrInvalid, certID)
 	}
@@ -468,12 +510,20 @@ func (t *Target) importPFX(ctx context.Context, c *vaultClients, s targetSetting
 		tags[k] = &v
 	}
 	tags[tagCertificateID] = &certID
+	if prevVersion != "" {
+		tags[tagPreviousVersion] = &prevVersion
+	}
 	kp, err := importKeyProperties(leaf, s.exportable)
 	if err != nil {
 		return err
 	}
+	pfx, err := pkcs12.LegacyDES.Encode(key, leaf, chain, "")
+	if err != nil {
+		return fmt.Errorf("%w: building the PKCS#12 bundle: %v", plugin.ErrPermanent, err)
+	}
 	ct := contentTypePKCS12
 	value := base64.StdEncoding.EncodeToString(pfx)
+	wipeBytes(pfx)
 	_, err = c.certs.ImportCertificate(ctx, s.name, azcertificates.ImportCertificateParameters{
 		Base64EncodedCertificate: &value,
 		CertificatePolicy: &azcertificates.CertificatePolicy{

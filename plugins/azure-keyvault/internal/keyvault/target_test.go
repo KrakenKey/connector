@@ -307,27 +307,80 @@ func TestOwnCertificateInPlace(t *testing.T) {
 	}
 }
 
-func TestPreviousVersionSkipsDisabledAndPages(t *testing.T) {
+// TestPreviousVersionFromTag: versions the connector creates name the one
+// they replaced, so creation times do not matter.
+func TestPreviousVersionFromTag(t *testing.T) {
 	e := newEnv(t)
+	e.srv.SetClockStep(0) // every version in the same second
 	ksCfg := e.config("")
 	tCfg := e.targetConfig("web", "")
 	tg := e.target(t)
-	a := e.issued(t, ksCfg)
 	e.issued(t, ksCfg)
-	versions := e.srv.Versions("web")
-	e.srv.DisableVersion("web", versions[1])
-	e.srv.SetPageSize(1)
+	b := e.issued(t, ksCfg)
 	c := e.issued(t, ksCfg)
-	prev, err := e.deploy(t, tg, tCfg, c, e.vaultRef(t, ksCfg, c.ref))
-	if err != nil || prev != refPrefix+a.serial {
-		t.Errorf("previous = %q, %v; want %s (the disabled version skipped)", prev, err, a.serial)
+	versions := e.srv.Versions("web")
+	if got := e.srv.Tags("web", "")[tagPreviousVersion]; got != versions[1] {
+		t.Fatalf("merged version names %q as previous, want %q", got, versions[1])
 	}
-	// Without permission to list, the deployment stands without a
-	// previous ref.
-	e.srv.Deny(fakevault.OpListVersions)
-	prev, err = e.deploy(t, tg, tCfg, c, e.vaultRef(t, ksCfg, c.ref))
-	if err != nil || prev != "" {
-		t.Errorf("without list permission = %q, %v", prev, err)
+	prev, err := e.deploy(t, tg, tCfg, c, e.vaultRef(t, ksCfg, c.ref))
+	if err != nil || prev != refPrefix+b.serial {
+		t.Errorf("previous = %q, %v; want %s", prev, err, b.serial)
+	}
+	if e.calls(fakevault.OpListVersions) != 0 {
+		t.Error("versions listed although the tag names the previous one")
+	}
+	// A disabled previous version served nobody: nothing to go back to.
+	e.srv.DisableVersion("web", versions[1])
+	if prev, err := e.deploy(t, tg, tCfg, c, e.vaultRef(t, ksCfg, c.ref)); err != nil || prev != "" {
+		t.Errorf("previous with the replaced version disabled = %q, %v", prev, err)
+	}
+}
+
+// TestPreviousVersionByTime covers versions created outside the connector,
+// which carry no tag: creation times decide, and a tie in the deciding
+// second gives no previous version rather than a guess.
+func TestPreviousVersionByTime(t *testing.T) {
+	cases := map[string]struct {
+		steps []time.Duration // clock step before each of three versions
+		deny  bool
+		want  int // index of the expected previous version, -1 for none
+	}{
+		"latest before":          {[]time.Duration{time.Minute, time.Minute, time.Minute}, false, 1},
+		"same second as current": {[]time.Duration{time.Minute, time.Minute, 0}, false, -1},
+		"tie before":             {[]time.Duration{time.Minute, 0, time.Minute}, false, -1},
+		"older tie is fine":      {[]time.Duration{time.Minute, 0, time.Minute, time.Minute}, false, 2},
+		"cannot list":            {[]time.Duration{time.Minute, time.Minute, time.Minute}, true, -1},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.srv.SetPageSize(1)
+			for _, step := range tc.steps {
+				e.srv.SetClockStep(step)
+				if err := e.srv.AddVersion("ext", map[string]string{tagCertificateID: "7"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.deny {
+				e.srv.Deny(fakevault.OpListVersions)
+			}
+			s, _ := parseTargetConfig(e.targetConfig("ext", ""))
+			c, err := e.ks.clientsFor(s.vaultURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cur, _, err := getVersion(e.ctx, c, "ext", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := ""
+			if tc.want >= 0 {
+				want = refPrefix + e.srv.Serial("ext", e.srv.Versions("ext")[tc.want])
+			}
+			if got := e.target(t).previousRef(e.ctx, c, "ext", cur); got != want {
+				t.Errorf("previous = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -635,5 +688,157 @@ func TestStagedMaterialExpires(t *testing.T) {
 	}
 	if _, err := tg.Activate(e.ctx, plugin.ActivateRequest{Config: cfg, StagedRef: staged, CertificateID: "7"}); !errors.Is(err, plugin.ErrNotFound) {
 		t.Errorf("activate after the TTL: %v", err)
+	}
+}
+
+// azureDenial is what Key Vault says when an access policy lacks a
+// permission: it names the caller and its tenant.
+const azureDenial = "The user, group or application 'appid=11111111-2222-3333-4444-555555555555;oid=66666666-7777-8888-9999-000000000000;iss=https://sts.windows.net/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/' does not have certificates create permission on key vault 'kv-b;location=westeurope'."
+
+// azureRBACDenial is what Key Vault says when an RBAC role lacks a data
+// action.
+const azureRBACDenial = "Caller is not authorized to perform action on resource. If role assignments, deny assignments or role definitions were changed recently, please observe propagation time. Caller: appid=11111111-2222-3333-4444-555555555555;oid=66666666-7777-8888-9999-000000000000;iss=https://sts.windows.net/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/ Action: 'Microsoft.KeyVault/vaults/certificates/import/action' Resource: '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg/providers/microsoft.keyvault/vaults/kv-b/certificates/kvt-copy' Assignment: (not found)"
+
+func checkScrubbed(t *testing.T, err error) {
+	t.Helper()
+	for _, leak := range []string{"11111111-2222", "66666666-7777", "aaaaaaaa-bbbb", "12345678-1234", "sts.windows.net", "appid", "oid="} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("error leaks %q: %v", leak, err)
+		}
+	}
+}
+
+// TestTargetNeverReadsPendingRequests: reading a pending request needs
+// certificate permission Create in access policy vaults, which an import
+// target does not have.
+func TestTargetNeverReadsPendingRequests(t *testing.T) {
+	e := newEnv(t)
+	e.srv.Deny(fakevault.OpGetPending)
+	tg := e.target(t)
+	cfg := e.targetConfig("kvt-copy", "")
+	if v, err := tg.ValidateDeployment(e.ctx, plugin.TargetValidateRequest{Config: cfg, CertificateID: "7"}); err != nil || len(v.Problems) != 0 {
+		t.Fatalf("validate = %+v, %v", v, err)
+	}
+	c, key, _ := localKey(t)
+	if _, err := e.deploy(t, tg, cfg, c, key); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if n := e.calls(fakevault.OpGetPending); n != 0 {
+		t.Errorf("the target read pending requests %d times", n)
+	}
+}
+
+// TestPermissionHintsAndScrubbing: a 403 names the permission Key Vault
+// says is missing, and never the caller's ids or tenant.
+func TestPermissionHintsAndScrubbing(t *testing.T) {
+	e := newEnv(t)
+	// Access policy vault: reading a pending request needs Create.
+	e.srv.FailNextWith(fakevault.OpGetPending, http.StatusForbidden, azureDenial, "AccessDenied")
+	_, err := e.ks.CreateCSR(e.ctx, plugin.CSRRequest{Config: e.config(""), CertificateID: "7", Names: []string{"a.example.com"}, KeyType: plugin.KeyTypeECDSAP256})
+	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "certificate permission Create in the vault access policy") ||
+		!strings.Contains(err.Error(), "HTTP 403, Forbidden/AccessDenied") {
+		t.Errorf("pending 403: %v", err)
+	}
+	checkScrubbed(t, err)
+
+	// RBAC vault: the denied data action from Key Vault's answer.
+	tg := e.target(t)
+	c, key, _ := localKey(t)
+	e.srv.FailNextWith(fakevault.OpImport, http.StatusForbidden, azureRBACDenial, "ForbiddenByRbac")
+	_, err = e.deploy(t, tg, e.targetConfig("kvt-copy", ""), c, key)
+	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "grant the identity Microsoft.KeyVault/vaults/certificates/import/action") {
+		t.Errorf("import 403: %v", err)
+	}
+	checkScrubbed(t, err)
+
+	// Without a named permission, the operation's own hint.
+	e.srv.Deny(fakevault.OpGetCert)
+	_, err = tg.Current(e.ctx, plugin.CurrentRequest{Config: e.targetConfig("kvt-copy", "")})
+	if !strings.Contains(err.Error(), "Microsoft.KeyVault/vaults/certificates/read") || !strings.Contains(err.Error(), "certificate permission Get") {
+		t.Errorf("get 403: %v", err)
+	}
+	if got := scrub("token from https://sts.windows.net/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/ for 11111111-2222-3333-4444-555555555555"); got != "token from <issuer> for <id>" {
+		t.Errorf("scrub = %q", got)
+	}
+}
+
+func TestRollbackImportFailures(t *testing.T) {
+	setup := func(t *testing.T) (*env, *Target, json.RawMessage, issued, plugin.KeyMaterial, string) {
+		e := newEnv(t)
+		tg := e.target(t)
+		cfg := e.targetConfig("api", "")
+		first, firstKey, _ := localKey(t)
+		if _, err := e.deploy(t, tg, cfg, first, firstKey); err != nil {
+			t.Fatal(err)
+		}
+		second, secondKey, _ := localKey(t)
+		prev, err := e.deploy(t, tg, cfg, second, secondKey)
+		if err != nil || prev != refPrefix+first.serial {
+			t.Fatalf("deploy: %q, %v", prev, err)
+		}
+		return e, tg, cfg, first, firstKey, prev
+	}
+	rollback := func(e *env, tg *Target, cfg json.RawMessage, first issued, key plugin.KeyMaterial, prev string) error {
+		return tg.Rollback(e.ctx, plugin.RollbackRequest{Config: cfg, PreviousRef: prev, CertificateID: "7",
+			PreviousCertPEM: first.leafPEM, PreviousChainPEM: first.chainPEM, PreviousKey: key, PreviousSerial: first.serial})
+	}
+	t.Run("lost answer", func(t *testing.T) {
+		e, tg, cfg, first, key, prev := setup(t)
+		e.srv.ApplyThenFail(fakevault.OpImport, http.StatusServiceUnavailable)
+		if err := rollback(e, tg, cfg, first, key, prev); err != nil || e.srv.Serial("api", "") != first.serial {
+			t.Errorf("rollback = %v, latest %s", err, e.srv.Serial("api", ""))
+		}
+	})
+	t.Run("forbidden", func(t *testing.T) {
+		e, tg, cfg, first, key, prev := setup(t)
+		e.srv.Deny(fakevault.OpImport)
+		err := rollback(e, tg, cfg, first, key, prev)
+		if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "certificates/import/action") || e.srv.Serial("api", "") == first.serial {
+			t.Errorf("rollback = %v", err)
+		}
+	})
+	t.Run("previous version named", func(t *testing.T) {
+		e, tg, cfg, first, key, prev := setup(t)
+		before := e.srv.Versions("api")
+		if err := rollback(e, tg, cfg, first, key, prev); err != nil {
+			t.Fatal(err)
+		}
+		if got := e.srv.Tags("api", "")[tagPreviousVersion]; got != before[len(before)-1] {
+			t.Errorf("rollback version names %q as previous, want %q", got, before[len(before)-1])
+		}
+	})
+}
+
+func TestOwnershipChangesBetweenStageAndActivate(t *testing.T) {
+	e := newEnv(t)
+	tg := e.target(t)
+	cfg := e.targetConfig("api", "")
+	c, key, _ := localKey(t)
+	staged, err := tg.Stage(e.ctx, plugin.StageRequest{Config: cfg, CertificateID: "7", CertPEM: c.leafPEM, ChainPEM: c.chainPEM, Key: key, Serial: c.serial})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.srv.AddVersion("api", nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tg.Activate(e.ctx, plugin.ActivateRequest{Config: cfg, StagedRef: staged, CertificateID: "7"})
+	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "adopt: true") || e.calls(fakevault.OpImport) != 0 {
+		t.Errorf("activate = %v, imports %d", err, e.calls(fakevault.OpImport))
+	}
+}
+
+// TestOwnCertificateNotInPlaceNotExportable: when the key store's
+// certificate is not the latest version any more and its key cannot be
+// exported, it cannot be put back.
+func TestOwnCertificateNotInPlaceNotExportable(t *testing.T) {
+	e := newEnv(t)
+	ksCfg := e.config(`"exportable":false`)
+	tCfg := e.targetConfig("web", `"exportable":false`)
+	tg := e.target(t)
+	a := e.issued(t, ksCfg)
+	e.issued(t, ksCfg)
+	_, err := e.deploy(t, tg, tCfg, a, e.vaultRef(t, ksCfg, a.ref))
+	if !errors.Is(err, plugin.ErrPermanent) || !strings.Contains(err.Error(), "not exportable") || e.calls(fakevault.OpImport) != 0 {
+		t.Errorf("deploy = %v", err)
 	}
 }

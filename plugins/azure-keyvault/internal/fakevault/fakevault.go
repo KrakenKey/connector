@@ -76,8 +76,10 @@ type Server struct {
 	base string
 	// deleted holds soft-deleted certificates.
 	deleted map[string]*certificate
-	// clock stamps new versions; each gets a later creation time.
-	clock time.Time
+	// clock stamps new versions; each gets a creation time clockStep
+	// after the one before.
+	clock     time.Time
+	clockStep time.Duration
 	// pageSize splits version lists into pages; 0 means one page.
 	pageSize int
 	// applyFailed makes the next call of an operation do its work but
@@ -119,7 +121,7 @@ type pendingOp struct {
 // means the server's own URL.
 func New(hosts []string, resource string) (*Server, error) {
 	s := &Server{certs: map[string]*certificate{}, deleted: map[string]*certificate{}, deny: map[string]bool{}, fail: map[string][]failure{},
-		clock: time.Unix(1_700_000_000, 0).UTC(), applyFailed: map[string]int{}}
+		clock: time.Unix(1_700_000_000, 0).UTC(), clockStep: time.Minute, applyFailed: map[string]int{}}
 	tlsCfg, caPEM, err := serverTLS(append([]string{"127.0.0.1", "localhost"}, hosts...))
 	if err != nil {
 		return nil, err
@@ -204,9 +206,14 @@ func (s *Server) AddVersion(name string, tags map[string]string) error {
 
 // tick returns the creation time for a new version. s.mu is held.
 func (s *Server) tick() time.Time {
-	s.clock = s.clock.Add(time.Minute)
+	s.clock = s.clock.Add(s.clockStep)
 	return s.clock
 }
+
+// SetClockStep sets the time between the creation times of new versions
+// (default a minute). Key Vault keeps them to the second, so 0 stands for
+// versions created in the same second.
+func (s *Server) SetClockStep(d time.Duration) { s.mu.Lock(); s.clockStep = d; s.mu.Unlock() }
 
 // SetPageSize makes version lists come in pages of n entries.
 func (s *Server) SetPageSize(n int) { s.mu.Lock(); s.pageSize = n; s.mu.Unlock() }

@@ -629,8 +629,22 @@ func pendingBlocks(ctx context.Context, c *vaultClients, name string) error {
 
 // merge merges x5c into the pending request. The tags are set on the new
 // version so later calls can tell the connector created it.
+//
+// The new version also names the version that was the latest before it
+// (tagPreviousVersion), for the target's rollback. Without permission to
+// read it, or without an earlier version, the tag is left out.
 func (k *KeyStore) merge(ctx context.Context, c *vaultClients, name string, x5c [][]byte, tags map[string]*string) (string, error) {
-	resp, err := c.certs.MergeCertificate(ctx, name, azcertificates.MergeCertificateParameters{X509Certificates: x5c, Tags: tags}, nil)
+	withPrev := make(map[string]*string, len(tags)+1)
+	for key, v := range tags {
+		if key != tagPreviousVersion {
+			withPrev[key] = v
+		}
+	}
+	if cur, err := c.certs.GetCertificate(ctx, name, "", nil); err == nil && cur.ID != nil {
+		v := cur.ID.Version()
+		withPrev[tagPreviousVersion] = &v
+	}
+	resp, err := c.certs.MergeCertificate(ctx, name, azcertificates.MergeCertificateParameters{X509Certificates: x5c, Tags: withPrev}, nil)
 	if err != nil {
 		return "", classify(opMerge, name, err)
 	}

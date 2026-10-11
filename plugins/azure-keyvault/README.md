@@ -129,9 +129,16 @@ tells the connector so, and the connector adds an
   `validate` as `implicit`.
 - Its settings come from the key store: `vault`, `certificate_name`,
   `adopt` and `exportable`.
-- `Stage` and `Activate` find the certificate in place and change nothing
-  (no import, no secret read). The previous ref is the version that was the
-  latest before it, so a rollback knows what to put back.
+- On a normal deployment, `Stage` and `Activate` find the certificate as
+  the latest version and change nothing: no import and no secret read. The
+  previous ref is the version that was the latest before it, so a rollback
+  knows what to put back.
+- When the certificate is not the latest version (after a rollback, or
+  when something else added a version), the target imports it again, like
+  a target for another certificate: that reads the key from its secret and
+  needs `exportable: true`, `certificates/import/action` and
+  `secrets/getSecret/action`. A rollback needs the same (see
+  [Rollback](#rollback)). With `exportable: false`, both are refused.
 - Without a `verify` block it is reported as activated but not verified.
 - A configured target with `plugin: azure-keyvault` and the key store's
   `vault` and `certificate_name` (in any spelling, for example the vault name
@@ -166,10 +173,19 @@ It needs the private key:
   needs `exportable: true`; `validate` refuses the pair otherwise.
 - With the `local` key store, the connector hands over the key as PEM.
 
-Before the first import into a certificate that already exists, the plugin
-reads its latest version's ownership tag, with the same rules and `adopt`
-setting as the key store (see [Ownership](#ownership)). Every imported
-version carries the ownership tag and the configured `tags`.
+Before an import into a certificate that already exists, the plugin reads
+its latest version's ownership tag, with the same rules and `adopt` setting
+as the key store (see [Ownership](#ownership)), but without looking for a
+pending request: an import fails anyway while one is pending, and reading
+pending requests needs more permissions than importing. Every imported
+version carries the ownership tag, the configured `tags`, and
+`krakenkey-connector-previous-version`, the version it replaced. The key
+store sets that tag on the versions it merges too, so the plugin can tell
+which version was live before without relying on creation times, which Key
+Vault keeps only to the second. For versions without it (created outside
+the connector, or before this tag), the plugin falls back to creation
+times, and gives up (no rollback for that deployment, logged) when two
+versions share the second that decides.
 
 ### Target calls
 
@@ -177,13 +193,18 @@ version carries the ownership tag and the configured `tags`.
 |---|---|
 | `Validate` | Checks the settings and reports the vault URL and certificate name as the deployment id. For a certificate other than the key store's own: reads the latest version's ownership tag, and checks for a soft-deleted certificate with that name. |
 | `Current` | Reads the latest version and returns its serial number; nothing when there is none or it is disabled (versionless consumers cannot read a disabled version). |
-| `Stage` | Reads the latest version. If it is the certificate being deployed, nothing else happens. Otherwise checks ownership, gets the key (reads the source secret for a vault reference), checks that it belongs to the certificate, and builds the PKCS#12 bundle in memory. |
-| `Activate` | Certificate in place: lists the versions to find the one that was the latest before it. Otherwise imports the bundle as a new version and returns the serial of the version it replaced. A failed import leaves the latest version as it was; if the answer is lost, the plugin checks whether the version went in. |
+| `Stage` | Reads the latest version. If it is the certificate being deployed, nothing else happens. Otherwise checks ownership, gets the key (reads the source secret for a vault reference) and checks that it belongs to the certificate. |
+| `Activate` | Certificate in place: reads the version named in its `krakenkey-connector-previous-version` tag (or, without the tag, lists the versions) to find the one that was the latest before it. Otherwise checks ownership again, imports the certificate, chain and key as a new version, and returns the serial of the version it replaced. A failed import leaves the latest version as it was; if the answer is lost, the plugin checks whether the version went in. |
 | `Rollback` | Imports the previous certificate and its key again as a new latest version (see [Rollback](#rollback)). Does nothing if that certificate is already the latest version. |
-| `Discard` | Drops the staged bundle from memory. |
+| `Discard` | Drops the staged key from memory. |
 
-Staged bundles live only in the plugin's memory, for at most an hour, and
-are wiped after `Activate` or `Discard`.
+Between `Stage` and `Activate` the plugin keeps the private key in memory,
+for at most an hour, and drops it after `Activate` or `Discard`. The
+PKCS#12 bundle it imports is built during `Activate` and has no password: a
+password sent next to it in the same request would protect nothing, so the
+key is protected in transit by the TLS connection to Key Vault. The plugin
+overwrites the bundle's buffer after the call, as far as Go allows; copies
+the runtime makes (the base64 text sent, the parsed key) cannot be wiped.
 
 ### Rollback
 
@@ -203,11 +224,29 @@ and its key once more, as a new version. The connector hands them back
 | First deployment (no earlier version) | Refused: Key Vault cannot delete a single version, so the new version stays. |
 
 The plugin reports `propagates_async`: services pick up a new version on
-their own schedule, so a failed `verify` check is reported, not rolled back.
-A rollback happens when a `then` command fails, or when the connector finds
-an interrupted deployment of an older certificate. Rolling back on every
-failed check would import the old certificate again while services may
-already have picked up the new one.
+their own schedule, so a failed `verify` check is not rolled back. The
+target is reported as `failed`, with an error that says so, and later
+passes check it again until the check passes or a newer certificate
+replaces it. A rollback happens when a `then` command fails, or when the
+connector finds an interrupted deployment of an older certificate that the
+vault does not serve yet. Rolling back on every failed check would import
+the old certificate again while services may already have picked up the
+new one.
+
+### With an older connector
+
+The implicit target needs a connector that supports it (core feature
+`implicit_target`, connector releases after v0.1.0). With a v0.1.0
+connector:
+
+- A certificate needs at least one configured target; the key store adds
+  none, so the target-less examples here do not work.
+- A configured target for the key store's own certificate is an ordinary
+  target: `validate` requires `exportable: true` for it, it finds the
+  certificate in place, and a rollback is refused (v0.1.0 hands back the
+  certificate the target already serves, which does not match the version
+  it replaced). Status reporting and the other behavior work as described.
+- Targets for other vaults and certificate names work as described.
 
 ### Target configuration
 
@@ -217,7 +256,7 @@ already have picked up the new one.
 | `certificate_name` | string | required | Key Vault certificate to deploy to. Created by the first import. |
 | `adopt` | bool | `false` | Let the connector add versions to a certificate it did not create. See [Ownership](#ownership). |
 | `exportable` | bool | `true` | Whether the private key of imported versions can be read from their secret. Application Gateway, App Service and Front Door need it. |
-| `tags` | map | none | Extra tags on every imported version (at most 14; `krakenkey-connector-certificate-id` is set by the connector). |
+| `tags` | map | none | Extra tags on every imported version (at most 13; `krakenkey-connector-certificate-id` and `krakenkey-connector-previous-version` are set by the connector). |
 
 For the implicit target, all of these come from the key store's settings.
 
@@ -244,7 +283,9 @@ with it. So:
 
 - For services that take hours or days, leave out `verify`. The target is
   reported as activated but not verified (`activated_unverifiable`), and
-  KrakenKey's own endpoint monitoring can watch the endpoint instead.
+  KrakenKey's own endpoint monitoring can watch the endpoint instead. With
+  `verify`, a check that fails because the service has not picked up the
+  version yet is reported as `failed` until a later pass sees it.
 - For services that poll within minutes (the CSI driver with rotation, the
   VM extension with a short interval), add `verify` with a window a little
   longer than the poll interval, for example `window: 10m` for a 2 minute
@@ -253,33 +294,45 @@ with it. So:
   command (for example a change to the Application Gateway, or a sync of
   the App Service certificate), and verify with a short window.
 
-A failed check on this target is reported, not rolled back (see
-[Rollback](#rollback)).
+A failed check on this target is reported and checked again on later
+passes, not rolled back (see [Rollback](#rollback)).
 
 ### Target permissions
 
 | Call | Key Vault operation | RBAC data action | Access policy |
 |---|---|---|---|
-| `Validate` (other certificates) | Get the latest version; for a missing certificate, check for a soft-deleted one | `certificates/read` | certificates: Get |
+| `Validate` (other certificates) | Get the latest version; for a missing certificate, check for a soft-deleted one (skipped without permission) | `certificates/read` | certificates: Get |
 | `Current` | Get the latest version | `certificates/read` | certificates: Get |
-| `Stage` | Get the latest version; for an import, read the source secret when given a vault reference | `certificates/read`; `secrets/getSecret/action` on the key store's vault | certificates: Get; secrets: Get on the key store's vault |
-| `Activate` | List versions (certificate in place), or import | `certificates/read`, `certificates/import/action` | certificates: Get, List, Import |
-| `Rollback` | Get the latest version, read the previous version's secret, import | `certificates/read`, `certificates/import/action`, `secrets/getSecret/action` | certificates: Get, Import; secrets: Get |
+| `Stage` | Get the latest version; when it is not the certificate being deployed, read the key from the source secret (vault reference) | `certificates/read`; `secrets/getSecret/action` on the key store's vault | certificates: Get; secrets: Get on the key store's vault |
+| `Activate` (in place) | Get the version it replaced; list versions only when it has no `krakenkey-connector-previous-version` tag | `certificates/read` | certificates: Get, List |
+| `Activate` (import) | Get the latest version, import | `certificates/read`, `certificates/import/action` | certificates: Get, Import |
+| `Rollback` | Get the latest version, read the previous version's secret (vault reference), import | `certificates/read`, `certificates/import/action`, `secrets/getSecret/action` | certificates: Get, Import; secrets: Get |
 
-For the implicit target alone (no rollback), `certificates/read` is enough;
-with access policies, add certificate permission **List**. Without it the
-deployment still succeeds, but the plugin cannot tell which version was
-live before, so that deployment cannot be rolled back (logged as a
-warning). Rollback adds `certificates/import/action` and
-`secrets/getSecret/action`.
+The target never reads pending certificate requests, which needs
+certificate permission Create in vaults that use access policies.
 
-For other certificates, grant `certificates/read` and
-`certificates/import/action` on the destination vault (or scoped to the
-certificate once it exists), and `secrets/getSecret/action` on the key
-store's vault. With the `local` key store, no secret permission is needed.
+Least privilege:
 
-A 403 names the operation and the permission to grant, as for the key
-store.
+- **Implicit target, no rollback:** `certificates/read`; with access
+  policies, certificate **Get** and **List**. The key store's own
+  permissions already include these. Without List, a deployment of a
+  version without the previous-version tag cannot be rolled back (logged).
+- **Implicit target with rollback, or putting the certificate back after a
+  rollback:** add `certificates/import/action` and
+  `secrets/getSecret/action` (access policies: certificate **Import**,
+  secret **Get**). The key store must be `exportable: true`.
+- **Another vault or certificate name:** on the destination vault,
+  `certificates/read` and `certificates/import/action` (access policies:
+  certificate **Get**, **List** and **Import**); on the key store's vault,
+  `secrets/getSecret/action` (secret **Get**). With the `local` key store,
+  no secret permission is needed.
+
+A 403 names the operation and the permission to grant: the one Key Vault's
+answer names, when it names one, otherwise the one the operation is
+documented to need. Errors keep Key Vault's HTTP status and error codes but
+not its message, which names the caller's application and object ids and
+tenant; the plugin also removes ids and token issuer URLs from errors that
+come from the Azure SDK's credential chain.
 
 ## Configuration
 
@@ -492,13 +545,13 @@ apply to the whole vault.
 
 | Call | Key Vault operation | RBAC data action | Access policy |
 |---|---|---|---|
-| `Validate` | Get certificate policy, latest version and pending request; for exportable certificates, get a secret version that does not exist (a 404 or 403 tells whether secrets can be read, without reading one); for a missing certificate, check for a soft-deleted one (skipped without permission) | `certificates/read`, `secrets/getSecret/action` (optional) | certificates: Get, secrets: Get (optional) |
+| `Validate` | Get certificate policy, latest version and pending request; for exportable certificates, get a secret version that does not exist (a 404 or 403 tells whether secrets can be read, without reading one); for a missing certificate, check for a soft-deleted one (skipped without permission) | `certificates/read`, `secrets/getSecret/action` (optional) | certificates: Get (and Create, which Key Vault asks for to read a pending request), secrets: Get (optional) |
 | `CreateCSR` | Get latest version (ownership tag), get and delete pending request, create certificate | `certificates/read`, `certificates/update/action`, `certificates/create/action` | certificates: Get, Update, Create |
-| `PublicKey` | Get pending request or certificate | `certificates/read` | certificates: Get |
-| `Complete` | Merge certificate (renewal with the same key also reads the policy and creates a version) | `certificates/create/action`, `certificates/read` | certificates: Create, Get |
+| `PublicKey` | Get pending request or certificate | `certificates/read` | certificates: Get, Create (pending request) |
+| `Complete` | Get the latest version (to name it in the new version's `krakenkey-connector-previous-version` tag), merge certificate (renewal with the same key also reads the policy and creates a version) | `certificates/create/action`, `certificates/read` | certificates: Create, Get |
 | `Export` (`vault_ref`) | Get certificate | `certificates/read` | certificates: Get |
 | `Export` (`pem`, `pfx`) | Get secret | `secrets/getSecret/action` | secrets: Get |
-| `Release` | Get and delete pending request | `certificates/read`, `certificates/update/action` | certificates: Get, Update |
+| `Release` | Get and delete pending request | `certificates/read`, `certificates/update/action` | certificates: Get, Create, Update |
 
 A 403 from Key Vault fails the call with the operation and the permission
 to grant, for example `grant the identity
