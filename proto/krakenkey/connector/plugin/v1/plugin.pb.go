@@ -1209,7 +1209,8 @@ type TargetCapabilities struct {
 	DefaultVerifyWindowSeconds int64 `protobuf:"varint,5,opt,name=default_verify_window_seconds,json=defaultVerifyWindowSeconds,proto3" json:"default_verify_window_seconds,omitempty"`
 	// The target picks up changes on its own schedule (for example a cloud
 	// service that polls a vault). The core reports verification failures for
-	// such targets but does not roll them back.
+	// such targets but does not roll them back, and checks them again on
+	// later passes.
 	PropagatesAsync bool `protobuf:"varint,6,opt,name=propagates_async,json=propagatesAsync,proto3" json:"propagates_async,omitempty"`
 	// Rollback needs the previous certificate and its private key handed
 	// back, because the target cannot keep them itself (for example a cloud

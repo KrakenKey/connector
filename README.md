@@ -560,8 +560,11 @@ them, or the one given with `--cert`). For each of their targets it sends:
 
 - the state: `pending` (nothing deployed yet, or a newer certificate is
   waiting to be deployed), `staged`, `activated` (not verified yet),
-  `verified`, `activated_unverifiable` (no `verify` block, or a target that
-  propagates on its own schedule), `failed` or `rolled_back`;
+  `verified`, `activated_unverifiable` (no `verify` block), `failed` or
+  `rolled_back`. A target that picks up changes on its own schedule and
+  fails its check is reported as `failed`, with an error that says it was
+  not rolled back; later passes check it again until it passes or a newer
+  certificate replaces it;
 - the serial number of the certificate the target has;
 - for failures, a short error message: private keys, API keys and
   enrollment tokens removed, paths under the data directory shortened, at
@@ -631,10 +634,13 @@ certificates:
 The implicit target is labeled with the key store plugin's name from the
 `plugins` block (`azure-keyvault` above), served by the same plugin, and
 deployed first. It needs no exportable key, because the certificate is
-already there; it changes nothing on a normal deployment, and puts the
-previous certificate back on a rollback. It has no `verify` or `then`
-block, so its deployments are reported as activated but not verified.
-`validate` lists it as `implicit`.
+already there. On a normal deployment it finds the certificate in place and
+changes nothing. When it is not in place (after a rollback, or when
+something else added a newer version), the plugin puts it back, and a
+rollback puts the previous certificate back; both need the key, so they work
+only when the key store allows export. It has no `verify` or `then` block,
+so its deployments are reported as activated but not verified. `validate`
+lists it as `implicit`.
 
 To verify it, run a command after it, or give it another label, configure a
 target of the same plugin that deploys to the same place. That target takes
@@ -653,10 +659,16 @@ Services that poll the key store can take hours to pick up a new version;
 the key store plugin's README says how long, and what verify window to use.
 
 The plugin tells the connector where a target deploys, so the match does not
-depend on how the settings are spelled. Any other target that uses the
-implicit target's label is reported as a problem. There is no setting to
-turn the implicit target off; it never deploys anything the key store has not
-already made live.
+depend on how the settings are spelled. Declare each plugin once: the same
+executable under two names is two plugins to the connector, so a target
+under the other name does not replace the implicit target (`validate` warns
+when it sees that).
+
+If another target already uses the implicit target's label (a config written
+before implicit targets), the implicit target is not added, and `validate`
+warns; rename that target to get it. There is no setting to turn the
+implicit target off. It only reads, except when it has to put a certificate
+back: the current one after a rollback, or the previous one on a rollback.
 
 ### Verify
 
@@ -685,6 +697,12 @@ lists it.
 
 A target without a `verify` block is activated without any check. `validate`
 warns about it.
+
+A failed check rolls the target back, except on targets that pick up
+changes on their own schedule (for example a cloud service that polls a
+vault): there the new certificate stays, the target is reported as
+`failed`, and every later pass checks it again until the check passes or a
+newer certificate replaces it.
 
 ### Built-in key store: `local`
 

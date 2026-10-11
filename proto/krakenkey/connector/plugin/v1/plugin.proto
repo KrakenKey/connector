@@ -285,7 +285,8 @@ message TargetCapabilities {
   int64 default_verify_window_seconds = 5;
   // The target picks up changes on its own schedule (for example a cloud
   // service that polls a vault). The core reports verification failures for
-  // such targets but does not roll them back.
+  // such targets but does not roll them back, and checks them again on
+  // later passes.
   bool propagates_async = 6;
   // Rollback needs the previous certificate and its private key handed
   // back, because the target cannot keep them itself (for example a cloud

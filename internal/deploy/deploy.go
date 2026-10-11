@@ -176,6 +176,37 @@ func (e *BlockedError) Unwrap() error { return e.Err }
 // BlocksDeployment marks the error as a failure on the connector's side.
 func (e *BlockedError) BlocksDeployment() bool { return true }
 
+// TargetError is a failed deployment to one target. The status report
+// shows it on that target only.
+type TargetError struct {
+	Label string
+	Err   error
+}
+
+func (e *TargetError) Error() string { return "target " + e.Label + ": " + e.Err.Error() }
+
+// Unwrap returns the wrapped error.
+func (e *TargetError) Unwrap() error { return e.Err }
+
+// OnlyTargetErrors reports whether err is made only of TargetErrors (one,
+// or several joined), so it says nothing about targets other than the
+// ones named.
+func OnlyTargetErrors(err error) bool {
+	if err == nil {
+		return false
+	}
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, e := range j.Unwrap() {
+			if !OnlyTargetErrors(e) {
+				return false
+			}
+		}
+		return len(j.Unwrap()) > 0
+	}
+	_, ok := err.(*TargetError)
+	return ok
+}
+
 // IsBlocked reports whether err, or an error it wraps, is a failure on the
 // connector's side that kept a certificate from being deployed: any error
 // with a BlocksDeployment method that returns true.
@@ -626,7 +657,7 @@ func (r *run) deployPending(ctx context.Context) error {
 		}
 		tr := &targetRun{run: r, tj: tj, log: r.log.With("target", label)}
 		if err := tr.deploy(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("target %s: %w", label, err))
+			errs = append(errs, &TargetError{Label: label, Err: err})
 		}
 	}
 
@@ -769,6 +800,9 @@ func (t *targetRun) deploy(ctx context.Context) error {
 	}
 	ts := t.ts()
 	if ts.Serial == t.st.Serial {
+		if ts.Outcome == OutcomeVerifyFailed {
+			return t.reverify(ctx)
+		}
 		return nil
 	}
 	if !t.opts.Force && t.e.now().Before(ts.NextAttempt) {
@@ -815,8 +849,22 @@ func (t *targetRun) recover(ctx context.Context) error {
 	case PhaseActivated:
 		ts = t.ts()
 		if ts.DeployingSerial != t.st.Serial {
-			// A newer certificate has been issued since. Put the target
-			// back the way it was; the normal path deploys the new one.
+			// A newer certificate has been issued since. If the target
+			// serves it already (the key store's own deployment, where the
+			// key store made it live in Complete), going back would undo
+			// that; end the old deployment and let the normal path deploy
+			// the new one.
+			if cur := t.current(ctx); cur != "" && cur == t.st.Serial {
+				a := t.entry(audit.StepRecover, audit.ResultSkipped)
+				a.Detail = "the target serves the newer certificate " + cur + " already; not rolling back the interrupted deployment of " + ts.DeployingSerial
+				_ = t.e.audit(a)
+				t.log.Info("an interrupted deployment of an older certificate is superseded; the target serves the current one", "serial", cur)
+				ts.endDeployment()
+				t.setTS(ts)
+				return t.save()
+			}
+			// Put the target back the way it was; the normal path deploys
+			// the new one.
 			err := t.rollback(ctx, ts.PreviousRef, errors.New("interrupted deployment of an older certificate"), false)
 			if t.ts().Phase == "" && t.ts().Serial != t.st.Serial {
 				// Rolled back (or kept); carry on with the current one.
@@ -880,6 +928,9 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 		key, err = t.job.KeyStore.Export(ctx, plugin.ExportRequest{Config: t.job.KeyStoreConfig, KeyRef: st.KeyRef, Format: tj.Format})
 		if err != nil {
 			t.failStep(audit.StepExport, err)
+			if t.keyStoreServesCurrent(ctx, "export failed") {
+				return t.finishActivated(ctx, "", true)
+			}
 			return t.recordFailure(err, OutcomeFailed)
 		}
 	}
@@ -895,6 +946,9 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	})
 	if err != nil {
 		t.failStep(audit.StepStage, err)
+		if t.keyStoreServesCurrent(ctx, "stage failed") {
+			return t.finishActivated(ctx, "", true)
+		}
 		return t.recordFailure(err, OutcomeFailed)
 	}
 	ts := t.ts()
@@ -959,6 +1013,30 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	return t.finishActivated(ctx, prevRef, false)
 }
 
+// keyStoreServesCurrent is for a step that failed before Activate on the
+// key store's own deployment: the key store made the certificate live in
+// Complete, so the target may serve it although the step failed. If it
+// does, it records the target as activated with an unknown previous state,
+// as for a lost Activate answer, and returns true; the caller then checks
+// it as activated.
+func (t *targetRun) keyStoreServesCurrent(ctx context.Context, what string) bool {
+	if !t.tj.Config.KeyStoreDeployment {
+		return false
+	}
+	if cur := t.current(ctx); cur == "" || cur != t.st.Serial {
+		return false
+	}
+	a := t.entry(audit.StepRecover, audit.ResultOK)
+	a.Detail = what + ", but the key store's certificate is in place; checking it"
+	_ = t.e.audit(a)
+	t.log.Warn(what+", but the key store's certificate is in place; checking it as activated", "serial", t.st.Serial)
+	ts := t.ts()
+	ts.Phase, ts.StagedRef, ts.PreviousRef, ts.DeployingSerial = PhaseActivated, "", "", t.st.Serial
+	t.setTS(ts)
+	_ = t.save()
+	return true
+}
+
 // finishActivated runs the then command and verification after Activate,
 // and rolls back on failure. recovering is true when finishing a
 // deployment from an earlier run.
@@ -981,35 +1059,9 @@ func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recover
 		t.recordSuccess(st.Serial, st.NotAfter, OutcomeUnverifiable)
 		return nil
 	}
-	leaf, err := certutil.ParseLeaf(st.CertPEM)
-	if err != nil {
-		return t.rollback(ctx, prevRef, err, true)
-	}
-	if v.SkipChainValidation {
-		t.log.Warn("chain validation is off for this target (verify.skip_chain_validation); only the served leaf is checked")
-	}
-	vreq := verify.Request{
-		Host:                v.Host,
-		Address:             v.DialAddress(),
-		Expected:            leaf,
-		Window:              tj.Window,
-		Roots:               tj.Roots,
-		SkipChainValidation: v.SkipChainValidation,
-	}
-	t.log.Info("verifying", "address", vreq.Address, "sni", vreq.Host, "window", vreq.Window)
-	if err := t.e.Verifier.Verify(ctx, vreq); err != nil {
+	if err := t.verify(ctx); err != nil {
 		if tj.Caps.PropagatesAsync {
-			a := t.entry(audit.StepVerify, audit.ResultReported)
-			a.Error = err.Error()
-			a.Detail = "target propagates on its own schedule; not rolled back"
-			_ = t.e.audit(a)
-			t.log.Error("verification failed; not rolling back because this target propagates on its own schedule", "error", err)
-			t.recordSuccess(st.Serial, st.NotAfter, OutcomeUnverifiable)
-			ts := t.ts()
-			ts.LastError = err.Error()
-			t.setTS(ts)
-			_ = t.save()
-			return fmt.Errorf("verify (not rolled back): %w", err)
+			return t.recordAsyncVerifyFailure(err)
 		}
 		t.failStep(audit.StepVerify, err)
 		return t.rollback(ctx, prevRef, err, true)
@@ -1024,6 +1076,67 @@ func (t *targetRun) finishActivated(ctx context.Context, prevRef string, recover
 	_ = t.e.audit(a)
 	t.log.Info("deployed and verified", "serial", st.Serial)
 	t.recordSuccess(st.Serial, st.NotAfter, OutcomeVerified)
+	return nil
+}
+
+// verify checks the endpoint in the target's verify block.
+func (t *targetRun) verify(ctx context.Context) error {
+	v := t.tj.Config.Verify
+	leaf, err := certutil.ParseLeaf(t.st.CertPEM)
+	if err != nil {
+		return err
+	}
+	if v.SkipChainValidation {
+		t.log.Warn("chain validation is off for this target (verify.skip_chain_validation); only the served leaf is checked")
+	}
+	vreq := verify.Request{
+		Host:                v.Host,
+		Address:             v.DialAddress(),
+		Expected:            leaf,
+		Window:              t.tj.Window,
+		Roots:               t.tj.Roots,
+		SkipChainValidation: v.SkipChainValidation,
+	}
+	t.log.Info("verifying", "address", vreq.Address, "sni", vreq.Host, "window", vreq.Window)
+	return t.e.Verifier.Verify(ctx, vreq)
+}
+
+// recordAsyncVerifyFailure records a failed check on a target that picks
+// up changes on its own schedule. The target keeps the new certificate (it
+// is not rolled back) and is reported as failed; later passes check it
+// again until the check passes or a newer certificate replaces it.
+func (t *targetRun) recordAsyncVerifyFailure(err error) error {
+	err = fmt.Errorf("verify failed; not rolled back because the target picks up changes on its own schedule, checking again on the next pass: %w", err)
+	a := t.entry(audit.StepVerify, audit.ResultReported)
+	a.Error = err.Error()
+	_ = t.e.audit(a)
+	t.log.Error("verification failed; not rolling back because this target propagates on its own schedule", "error", err)
+	ts := t.ts()
+	ts.Serial, ts.NotAfter = t.st.Serial, t.st.NotAfter
+	ts.Outcome, ts.LastError = OutcomeVerifyFailed, err.Error()
+	ts.endDeployment()
+	ts.Failures, ts.NextAttempt = 0, time.Time{}
+	t.setTS(ts)
+	_ = t.save()
+	return err
+}
+
+// reverify checks again a target whose last check failed (see
+// recordAsyncVerifyFailure).
+func (t *targetRun) reverify(ctx context.Context) error {
+	if t.tj.Config.Verify == nil {
+		// The verify block was removed from the config.
+		t.recordSuccess(t.st.Serial, t.st.NotAfter, OutcomeUnverifiable)
+		return nil
+	}
+	if err := t.verify(ctx); err != nil {
+		return t.recordAsyncVerifyFailure(err)
+	}
+	a := t.entry(audit.StepVerify, audit.ResultOK)
+	a.Detail = "checked again after a failed check on an earlier pass"
+	_ = t.e.audit(a)
+	t.log.Info("verified on a later pass", "serial", t.st.Serial)
+	t.recordSuccess(t.st.Serial, t.st.NotAfter, OutcomeVerified)
 	return nil
 }
 
@@ -1114,10 +1227,10 @@ func (t *targetRun) rollback(ctx context.Context, prevRef string, cause error, c
 	if t.tj.Config.Then != nil {
 		if err := t.runThen(rctx, "", "rollback"); err != nil {
 			a.Result, a.Error = audit.ResultFailed, err.Error()
-			a.Detail = "files rolled back; then.exec failed afterwards"
+			a.Detail = "rolled back; then.exec failed afterwards"
 			_ = t.e.audit(a)
 			t.log.Error("rolled back, but then.exec failed afterwards", "error", err)
-			return done(errors.Join(cause, fmt.Errorf("files rolled back, but then.exec failed afterwards: %w", err)), OutcomeRolledBack)
+			return done(errors.Join(cause, fmt.Errorf("rolled back, but then.exec failed afterwards: %w", err)), OutcomeRolledBack)
 		}
 	}
 	_ = t.e.audit(a)

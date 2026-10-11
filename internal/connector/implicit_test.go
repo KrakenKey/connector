@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	stdlog "log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -167,10 +168,6 @@ func TestImplicitTargetProblems(t *testing.T) {
 		cert config.Certificate
 		want string
 	}{
-		"label taken by another deployment": {
-			vaultCert(config.Target{Label: "vault", Plugin: "copy", Settings: map[string]any{"vault": "dr"}}),
-			`label "vault" is taken by the target key store vault adds by itself`,
-		},
 		"two targets in one place": {
 			vaultCert(
 				config.Target{Label: "a", Plugin: "copy", Settings: map[string]any{"vault": "dr"}},
@@ -265,7 +262,7 @@ func (e *vaultEnv) config(targets string) *config.Config {
 	return writeConfig(e.t, fmt.Sprintf(`
 krakenkey: { api_url: %q }
 data_dir: %s
-plugins: { vault: { path: /opt/krakenkey-connector-plugin-vault } }
+plugins: { vault: { path: /opt/krakenkey-connector-plugin-vault }, copy: { path: /opt/krakenkey-connector-plugin-vault } }
 certificates:
   - id: 1043
     names: [api.example.com]
@@ -467,4 +464,190 @@ func readAudit(t *testing.T, path string) string {
 		}
 	}
 	return strings.Join(steps, " ")
+}
+
+// TestImplicitTargetLabelTaken keeps a config from before implicit targets
+// working when a target there already uses the implicit target's label.
+func TestImplicitTargetLabelTaken(t *testing.T) {
+	r := newVaultResolver()
+	job, rep := BuildJob(context.Background(), vaultCert(config.Target{Label: "vault", Plugin: "copy", Settings: map[string]any{"vault": "dr"}}), r)
+	if !rep.OK() || len(rep.Targets) != 1 || len(job.Cert.Targets) != 1 || rep.Targets[0].Implicit {
+		t.Fatalf("report %+v %+v", rep, rep.Targets)
+	}
+	if len(rep.Warnings) != 1 || !strings.Contains(rep.Warnings[0], `the configured target "vault", which deploys somewhere else, uses its label`) {
+		t.Errorf("warnings = %q", rep.Warnings)
+	}
+	var out bytes.Buffer
+	cfg := &config.Config{Certificates: []config.Certificate{vaultCert(config.Target{Label: "vault", Plugin: "copy", Settings: map[string]any{"vault": "dr"}})}}
+	if n := Validate(context.Background(), cfg, r, nil, &out); n != 0 || !strings.Contains(out.String(), "  WARNING: key store vault deploys to its own certificate") {
+		t.Errorf("validate (%d problems):\n%s", n, out.String())
+	}
+	// A target that replaces the implicit one may use the label, and no
+	// warning is given then.
+	_, rep = BuildJob(context.Background(), vaultCert(config.Target{Label: "vault", Plugin: "vault", Settings: map[string]any{"vault": "main"}}), r)
+	if !rep.OK() || len(rep.Warnings) != 0 || !rep.Targets[0].KeyStoreDeployment {
+		t.Errorf("replacing target: %+v %+v", rep, rep.Targets)
+	}
+}
+
+func TestImplicitTargetWithoutDeploymentID(t *testing.T) {
+	r := newVaultResolver()
+	r.t.NoDeploymentID = true
+	_, rep := BuildJob(context.Background(), vaultCert(), r)
+	if rep.OK() || len(rep.Targets) != 1 || !strings.Contains(firstProblem(rep), "does not say where it deploys (no deployment id)") {
+		t.Errorf("report %+v %+v", rep, rep.Targets)
+	}
+}
+
+// checksumResolver says that the plugins "vault" and "copy" are the same
+// executable.
+type checksumResolver struct{ vaultResolver }
+
+func (checksumResolver) PluginChecksum(name string) string {
+	if name == "vault" || name == "copy" {
+		return "abc123"
+	}
+	return ""
+}
+
+func TestSameExecutableUnderTwoNames(t *testing.T) {
+	cert := vaultCert(config.Target{Label: "other-name", Plugin: "copy", Settings: map[string]any{"vault": "main"}})
+	_, rep := BuildJob(context.Background(), cert, checksumResolver{newVaultResolver()})
+	if len(rep.Targets) != 2 {
+		t.Fatalf("targets %+v", rep.Targets)
+	}
+	if w := strings.Join(rep.Targets[1].Warnings, "; "); !strings.Contains(w, "plugins copy and vault are the same executable") {
+		t.Errorf("warnings = %q", w)
+	}
+	// Without checksums (built-in plugins, or not started) nothing is said.
+	_, rep = BuildJob(context.Background(), cert, newVaultResolver())
+	if len(rep.Targets[1].Warnings) != 0 {
+		t.Errorf("warnings without checksums = %q", rep.Targets[1].Warnings)
+	}
+}
+
+// TestAsyncKeyStoreDeploymentVerifiesAgain checks a target that picks up
+// changes on its own schedule: a failed check is reported as failed on
+// that target, not rolled back, and checked again on the next pass.
+func TestAsyncKeyStoreDeploymentVerifiesAgain(t *testing.T) {
+	e := newVaultEnv(t)
+	e.r.t.Async = true
+	stale := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	stale.TLS = &tls.Config{GetCertificate: e.r.v.GetCertificate("empty")}
+	stale.Config.ErrorLog = stdlog.New(io.Discard, "", 0)
+	stale.StartTLS()
+	t.Cleanup(stale.Close)
+	target := func(addr string) string {
+		return fmt.Sprintf(`    targets:
+      - label: vault
+        plugin: vault
+        vault: main
+        verify: { host: api.example.com, address: %q, ca_file: %s, window: 1s }`, addr, e.caFile)
+	}
+
+	err := e.run(e.config(target(stale.Listener.Addr().String())), false)
+	if err == nil || !strings.Contains(err.Error(), "verify failed; not rolled back because the target picks up changes on its own schedule") {
+		t.Fatalf("first pass: %v", err)
+	}
+	serial := e.serial()
+	if vs := e.r.v.Versions("main"); len(vs) != 1 {
+		t.Errorf("rolled back: %d versions", len(vs))
+	}
+	if ts := e.state().Targets["vault"]; ts.Serial != serial || ts.Outcome != deploy.OutcomeVerifyFailed {
+		t.Errorf("state = %+v", ts)
+	}
+	rc := e.lastReport()
+	if rc.Targets[0].State != api.DeployFailed || rc.Targets[0].Serial != serial || !strings.Contains(rc.Targets[0].Error, "not rolled back") {
+		t.Errorf("report = %+v", rc.Targets)
+	}
+
+	// The next pass checks again, without deploying again.
+	stages := e.r.t.Stages
+	if err := e.run(e.config(target(e.addr)), false); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if e.r.t.Stages != stages {
+		t.Error("the second pass deployed again")
+	}
+	if ts := e.state().Targets["vault"]; ts.Outcome != deploy.OutcomeVerified || ts.LastError != "" {
+		t.Errorf("state = %+v", ts)
+	}
+	if rc := e.lastReport(); rc.Targets[0].State != api.DeployVerified {
+		t.Errorf("report = %+v", rc.Targets)
+	}
+}
+
+// TestKeyStoreDeploymentStageFailure checks that a failed Stage on the key
+// store's own deployment, which the key store made live already, is
+// recorded as activated rather than failed on the old certificate.
+func TestKeyStoreDeploymentStageFailure(t *testing.T) {
+	e := newVaultEnv(t)
+	if err := e.run(e.config(""), false); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	e.r.t.FailStage = fmt.Errorf("%w: vault busy", plugin.ErrUnavailable)
+	if err := e.run(e.config(""), true); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	serial := e.serial()
+	if ts := e.state().Targets["vault"]; ts.Serial != serial || ts.Outcome != deploy.OutcomeUnverifiable {
+		t.Errorf("state = %+v", ts)
+	}
+	if rc := e.lastReport(); rc.Targets[0].State != api.DeployActivatedUnverifiable || rc.Targets[0].Serial != serial {
+		t.Errorf("report = %+v", rc.Targets)
+	}
+	if a := readAudit(t, filepath.Join(e.tmp, "data", "audit.jsonl")); !strings.Contains(a, "stage:failed recover:ok verify:skipped") {
+		t.Errorf("audit = %s", a)
+	}
+}
+
+// TestUpgradeAddsImplicitTarget runs a certificate first as a connector
+// before implicit targets would (no implicit target), then with them: the
+// implicit target is deployed without a renewal, and the configured target
+// is left alone. A configured target that already uses the implicit
+// target's label keeps working.
+func TestUpgradeAddsImplicitTarget(t *testing.T) {
+	for _, label := range []string{"lb", "vault"} {
+		t.Run(label, func(t *testing.T) {
+			e := newVaultEnv(t)
+			e.r.v.NoImplicit = true
+			cfg := e.config(fmt.Sprintf(`    targets:
+      - { label: %s, plugin: copy, vault: dr }`, label))
+			if err := e.run(cfg, false); err != nil {
+				t.Fatalf("before the upgrade: %v", err)
+			}
+			serial := e.serial()
+			e.kk.mu.Lock()
+			renewals := len(e.kk.requests)
+			e.kk.mu.Unlock()
+			stages := e.r.t.Stages
+
+			e.r.v.NoImplicit = false
+			if err := e.run(cfg, false); err != nil {
+				t.Fatalf("after the upgrade: %v", err)
+			}
+			for _, req := range e.kk.requests[renewals:] {
+				if strings.HasSuffix(req, "/renew") {
+					t.Errorf("renewed after the upgrade: %s", req)
+				}
+			}
+			st := e.state()
+			rc := e.lastReport()
+			if label == "vault" {
+				if e.r.t.Stages != stages || len(rc.Targets) != 1 || rc.Targets[0].Label != "vault" || st.Targets["vault"].Serial != serial {
+					t.Errorf("label taken: stages %d -> %d, report %+v", stages, e.r.t.Stages, rc.Targets)
+				}
+				return
+			}
+			if e.r.t.Stages != stages+1 {
+				t.Errorf("stages %d -> %d, want one for the implicit target", stages, e.r.t.Stages)
+			}
+			if st.Targets["vault"].Serial != serial || st.Targets["lb"].Serial != serial {
+				t.Errorf("state = %+v", st.Targets)
+			}
+			if len(rc.Targets) != 2 || rc.Targets[0].Label != "vault" || rc.Targets[1].Label != "lb" {
+				t.Errorf("report = %+v", rc.Targets)
+			}
+		})
+	}
 }

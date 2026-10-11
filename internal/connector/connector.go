@@ -28,6 +28,13 @@ type Resolver interface {
 	Target(name string) (plugin.Target, error)
 }
 
+// PluginChecksummer is implemented by resolvers that run external plugins.
+// PluginChecksum returns the checksum of the executable a started plugin
+// runs, or "" when it is not known (built-in or not started).
+type PluginChecksummer interface {
+	PluginChecksum(name string) string
+}
+
 // TargetReport describes one target after resolving and checking it.
 type TargetReport struct {
 	Label    string
@@ -55,6 +62,8 @@ type CertReport struct {
 	KeyStore     string
 	KeyStoreCaps *plugin.KeyStoreCapabilities
 	Problems     []string // key store problems
+	// Warnings do not stop deployments.
+	Warnings []string
 	// Targets are the certificate's targets in deployment order, including
 	// one the key store added (see plugin.ImplicitTarget). They line up
 	// with the Job's Cert.Targets.
@@ -194,7 +203,7 @@ func BuildJob(ctx context.Context, cert config.Certificate, r Resolver) (deploy.
 
 	if implicit != nil {
 		label := config.ImplicitTargetLabel(cert.KeyStore.Plugin)
-		replaced := false
+		replaced, labelTakenBy := false, ""
 		for _, c := range targets {
 			switch {
 			case c.tr.Plugin == cert.KeyStore.Plugin && c.deploymentID == implicit.DeploymentID:
@@ -204,11 +213,18 @@ func BuildJob(ctx context.Context, cert config.Certificate, r Resolver) (deploy.
 				c.tr.KeyStoreDeployment = true
 				c.tj.Config.KeyStoreDeployment = true
 			case c.tr.Label == label:
-				c.problem(fmt.Sprintf("label %q is taken by the target key store %s adds by itself, and this target deploys somewhere else; use another label",
-					label, cert.KeyStore.Plugin))
+				labelTakenBy = c.tr.Label
 			}
 		}
-		if !replaced {
+		switch {
+		case replaced:
+		case labelTakenBy != "":
+			// A config written before implicit targets may use the
+			// label for something else; keep it working.
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+				"key store %s deploys to its own certificate, but the target for that is not added: the configured target %q, which deploys somewhere else, uses its label. Rename that target to have the key store's certificate reported, or configure a target of plugin %s for the key store's certificate",
+				cert.KeyStore.Plugin, labelTakenBy, cert.KeyStore.Plugin))
+		default:
 			tc := config.Target{Label: label, Plugin: cert.KeyStore.Plugin, Implicit: true, KeyStoreDeployment: true}
 			var settingsErr error
 			tc.Settings, settingsErr = implicitSettings(implicit.Config)
@@ -217,13 +233,38 @@ func BuildJob(ctx context.Context, cert config.Certificate, r Resolver) (deploy.
 			if settingsErr != nil {
 				c.problem("settings from key store " + cert.KeyStore.Plugin + ": " + settingsErr.Error())
 			}
-			if c.deploymentID != "" && c.deploymentID != implicit.DeploymentID {
+			switch {
+			case c.caps == nil:
+			case c.deploymentID == "":
+				// A configured target could never replace it, and two
+				// targets would deploy to one place.
+				c.problem(fmt.Sprintf("the target of plugin %s does not say where it deploys (no deployment id), so it cannot serve the key store's own certificate; update the plugin",
+					cert.KeyStore.Plugin))
+			case c.deploymentID != implicit.DeploymentID:
 				c.problem(fmt.Sprintf("the target reports deployment id %q for the settings key store %s gave it, not %q",
 					c.deploymentID, cert.KeyStore.Plugin, implicit.DeploymentID))
 			}
 			// The key store has made the certificate live by the time any
 			// target is deployed, so this one goes first.
 			targets = append([]*checkedTarget{c}, targets...)
+		}
+	}
+
+	// The same executable declared under two plugin names is two plugins
+	// to the connector, so the checks above do not see that two targets
+	// deploy to one place.
+	if pc, ok := r.(PluginChecksummer); ok {
+		for i, a := range targets {
+			for _, b := range targets[:i] {
+				if a.deploymentID == "" || a.deploymentID != b.deploymentID || a.tr.Plugin == b.tr.Plugin {
+					continue
+				}
+				if sa, sb := pc.PluginChecksum(a.tr.Plugin), pc.PluginChecksum(b.tr.Plugin); sa != "" && sa == sb {
+					a.tr.Warnings = append(a.tr.Warnings, fmt.Sprintf(
+						"plugins %s and %s are the same executable, and this target deploys to the same place as target %s; declare the plugin once and use one name for both",
+						a.tr.Plugin, b.tr.Plugin, b.tr.Label))
+				}
+			}
 		}
 	}
 

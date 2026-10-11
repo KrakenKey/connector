@@ -116,7 +116,7 @@ type TargetCapabilities struct {
 	DefaultVerifyWindow time.Duration
 	// PropagatesAsync is true for targets that pick up changes on their own
 	// schedule. The core reports verification failures for them but does not
-	// roll them back.
+	// roll them back, and checks them again on later passes.
 	PropagatesAsync bool
 	// RollbackNeedsMaterial is true when Rollback needs the previous
 	// certificate and its private key handed back, because the target

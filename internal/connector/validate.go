@@ -92,6 +92,10 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 		for _, p := range rep.Problems {
 			bad("%s", p)
 		}
+		for _, warn := range rep.Warnings {
+			warnings++
+			fmt.Fprintf(w, "  WARNING: %s\n", warn)
+		}
 
 		for i, t := range rep.Targets {
 			fmt.Fprintf(w, "  target %s (%s", t.Label, t.Plugin)

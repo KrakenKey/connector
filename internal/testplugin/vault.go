@@ -27,6 +27,9 @@ type Vault struct {
 
 	// Exportable is reported in the capabilities for every setting.
 	Exportable bool
+	// NoImplicit makes the key store report no implicit target, like a
+	// plugin or connector from before implicit targets.
+	NoImplicit bool
 
 	mu       sync.Mutex
 	versions map[string][]VaultVersion // by vault name
@@ -92,6 +95,9 @@ func (v *Vault) ValidateCapabilities(ctx context.Context, req plugin.KeyStoreVal
 		return plugin.KeyStoreValidation{Problems: []string{err.Error()}}, nil
 	}
 	caps, _ := v.Describe(ctx)
+	if v.NoImplicit {
+		return plugin.KeyStoreValidation{Capabilities: &caps}, nil
+	}
 	cfg, _ := json.Marshal(vaultSettings{Vault: s.Vault})
 	caps.ImplicitTarget = &plugin.ImplicitTarget{Config: cfg, DeploymentID: VaultDeploymentID(s.Vault)}
 	return plugin.KeyStoreValidation{Capabilities: &caps}, nil
@@ -186,6 +192,14 @@ func (v *Vault) Target() *VaultTarget { return &VaultTarget{v: v} }
 // previous material to roll back, and reports where it deploys.
 type VaultTarget struct {
 	v *Vault
+	// Async reports PropagatesAsync, like a service that polls the vault.
+	Async bool
+	// NoDeploymentID makes Validate report no deployment id.
+	NoDeploymentID bool
+	// FailStage makes Stage fail with this error.
+	FailStage error
+	// Stages counts Stage calls.
+	Stages int
 	// ValidateRequests records every validate request.
 	ValidateRequests []plugin.TargetValidateRequest
 	mu               sync.Mutex
@@ -203,6 +217,7 @@ func (t *VaultTarget) Describe(context.Context) (plugin.TargetCapabilities, erro
 		NeedsExportableKey:    true,
 		SupportsRollback:      true,
 		RollbackNeedsMaterial: true,
+		PropagatesAsync:       t.Async,
 	}, nil
 }
 
@@ -221,6 +236,9 @@ func (t *VaultTarget) ValidateDeployment(_ context.Context, req plugin.TargetVal
 	if err != nil {
 		return plugin.TargetValidation{Problems: []string{err.Error()}}, nil
 	}
+	if t.NoDeploymentID {
+		return plugin.TargetValidation{}, nil
+	}
 	return plugin.TargetValidation{DeploymentID: VaultDeploymentID(s.Vault)}, nil
 }
 
@@ -236,6 +254,13 @@ func (t *VaultTarget) Current(_ context.Context, req plugin.CurrentRequest) (str
 // Stage finds the certificate in place, or prepares a new version from
 // the key material.
 func (t *VaultTarget) Stage(_ context.Context, req plugin.StageRequest) (string, error) {
+	t.mu.Lock()
+	t.Stages++
+	fail := t.FailStage
+	t.mu.Unlock()
+	if fail != nil {
+		return "", fail
+	}
 	s, err := parseVaultSettings(req.Config)
 	if err != nil {
 		return "", err

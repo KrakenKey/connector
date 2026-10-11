@@ -141,6 +141,9 @@ func (r *Reporter) target(st *deploy.State, tc config.Target, certErr error) api
 		rt.State, rt.Serial = api.DeployActivated, ts.DeployingSerial
 	case ts.Outcome == deploy.OutcomeFailed || ts.Outcome == deploy.OutcomeRolledBack:
 		rt.State, rt.Error = ts.Outcome, ts.LastError
+	case ts.Outcome == deploy.OutcomeVerifyFailed && ts.Serial == st.Serial:
+		// Deployed, but the check failed; checked again on later passes.
+		rt.State, rt.Error = api.DeployFailed, ts.LastError
 	case ts.Serial == "":
 		rt.State = api.DeployPending
 	case st.Serial != "" && ts.Serial != st.Serial:
@@ -164,7 +167,9 @@ func (r *Reporter) target(st *deploy.State, tc config.Target, certErr error) api
 		// something on the connector's side; the target keeps whatever it
 		// has (rt.Serial).
 		rt.State, rt.Error, updated = api.DeployFailed, certErr.Error(), r.now()
-	case rt.State == api.DeployPending:
+	case rt.State == api.DeployPending && !deploy.OnlyTargetErrors(certErr):
+		// A failure of the certificate as a whole (not of other targets)
+		// is why this target is still waiting.
 		rt.Error, updated = certErr.Error(), r.now()
 	}
 	if !known && updated.IsZero() {

@@ -142,6 +142,14 @@ func (h *Host) CheckPlugin(name string) (Location, error) {
 	return h.locations[name], nil
 }
 
+// PluginChecksum returns the checksum of the executable the external
+// plugin called name runs, or "" when it has not been started.
+func (h *Host) PluginChecksum(name string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.locations[name].SHA256
+}
+
 // rpc returns a running client for the plugin, starting it, or restarting
 // it if it has exited.
 func (h *Host) rpc(name string) (goplugin.ClientProtocol, error) {
