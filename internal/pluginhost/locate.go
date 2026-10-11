@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/krakenkey/connector/internal/config"
@@ -36,6 +37,8 @@ const (
 	// SourcePluginDir is <plugin_dir>/<name>/<version>/, the system plugin
 	// directory.
 	SourcePluginDir Source = "plugin_dir"
+	// SourceBuiltin is a plugin built into the connector.
+	SourceBuiltin Source = "builtin"
 )
 
 // Location is where a plugin's executable was found and what its checksum
@@ -55,6 +58,35 @@ type Location struct {
 	// PinnedBy lists what SHA256 matched: "config" (the plugin's sha256
 	// setting) and LockFile. Empty means the binary is not pinned.
 	PinnedBy []string
+}
+
+// Locate says where the plugin called name runs from, without starting
+// it: for a running plugin, the executable it was started from; for
+// others, where the connector looks for it (Path and Version may be empty
+// when that lookup fails). Built-in plugins have Source SourceBuiltin; a
+// name that is neither built in nor declared gives an empty Location. It
+// reads nothing but directory entries.
+func (h *Host) Locate(name string) Location {
+	if slices.Contains(config.BuiltinKeyStores, name) || slices.Contains(config.BuiltinTargets, name) {
+		return Location{Source: SourceBuiltin}
+	}
+	h.mu.Lock()
+	loc, running := h.locations[name]
+	h.mu.Unlock()
+	if running {
+		return loc
+	}
+	spec, ok := h.specs[name]
+	if !ok {
+		return Location{}
+	}
+	loc, _, _ = h.find(name, spec)
+	if loc.Source == "" {
+		// Without version and path the plugin can only come from the
+		// system plugin directory.
+		loc.Source = SourcePluginDir
+	}
+	return loc
 }
 
 // PinConfig is the PinnedBy entry for the plugin's sha256 setting.

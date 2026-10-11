@@ -239,6 +239,8 @@ type vaultEnv struct {
 	addr   string
 	caFile string
 	sent   *sentReports
+	// sharer, if set, gets the config summary after each pass.
+	sharer *ConfigSharer
 }
 
 func newVaultEnv(t *testing.T) *vaultEnv {
@@ -290,7 +292,8 @@ func (e *vaultEnv) run(cfg *config.Config, force bool) error {
 			Verifier: &verify.Verifier{DialTimeout: time.Second, MinBackoff: 10 * time.Millisecond, MaxBackoff: 50 * time.Millisecond},
 			Audit:    auditLog, State: state, Log: log,
 		},
-		Reporter: &Reporter{API: e.sent, Config: cfg, State: state, Log: log},
+		Reporter:     &Reporter{API: e.sent, Config: cfg, State: state, Log: log},
+		ConfigSharer: e.sharer,
 	}
 	return c.RunOnce(context.Background(), RunOptions{Force: force})
 }

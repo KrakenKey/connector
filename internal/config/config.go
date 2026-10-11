@@ -64,7 +64,14 @@ type Config struct {
 // KrakenKey holds API settings.
 type KrakenKey struct {
 	APIURL string `yaml:"api_url"`
+	// ShareConfig lets an enrolled connector send KrakenKey a read-only
+	// summary of this config for the dashboard. Default true; see
+	// SharesConfig.
+	ShareConfig *bool `yaml:"share_config"`
 }
+
+// SharesConfig reports whether krakenkey.share_config is on (the default).
+func (k KrakenKey) SharesConfig() bool { return k.ShareConfig == nil || *k.ShareConfig }
 
 // PluginSpec declares an external plugin.
 type PluginSpec struct {

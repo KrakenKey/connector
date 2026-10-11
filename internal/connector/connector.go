@@ -363,6 +363,9 @@ type Connector struct {
 	// for an enrolled connector: KrakenKey takes reports only with keys
 	// issued to a connector.
 	Reporter *Reporter
+	// ConfigSharer sends a summary of the config after each pass. Like
+	// Reporter, it is set only for an enrolled connector.
+	ConfigSharer *ConfigSharer
 }
 
 // RunOptions change one pass.
@@ -421,6 +424,7 @@ func (c *Connector) RunOnce(ctx context.Context, opts RunOptions) error {
 	}
 	err := errors.Join(errs...)
 	c.report(ctx, log, results, effective, err)
+	c.shareConfig(ctx, effective, err)
 	return err
 }
 
@@ -435,6 +439,18 @@ func (c *Connector) report(ctx context.Context, log *slog.Logger, results map[in
 		log.Warn("deployment status not reported: the pass stopped early", "error", passErr)
 	default:
 		c.Reporter.Send(ctx, results, certs)
+	}
+}
+
+// shareConfig sends the config summary, under the same conditions as the
+// status report. It never changes the result of the pass.
+func (c *Connector) shareConfig(ctx context.Context, certs map[int]config.Certificate, passErr error) {
+	if c.ConfigSharer == nil {
+		return
+	}
+	c.ConfigSharer.Remember(certs)
+	if !stopsPass(passErr) {
+		c.ConfigSharer.Share(ctx)
 	}
 }
 

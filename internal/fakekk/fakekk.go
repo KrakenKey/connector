@@ -4,11 +4,14 @@
 package fakekk
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -55,6 +58,9 @@ type Server struct {
 	// ReportNoContent makes /connectors/report answer 204 with no body,
 	// as an earlier version of the contract had it.
 	ReportNoContent bool
+	// ConfigStatus, if set, is returned by PUT and DELETE /connectors/config
+	// instead of storing or clearing the summary.
+	ConfigStatus int
 
 	mu          sync.Mutex
 	tokens      map[string]string // enrollment token -> connector name
@@ -65,6 +71,8 @@ type Server struct {
 	tokenCalls  int
 	rotateCalls int
 	reports     []json.RawMessage
+	configs     []json.RawMessage
+	configCalls []string
 }
 
 // New starts a fake.
@@ -179,6 +187,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			s.report(w, r)
 			return
 		}
+	}
+	if r.URL.Path == "/connectors/config" && (r.Method == http.MethodPut || r.Method == http.MethodDelete) {
+		s.config(w, r)
+		return
 	}
 	if s.Fallback != nil {
 		s.Fallback.ServeHTTP(w, r)
@@ -424,4 +436,235 @@ func randHex(n int) string {
 func newUUID() string {
 	h := randHex(16)
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// ConfigSummaries returns the raw bodies of the config summaries stored so
+// far, oldest first.
+func (s *Server) ConfigSummaries() []json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]json.RawMessage(nil), s.configs...)
+}
+
+// ConfigCalls returns the method of every /connectors/config request with
+// a connector key, answered or not.
+func (s *Server) ConfigCalls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.configCalls...)
+}
+
+var (
+	hashRe        = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	pluginNameRe  = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	settingKeyRe  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+	pluginSources = map[string]bool{"bundled": true, "data_dir": true, "path": true, "builtin": true}
+)
+
+// config checks PUT /connectors/config against the contract, field by
+// field, and stores the summary; DELETE clears it.
+func (s *Server) config(w http.ResponseWriter, r *http.Request) {
+	if s.Authorized(r) == "" {
+		writeJSON(w, http.StatusForbidden, map[string]any{"statusCode": 403, "message": "Config summaries need a connector key"})
+		return
+	}
+	s.mu.Lock()
+	s.configCalls = append(s.configCalls, r.Method)
+	status := s.ConfigStatus
+	s.mu.Unlock()
+	if r.Method == http.MethodDelete {
+		if status != 0 {
+			writeJSON(w, status, map[string]any{"statusCode": status, "message": "refused"})
+			return
+		}
+		s.mu.Lock()
+		s.configs = nil
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	var raw json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		s.t.Errorf("config: bad body: %v", err)
+	}
+	s.checkConfig(raw)
+	if status != 0 {
+		writeJSON(w, status, map[string]any{"statusCode": status, "message": "refused"})
+		return
+	}
+	s.mu.Lock()
+	s.configs = append(s.configs, raw)
+	s.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) checkConfig(raw json.RawMessage) {
+	t := s.t
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Errorf("config: %v", err)
+		return
+	}
+	allowed(t, "config", body, "hash", "version", "checkIntervalSeconds", "plugins", "certificates", "truncated")
+	var hash string
+	if json.Unmarshal(body["hash"], &hash) != nil || !hashRe.MatchString(hash) {
+		t.Errorf("config: hash %s", body["hash"])
+	}
+	// The hash covers the body without it: the connector sends the hash
+	// first, then the summary as it hashed it.
+	prefix := []byte(`{"hash":"` + hash + `",`)
+	if !bytes.HasPrefix(raw, prefix) {
+		t.Errorf("config: body does not start with the hash: %.80s", raw)
+	} else if sum := sha256.Sum256(append([]byte("{"), raw[len(prefix):]...)); hex.EncodeToString(sum[:]) != hash {
+		t.Errorf("config: hash %s does not match the body", hash)
+	}
+	var version string
+	if json.Unmarshal(body["version"], &version) != nil || !printable(version, 64) || version == "" {
+		t.Errorf("config: version %s", body["version"])
+	}
+	if v, ok := body["checkIntervalSeconds"]; ok && string(v) != "null" {
+		var n int
+		if json.Unmarshal(v, &n) != nil || n < 1 || n > 604800 {
+			t.Errorf("config: checkIntervalSeconds %s", v)
+		}
+	}
+	var truncated bool
+	if json.Unmarshal(body["truncated"], &truncated) != nil {
+		t.Errorf("config: truncated %s", body["truncated"])
+	}
+
+	var plugins []map[string]json.RawMessage
+	if err := json.Unmarshal(body["plugins"], &plugins); err != nil || plugins == nil || len(plugins) > 50 {
+		t.Errorf("config: plugins: %v (%d)", err, len(plugins))
+	}
+	for _, p := range plugins {
+		allowed(t, "config plugin", p, "name", "version", "source")
+		var name, source string
+		_ = json.Unmarshal(p["name"], &name)
+		_ = json.Unmarshal(p["source"], &source)
+		if !pluginNameRe.MatchString(name) || !pluginSources[source] {
+			t.Errorf("config: plugin %q source %q", name, source)
+		}
+		s.nullOrString(p["version"], 64, "plugin version")
+	}
+
+	var certs []map[string]json.RawMessage
+	if err := json.Unmarshal(body["certificates"], &certs); err != nil || certs == nil || len(certs) > 500 {
+		t.Errorf("config: certificates: %v (%d)", err, len(certs))
+	}
+	for _, c := range certs {
+		allowed(t, "config certificate", c, "certificateId", "names", "keyStore", "targets")
+		var id int
+		if json.Unmarshal(c["certificateId"], &id) != nil || id < 1 {
+			t.Errorf("config: certificateId %s", c["certificateId"])
+		}
+		var names []string
+		if err := json.Unmarshal(c["names"], &names); err != nil || names == nil || len(names) > 100 {
+			t.Errorf("config: names of %d: %v (%d)", id, err, len(names))
+		}
+		for _, n := range names {
+			if !printable(n, 253) {
+				t.Errorf("config: name %q", n)
+			}
+		}
+		var ks map[string]json.RawMessage
+		if err := json.Unmarshal(c["keyStore"], &ks); err != nil {
+			t.Errorf("config: keyStore of %d: %v", id, err)
+		}
+		allowed(t, "config key store", ks, "plugin", "keyType", "settings")
+		var ksPlugin string
+		if json.Unmarshal(ks["plugin"], &ksPlugin) != nil || !pluginNameRe.MatchString(ksPlugin) {
+			t.Errorf("config: keyStore.plugin %s", ks["plugin"])
+		}
+		s.nullOrString(ks["keyType"], 32, "keyType")
+		s.checkSettings(ks["settings"])
+
+		var targets []map[string]json.RawMessage
+		if err := json.Unmarshal(c["targets"], &targets); err != nil || targets == nil || len(targets) > 50 {
+			t.Errorf("config: targets of %d: %v (%d)", id, err, len(targets))
+		}
+		for _, tg := range targets {
+			allowed(t, "config target", tg, "label", "plugin", "implicit", "runsCommand", "verify", "settings")
+			var label, plugin string
+			var implicit, runs bool
+			_ = json.Unmarshal(tg["label"], &label)
+			_ = json.Unmarshal(tg["plugin"], &plugin)
+			if !labelRe.MatchString(label) || !pluginNameRe.MatchString(plugin) ||
+				json.Unmarshal(tg["implicit"], &implicit) != nil || json.Unmarshal(tg["runsCommand"], &runs) != nil {
+				t.Errorf("config: target %s", mustJSON(tg))
+			}
+			if v := tg["verify"]; string(v) != "null" {
+				var vf map[string]json.RawMessage
+				if err := json.Unmarshal(v, &vf); err != nil {
+					t.Errorf("config: verify %s", v)
+				}
+				allowed(t, "config verify", vf, "host", "port", "skipChainValidation")
+				s.nullOrString(vf["host"], 253, "verify.host")
+				if p := vf["port"]; string(p) != "null" {
+					var n int
+					if json.Unmarshal(p, &n) != nil || n < 1 || n > 65535 {
+						t.Errorf("config: verify.port %s", p)
+					}
+				}
+				var skip bool
+				if json.Unmarshal(vf["skipChainValidation"], &skip) != nil {
+					t.Errorf("config: verify.skipChainValidation %s", vf["skipChainValidation"])
+				}
+			}
+			s.checkSettings(tg["settings"])
+		}
+	}
+}
+
+func (s *Server) nullOrString(v json.RawMessage, max int, what string) {
+	if string(v) == "null" {
+		return
+	}
+	var str string
+	if json.Unmarshal(v, &str) != nil || !printable(str, max) {
+		s.t.Errorf("config: %s %s", what, v)
+	}
+}
+
+func (s *Server) checkSettings(v json.RawMessage) {
+	var m map[string]any
+	if err := json.Unmarshal(v, &m); err != nil || m == nil || len(m) > 10 {
+		s.t.Errorf("config: settings %s", v)
+	}
+	for k, val := range m {
+		if !settingKeyRe.MatchString(k) {
+			s.t.Errorf("config: setting key %q", k)
+		}
+		switch x := val.(type) {
+		case string:
+			if len(utf16.Encode([]rune(x))) > 256 || strings.ContainsFunc(x, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+				s.t.Errorf("config: setting %s = %q", k, x)
+			}
+		case bool:
+		case float64:
+			if math.IsInf(x, 0) || math.IsNaN(x) {
+				s.t.Errorf("config: setting %s = %v", k, x)
+			}
+		default:
+			s.t.Errorf("config: setting %s has type %T", k, val)
+		}
+	}
+}
+
+func printable(s string, max int) bool {
+	if len(s) > max {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func mustJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }

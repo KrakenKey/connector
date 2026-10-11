@@ -488,3 +488,144 @@ func TestRunReportsStatusWhenEnrolled(t *testing.T) {
 		t.Errorf("no warning\n%s", errOut.String())
 	}
 }
+
+// writeConfigWith writes a config with a Key Vault certificate whose plugin
+// is not installed, next to certificate 7, and extra lines in the
+// krakenkey block.
+func writeConfigWith(t *testing.T, krakenkey string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cfg := `
+krakenkey: {` + krakenkey + `}
+data_dir: ` + filepath.Join(dir, "data") + `
+plugins:
+  azure-keyvault: { path: /nonexistent/krakenkey-connector-plugin-azure-keyvault }
+certificates:
+  - id: 7
+    names: [api.example.com]
+    targets:
+      - { label: hook, plugin: exec, command: [/bin/true, secret-arg], env: { TOKEN: secret-env } }
+  - id: 8
+    names: [www.example.com]
+    key_store: { plugin: azure-keyvault, vault: kv-prod, certificate_name: www }
+    targets:
+      - label: web
+        plugin: file
+        dir: /etc/nginx/certs
+        files: { fullchain: site.pem, key: site.key }
+        owner: secret-owner
+        then: { exec: [/usr/sbin/nginx, -s, reload] }
+`
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestRunSharesConfigWhenEnrolled(t *testing.T) {
+	srv := fakekk.New(t)
+	enrollEnv(t, srv)
+	cfg := writeConfigWith(t, "")
+
+	// With a plain API key, nothing is shared.
+	srv.Fallback = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	t.Setenv("KK_API_KEY", "kk_plain_key_for_test")
+	var out, errOut bytes.Buffer
+	_ = run([]string{"run", "--once", "--config", cfg}, &out, &errOut)
+	for _, r := range srv.Requests() {
+		if strings.Contains(r, "/connectors/config") {
+			t.Errorf("API key mode sent %s", r)
+		}
+	}
+
+	srv.Fallback = certsNeedConnectorKey(srv)
+	t.Setenv("KK_API_KEY", "")
+	enrollOK(t, srv, cfg)
+	errOut.Reset()
+	if code := run([]string{"run", "--once", "--log-level", "debug", "--config", cfg}, &out, &errOut); code != exitFailed {
+		t.Fatalf("exit %d\n%s", code, errOut.String())
+	}
+	sums := srv.ConfigSummaries()
+	if len(sums) != 1 || !strings.Contains(errOut.String(), "config summary sent") {
+		t.Fatalf("%d summaries\n%s", len(sums), errOut.String())
+	}
+	if strings.Contains(string(sums[0]), "secret") {
+		t.Errorf("summary leaks settings: %s", sums[0])
+	}
+	var sum struct {
+		Version              string
+		CheckIntervalSeconds int
+		Plugins              []struct {
+			Name, Source string
+			Version      *string
+		}
+		Certificates []struct {
+			CertificateID int
+			KeyStore      struct {
+				Plugin   string
+				Settings map[string]any
+			}
+			Targets []struct {
+				Label, Plugin string
+				RunsCommand   bool
+				Settings      map[string]any
+			}
+		}
+	}
+	_ = json.Unmarshal(sums[0], &sum)
+	if sum.Version != "dev" || sum.CheckIntervalSeconds != 6*3600 || len(sum.Plugins) != 4 || len(sum.Certificates) != 2 {
+		t.Fatalf("summary %s", sums[0])
+	}
+	if p := sum.Plugins[0]; p.Name != "azure-keyvault" || p.Source != "path" || p.Version != nil {
+		t.Errorf("plugin %+v", p)
+	}
+	// Certificate 8's key store plugin does not start; its configured
+	// targets are summarized.
+	c8 := sum.Certificates[1]
+	if c8.CertificateID != 8 || c8.KeyStore.Settings["vault"] != "kv-prod" || len(c8.Targets) != 1 ||
+		!c8.Targets[0].RunsCommand || c8.Targets[0].Settings["fullchain"] != "site.pem" || len(c8.Targets[0].Settings) != 3 {
+		t.Errorf("certificate 8 %s", sums[0])
+	}
+
+	// An older KrakenKey without the route: no warning, same exit code.
+	srv.ConfigStatus = http.StatusNotFound
+	errOut.Reset()
+	if code := run([]string{"run", "--once", "--log-level", "debug", "--config", cfg}, &out, &errOut); code != exitFailed {
+		t.Errorf("exit %d\n%s", code, errOut.String())
+	}
+	if strings.Contains(errOut.String(), "could not send the config summary") || !strings.Contains(errOut.String(), "does not store config summaries") {
+		t.Errorf("missing route\n%s", errOut.String())
+	}
+
+	// Other failures are warnings and leave the exit code alone.
+	srv.ConfigStatus = http.StatusInternalServerError
+	errOut.Reset()
+	if code := run([]string{"run", "--once", "--config", cfg}, &out, &errOut); code != exitFailed {
+		t.Errorf("exit %d\n%s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "could not send the config summary") {
+		t.Errorf("no warning\n%s", errOut.String())
+	}
+}
+
+func TestRunWithShareConfigOff(t *testing.T) {
+	srv := fakekk.New(t)
+	srv.Fallback = certsNeedConnectorKey(srv)
+	enrollEnv(t, srv)
+	cfg := writeConfigWith(t, "share_config: false")
+	enrollOK(t, srv, cfg)
+	var out, errOut bytes.Buffer
+	if code := run([]string{"run", "--once", "--config", cfg}, &out, &errOut); code != exitFailed {
+		t.Fatalf("exit %d\n%s", code, errOut.String())
+	}
+	if calls := srv.ConfigCalls(); len(calls) != 1 || calls[0] != http.MethodDelete || len(srv.ConfigSummaries()) != 0 {
+		t.Errorf("calls %v", calls)
+	}
+	// A failed delete is not even a warning.
+	srv.ConfigStatus = http.StatusInternalServerError
+	errOut.Reset()
+	if code := run([]string{"run", "--once", "--config", cfg}, &out, &errOut); code != exitFailed || strings.Contains(errOut.String(), "config summary") {
+		t.Errorf("exit %d\n%s", code, errOut.String())
+	}
+}

@@ -304,6 +304,7 @@ func cmdRun(args []string, stderr io.Writer) int {
 			API: client, State: state, Config: cfg, Log: log,
 			Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH,
 		}
+		c.ConfigSharer = &connector.ConfigSharer{API: client, Config: cfg, Plugins: host, Log: log, Version: version}
 	}
 
 	installID, err := identity.InstallID(cfg.DataDir, ident)

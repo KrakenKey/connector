@@ -62,6 +62,14 @@ plugins, places such as key vaults and cloud load balancers.
   as the same user (plugins and deployment commands included) cannot read
   its environment or memory through `/proc`. Root still can. Keys, tokens
   and the identity key are never logged.
+- An enrolled connector sends KrakenKey a read-only summary of its config
+  for the dashboard: certificate ids and names, key store and target
+  plugins and labels, plugin versions, `verify` hosts and ports, and a short
+  allowlist of settings such as directories, file names and vault names.
+  Commands, environment variables, file owners and modes, tags, cloud
+  account ids, ARNs and plugin paths are never sent, and KrakenKey cannot
+  change the config. Set `krakenkey.share_config: false` to turn it off.
+  See [Config summary](#config-summary).
 - Plugins and deployment commands run with the connector's permissions. Only
   install plugins you trust. Plugins you install under the data directory
   must have their `sha256` pinned in the config; the plugins in the
@@ -590,11 +598,63 @@ the connector to back off, no report is sent.
 
 Connectors that use an API key instead of enrollment do not report.
 
+### Config summary
+
+After a pass, an enrolled connector also sends KrakenKey a summary of its
+config, so the dashboard can show what the connector is set up to do. It
+is read-only: nothing in KrakenKey can change the config, which lives on
+the host. The summary lists:
+
+- the connector's version and `check_interval`;
+- the plugins: each declared plugin and each built-in one in use, with its
+  version and where it comes from (`bundled` for the system plugin
+  directory, `data_dir`, `path` or `builtin`);
+- every certificate in the config, in config order: its id and names, its
+  key store plugin and key type, and its targets with label, plugin,
+  whether the key store added the target by itself (see
+  [Implicit targets](#implicit-targets)), whether a command runs after
+  deployment (`then`, or an `exec` target), and the `verify` host, port and
+  `skip_chain_validation`.
+
+Settings are sent only from this allowlist, and only when they are set:
+
+| Plugin | Settings sent |
+|--------|---------------|
+| `azure-keyvault` | `vault`, `certificate_name`, `exportable`, `reuse_key`, `adopt` |
+| `azure-appgateway` | `resource_group`, `gateway`, `ssl_certificate`, `replace_uploaded_certificate` |
+| `aws-acm` | `region` |
+| `file` | `dir`, and the file names under `files` (`cert`, `chain`, `fullchain`, `key`) |
+| `exec`, `local`, any other plugin | none |
+
+Never sent: `exec` commands and their environment, `then.exec`, file
+`owner` and `mode`, Key Vault `tags`, the Application Gateway
+`subscription_id`, the ACM `certificate_arn`, `verify.address` and
+`verify.ca_file`, plugin paths and checksums, `data_dir`, `plugin_dir`,
+`audit_log`, `api_url`, and anything from the environment. The allowlist
+goes by the plugin's name in the config, so a plugin declared under another
+name sends no settings.
+
+Implicit targets appear once a pass has resolved them; until a
+certificate's first pass, its configured targets are listed. The summary is
+sent when it changed since the last one this process sent, and at least
+once a day. Like the status report, it is skipped when the pass stopped
+because KrakenKey refused the credentials or asked the connector to back
+off, a failure to send it is logged as a warning, and it never changes the
+outcome of a pass. A summary over KrakenKey's limits (such as 500
+certificates, or 50 targets per certificate) is cut, marked as truncated,
+and logged as a warning.
+
+To turn it off, set `krakenkey.share_config: false`. The connector then
+asks KrakenKey to delete any summary it stored before, once each time it
+starts, and sends none. Connectors that use an API key instead of
+enrollment never send a summary.
+
 ## Configuration
 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `krakenkey.api_url` | `https://api.krakenkey.io` | API base URL. `KK_API_URL` overrides it. |
+| `krakenkey.share_config` | `true` | Send KrakenKey a read-only summary of this config for the dashboard (enrolled connectors only). See [Config summary](#config-summary). |
 | `check_interval` | `6h` | Time between passes in `run` mode (minimum `1m`). |
 | `data_dir` | `/var/lib/krakenkey-connector` | Keys, identity, state and plugin binaries. Must be owned by the connector's user, mode `0700`. |
 | `plugin_dir` | `/usr/lib/krakenkey-connector/plugins` | System plugin directory, read-only and owned by root, with a `plugins.lock`. `KK_PLUGIN_DIR` overrides it. See [External plugins](#external-plugins). |
