@@ -8,6 +8,18 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+## [v0.3.0] - 2026-10-11
+
+A read-only summary of the config for the KrakenKey dashboard.
+
+### Upgrading from v0.2.0
+
+- Enrolled connectors now share a read-only summary of their config with
+  KrakenKey after passes (see "Added"). Nothing changes on the host. To keep
+  the config to yourself, set `krakenkey.share_config: false` before
+  upgrading; with it off, the connector also deletes any summary sent
+  before. Connectors that use an API key instead of enrollment send nothing.
+
 ### Added
 
 - An enrolled connector sends KrakenKey a read-only summary of its config
@@ -271,6 +283,7 @@ together under one version.
   The README lists the cloud SDK variables that decide where plugins send
   keys and tokens.
 
-[Unreleased]: https://github.com/KrakenKey/connector/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/KrakenKey/connector/compare/v0.3.0...HEAD
+[v0.3.0]: https://github.com/KrakenKey/connector/compare/v0.2.0...v0.3.0
 [v0.2.0]: https://github.com/KrakenKey/connector/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/KrakenKey/connector/releases/tag/v0.1.0
