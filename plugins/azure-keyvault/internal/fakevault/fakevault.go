@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,9 @@ const (
 	OpGetCert       = "getCert"
 	OpGetSecret     = "getSecret"
 	OpGetDeleted    = "getDeleted"
+	OpImport        = "import"
+	OpListVersions  = "listVersions"
+	OpUpdate        = "update"
 )
 
 // Token is the only bearer token the fake accepts.
@@ -74,7 +78,35 @@ type Server struct {
 	base string
 	// deleted holds soft-deleted certificates.
 	deleted map[string]*certificate
+	// clock stamps new versions; each gets a creation time clockStep
+	// after the one before.
+	clock     time.Time
+	clockStep time.Duration
+	// pageSize splits version lists into pages; 0 means one page.
+	pageSize int
+	// applyFailed makes the next call of an operation do its work but
+	// answer with this status, as if the answer was lost.
+	applyFailed map[string]int
+	imports     []ImportRecord
+	// ignoreMergeTags makes merges keep the tags of the create request and
+	// ignore the ones passed to the merge.
+	ignoreMergeTags bool
+	// stripOnMerge lists tags merges drop from the new version.
+	stripOnMerge []string
 }
+
+// StripTagsOnMerge makes merges drop these tags from the new version,
+// whatever the create and merge requests said.
+func (s *Server) StripTagsOnMerge(keys ...string) {
+	s.mu.Lock()
+	s.stripOnMerge = append(s.stripOnMerge, keys...)
+	s.mu.Unlock()
+}
+
+// IgnoreMergeTags makes merges ignore the tags passed to them, keeping
+// those of the create request. By default, tags passed to a merge replace
+// them, as Key Vault does when it applies them.
+func (s *Server) IgnoreMergeTags() { s.mu.Lock(); s.ignoreMergeTags = true; s.mu.Unlock() }
 
 type certificate struct {
 	policy   *azcertificates.CertificatePolicy
@@ -84,6 +116,7 @@ type certificate struct {
 
 type version struct {
 	id          string
+	created     time.Time
 	tags        map[string]*string
 	disabled    bool
 	key         crypto.Signer
@@ -107,7 +140,8 @@ type pendingOp struct {
 // 127.0.0.1 and localhost). resource is the challenge resource; empty
 // means the server's own URL.
 func New(hosts []string, resource string) (*Server, error) {
-	s := &Server{certs: map[string]*certificate{}, deleted: map[string]*certificate{}, deny: map[string]bool{}, fail: map[string][]failure{}}
+	s := &Server{certs: map[string]*certificate{}, deleted: map[string]*certificate{}, deny: map[string]bool{}, fail: map[string][]failure{},
+		clock: time.Unix(1_700_000_000, 0).UTC(), clockStep: time.Minute, applyFailed: map[string]int{}}
 	tlsCfg, caPEM, err := serverTLS(append([]string{"127.0.0.1", "localhost"}, hosts...))
 	if err != nil {
 		return nil, err
@@ -185,9 +219,67 @@ func (s *Server) AddVersion(name string, tags map[string]string) error {
 		c = &certificate{policy: &azcertificates.CertificatePolicy{IssuerParameters: &azcertificates.IssuerParameters{Name: &self}}}
 		s.certs[name] = c
 	}
-	c.versions = append(c.versions, &version{id: randomHex(16), key: key, certs: [][]byte{der}, exportable: true,
+	c.versions = append(c.versions, &version{id: randomHex(16), created: s.tick(), key: key, certs: [][]byte{der}, exportable: true,
 		contentType: "application/x-pkcs12", tags: t})
 	return nil
+}
+
+// tick returns the creation time for a new version. s.mu is held.
+func (s *Server) tick() time.Time {
+	s.clock = s.clock.Add(s.clockStep)
+	return s.clock
+}
+
+// SetClockStep sets the time between the creation times of new versions
+// (default a minute). Key Vault keeps them to the second, so 0 stands for
+// versions created in the same second.
+func (s *Server) SetClockStep(d time.Duration) { s.mu.Lock(); s.clockStep = d; s.mu.Unlock() }
+
+// SetPageSize makes version lists come in pages of n entries.
+func (s *Server) SetPageSize(n int) { s.mu.Lock(); s.pageSize = n; s.mu.Unlock() }
+
+// ApplyThenFail makes the next call of op take effect but answer with
+// status, as if the answer was lost on the way back.
+func (s *Server) ApplyThenFail(op string, status int) {
+	s.mu.Lock()
+	s.applyFailed[op] = status
+	s.mu.Unlock()
+}
+
+// Serial returns the serial number (lowercase hex) of a version's
+// certificate ("" for the latest), or "".
+func (s *Server) Serial(name, id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.certs[name].find(id)
+	if v == nil {
+		return ""
+	}
+	c, err := x509.ParseCertificate(v.certs[0])
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", c.SerialNumber)
+}
+
+// Exportable reports whether a version ("" for the latest) has an
+// exportable key.
+func (s *Server) Exportable(name, id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.certs[name].find(id)
+	return v != nil && v.exportable
+}
+
+// Chain returns the number of certificates stored with a version ("" for
+// the latest).
+func (s *Server) Chain(name, id string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if v := s.certs[name].find(id); v != nil {
+		return len(v.certs)
+	}
+	return 0
 }
 
 // SoftDelete moves a certificate to the deleted state: it is no longer
@@ -397,6 +489,25 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.operation(name, p, true))
 	case OpMerge:
 		s.merge(w, name, c, body)
+	case OpImport:
+		s.importCert(w, r, name, c, body)
+	case OpUpdate:
+		v := c.find(segment(parts, 2))
+		if v == nil || segment(parts, 2) == "" {
+			kvError(w, http.StatusNotFound, "CertificateNotFound", "A certificate with (name/id) "+name+" was not found in this key vault.")
+			return
+		}
+		var params azcertificates.UpdateCertificateParameters
+		if err := json.Unmarshal(body, &params); err != nil {
+			kvError(w, http.StatusBadRequest, "BadParameter", "invalid update request")
+			return
+		}
+		if params.Tags != nil {
+			v.tags = params.Tags
+		}
+		writeJSON(w, http.StatusOK, s.certJSON(name, c, v))
+	case OpListVersions:
+		s.listVersions(w, r, name, c)
 	case OpGetDeleted:
 		if s.deleted[name] == nil {
 			kvError(w, http.StatusNotFound, "CertificateNotFound", "Deleted Certificate not found: "+name)
@@ -460,6 +571,12 @@ func route(method string, p []string) (op, name string) {
 		return OpMerge, name
 	case p[0] == "certificates" && len(p) == 3 && p[2] == "policy" && method == http.MethodGet:
 		return OpGetPolicy, name
+	case p[0] == "certificates" && len(p) == 3 && p[2] == "import" && method == http.MethodPost:
+		return OpImport, name
+	case p[0] == "certificates" && len(p) == 3 && p[2] == "versions" && method == http.MethodGet:
+		return OpListVersions, name
+	case p[0] == "certificates" && len(p) == 3 && method == http.MethodPatch:
+		return OpUpdate, name
 	case p[0] == "certificates" && method == http.MethodGet:
 		return OpGetCert, name
 	case p[0] == "secrets" && method == http.MethodGet:
@@ -597,9 +714,18 @@ func (s *Server) merge(w http.ResponseWriter, name string, c *certificate, body 
 		kvError(w, http.StatusBadRequest, "BadParameter", "Public key from x509 certificate and key of this instance doesn't match")
 		return
 	}
-	v := &version{id: randomHex(16), key: c.pending.key, certs: params.X509Certificates, exportable: true, contentType: "application/x-pkcs12", tags: c.pending.tags}
-	if params.Tags != nil {
+	v := &version{id: randomHex(16), created: s.tick(), key: c.pending.key, certs: params.X509Certificates, exportable: true, contentType: "application/x-pkcs12", tags: c.pending.tags}
+	if params.Tags != nil && !s.ignoreMergeTags {
 		v.tags = params.Tags
+	}
+	if len(s.stripOnMerge) > 0 {
+		kept := map[string]*string{}
+		for k, val := range v.tags {
+			if !slices.Contains(s.stripOnMerge, k) {
+				kept[k] = val
+			}
+		}
+		v.tags = kept
 	}
 	if kp := c.pending.policy.KeyProperties; kp != nil && kp.Exportable != nil {
 		v.exportable = *kp.Exportable
@@ -631,14 +757,144 @@ func (s *Server) certJSON(name string, c *certificate, v *version) azcertificate
 	id := azcertificates.ID(s.base + "/certificates/" + name + "/" + v.id)
 	kid := azcertificates.ID(s.base + "/keys/" + name + "/" + v.id)
 	sid := azcertificates.ID(s.base + "/secrets/" + name + "/" + v.id)
-	enabled := true
+	enabled := !v.disabled
+	created := v.created
 	return azcertificates.Certificate{
 		ID: &id, KID: &kid, SID: &sid,
 		CER:        v.certs[0],
 		Tags:       v.tags,
 		Policy:     c.policy,
-		Attributes: &azcertificates.CertificateAttributes{Enabled: &enabled},
+		Attributes: &azcertificates.CertificateAttributes{Enabled: &enabled, Created: &created, Updated: &created},
 	}
+}
+
+// importCert adds a version from a PKCS#12 or PEM bundle that holds the
+// private key, as Key Vault's import does.
+func (s *Server) importCert(w http.ResponseWriter, r *http.Request, name string, c *certificate, body []byte) {
+	var params azcertificates.ImportCertificateParameters
+	if err := json.Unmarshal(body, &params); err != nil || params.Base64EncodedCertificate == nil {
+		kvError(w, http.StatusBadRequest, "BadParameter", "value is required")
+		return
+	}
+	if s.deleted[name] != nil {
+		kvErrorInner(w, http.StatusConflict, "Conflict", "Certificate "+name+" is currently in a deleted but recoverable state.", "ObjectIsDeletedButRecoverable")
+		return
+	}
+	if c != nil && c.pending != nil {
+		kvError(w, http.StatusConflict, "Conflict", "There is a pending operation on certificate "+name)
+		return
+	}
+	contentType := "application/x-pkcs12"
+	if pol := params.CertificatePolicy; pol != nil && pol.SecretProperties != nil && pol.SecretProperties.ContentType != nil {
+		contentType = *pol.SecretProperties.ContentType
+	}
+	password := ""
+	if params.Password != nil {
+		password = *params.Password
+	}
+	var key crypto.Signer
+	var certs [][]byte
+	switch contentType {
+	case "application/x-pkcs12":
+		pfx, err := base64.StdEncoding.DecodeString(*params.Base64EncodedCertificate)
+		if err != nil {
+			kvError(w, http.StatusBadRequest, "BadParameter", "value is not base64")
+			return
+		}
+		k, leaf, chain, err := pkcs12.DecodeChain(pfx, password)
+		if err != nil {
+			kvError(w, http.StatusBadRequest, "BadParameter", "The specified PEM X.509 certificate content is in an unexpected format.")
+			return
+		}
+		signer, ok := k.(crypto.Signer)
+		if !ok {
+			kvError(w, http.StatusBadRequest, "BadParameter", "Private key is required")
+			return
+		}
+		key = signer
+		certs = append(certs, leaf.Raw)
+		for _, ch := range chain {
+			certs = append(certs, ch.Raw)
+		}
+	default:
+		kvError(w, http.StatusBadRequest, "BadParameter", "unsupported content type "+contentType)
+		return
+	}
+	leaf, _ := x509.ParseCertificate(certs[0])
+	spki, _ := x509.MarshalPKIXPublicKey(key.Public())
+	if string(spki) != string(leaf.RawSubjectPublicKeyInfo) {
+		kvError(w, http.StatusBadRequest, "BadParameter", "Private key does not match the certificate")
+		return
+	}
+	if c == nil {
+		c = &certificate{}
+		s.certs[name] = c
+	}
+	v := &version{id: randomHex(16), created: s.tick(), key: key, certs: certs, exportable: true, contentType: contentType, tags: params.Tags}
+	if pol := params.CertificatePolicy; pol != nil {
+		if kp := pol.KeyProperties; kp != nil && kp.Exportable != nil {
+			v.exportable = *kp.Exportable
+		}
+		merged := *pol
+		if merged.IssuerParameters == nil {
+			unknown := "Unknown"
+			merged.IssuerParameters = &azcertificates.IssuerParameters{Name: &unknown}
+		}
+		c.policy = &merged
+	} else if c.policy == nil {
+		unknown := "Unknown"
+		c.policy = &azcertificates.CertificatePolicy{IssuerParameters: &azcertificates.IssuerParameters{Name: &unknown}}
+	}
+	c.versions = append(c.versions, v)
+	s.imports = append(s.imports, ImportRecord{Name: name, Tags: params.Tags, Policy: params.CertificatePolicy, Password: password})
+	if st, ok := s.applyFailed[OpImport]; ok {
+		delete(s.applyFailed, OpImport)
+		kvError(w, st, http.StatusText(st), "injected failure after the import")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.certJSON(name, c, v))
+}
+
+// ImportRecord is one import the fake served.
+type ImportRecord struct {
+	Name     string
+	Tags     map[string]*string
+	Policy   *azcertificates.CertificatePolicy
+	Password string
+}
+
+// Imports returns the imports served so far.
+func (s *Server) Imports() []ImportRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ImportRecord(nil), s.imports...)
+}
+
+// listVersions lists a certificate's versions, in pages when a page size
+// is set. The next link carries the offset.
+func (s *Server) listVersions(w http.ResponseWriter, r *http.Request, name string, c *certificate) {
+	if c == nil || len(c.versions) == 0 {
+		kvError(w, http.StatusNotFound, "CertificateNotFound", "A certificate with (name/id) "+name+" was not found in this key vault.")
+		return
+	}
+	start := 0
+	if v := r.URL.Query().Get("$skiptoken"); v != "" {
+		_, _ = fmt.Sscanf(v, "%d", &start)
+	}
+	end := len(c.versions)
+	if s.pageSize > 0 && start+s.pageSize < end {
+		end = start + s.pageSize
+	}
+	var page azcertificates.CertificatePropertiesListResult
+	for _, v := range c.versions[start:end] {
+		cj := s.certJSON(name, c, v)
+		page.Value = append(page.Value, &azcertificates.CertificateProperties{ID: cj.ID, Attributes: cj.Attributes, Tags: cj.Tags})
+	}
+	if end < len(c.versions) {
+		next := fmt.Sprintf("%s/certificates/%s/versions?api-version=%s&$skiptoken=%d", s.base, name, r.URL.Query().Get("api-version"), end)
+		page.NextLink = &next
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 // secretValue renders a version's secret the way Key Vault does: base64

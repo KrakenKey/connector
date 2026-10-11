@@ -9,7 +9,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets v1.5.0
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-plugin v1.8.0
-	github.com/krakenkey/connector v0.1.0
+	github.com/krakenkey/connector v0.1.1-0.20261011124458-10bee28439ec
 	software.sslmate.com/src/go-pkcs12 v0.7.3
 )
 

@@ -16,7 +16,7 @@ import (
 // A key created by CreateCSR and not yet completed is a pending request on
 // the certificate:
 //
-//	https://<vault>/certificates/<name>/pending?certificate_id=<id>&spki_sha256=<hex>
+//	https://<vault>/certificates/<name>/pending?certificate_id=<id>&spki_sha256=<hex>[&previous_version=<version>]
 //
 // Key Vault keeps at most one pending request per certificate, so the
 // SHA-256 of the CSR's SubjectPublicKeyInfo tells this key's request apart
@@ -37,6 +37,11 @@ type keyRef struct {
 	version  string // empty for a pending request
 	spki     string // pending only: hex SHA-256 of the SubjectPublicKeyInfo
 	certID   string // pending only: KrakenKey certificate id
+	// prev is, for a pending request, the version that was the latest when
+	// the request was created, which Complete names in the merged
+	// version's tagPreviousVersion. Empty when there was none, and in
+	// references made before it was recorded.
+	prev string
 }
 
 const pendingSegment = "pending"
@@ -52,7 +57,11 @@ func (r keyRef) pending() bool { return r.version == "" }
 func (r keyRef) String() string {
 	base := r.vaultURL + "/certificates/" + r.name + "/"
 	if r.pending() {
-		return base + pendingSegment + "?certificate_id=" + r.certID + "&spki_sha256=" + r.spki
+		ref := base + pendingSegment + "?certificate_id=" + r.certID + "&spki_sha256=" + r.spki
+		if r.prev != "" {
+			ref += "&previous_version=" + r.prev
+		}
+		return ref
 	}
 	return base + r.version
 }
@@ -77,8 +86,12 @@ func parseRef(s string) (keyRef, error) {
 	r := keyRef{vaultURL: "https://" + normHost(u), name: parts[1]}
 	if parts[2] == pendingSegment {
 		q := u.Query()
-		r.spki, r.certID = q.Get("spki_sha256"), q.Get("certificate_id")
-		if !spkiRE.MatchString(r.spki) || !certIDRE.MatchString(r.certID) || len(q) != 2 {
+		r.spki, r.certID, r.prev = q.Get("spki_sha256"), q.Get("certificate_id"), q.Get("previous_version")
+		want := 2
+		if q.Has("previous_version") {
+			want = 3
+		}
+		if !spkiRE.MatchString(r.spki) || !certIDRE.MatchString(r.certID) || len(q) != want || (want == 3 && !versionRE.MatchString(r.prev)) {
 			return bad("pending reference without a valid certificate_id and spki_sha256")
 		}
 		return r, nil
@@ -116,4 +129,33 @@ func refFromID(id string) (keyRef, error) {
 func spkiHash(spki []byte) string {
 	sum := sha256.Sum256(spki)
 	return hex.EncodeToString(sum[:])
+}
+
+// secretRef is a versioned secret id, as Export returns for vault_ref:
+// https://<vault>/secrets/<name>/<version>.
+type secretRef struct {
+	vaultURL string
+	name     string
+	version  string
+}
+
+func (r secretRef) String() string { return r.vaultURL + "/secrets/" + r.name + "/" + r.version }
+
+func parseSecretRef(s string) (secretRef, error) {
+	bad := fmt.Errorf("%w: key reference %q is not a Key Vault secret id (https://<vault>/secrets/<name>/<version>)", plugin.ErrPermanent, s)
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" {
+		return secretRef{}, bad
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "secrets" || !objectNameRE.MatchString(parts[1]) || !versionRE.MatchString(parts[2]) {
+		return secretRef{}, bad
+	}
+	return secretRef{vaultURL: "https://" + normHost(u), name: parts[1], version: parts[2]}, nil
+}
+
+// deploymentID says where a certificate lives: the vault URL and the
+// certificate name, which Key Vault compares without regard to case.
+func deploymentID(vaultURL, name string) string {
+	return vaultURL + "/certificates/" + strings.ToLower(name)
 }

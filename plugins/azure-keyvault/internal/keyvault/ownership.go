@@ -12,6 +12,12 @@ import (
 // worked on, unless the config says adopt: true.
 const tagCertificateID = "krakenkey-connector-certificate-id"
 
+// tagPreviousVersion names, on a version the connector creates, the version
+// that was the latest before it, so a rollback knows what consumers used
+// before without relying on creation times (Key Vault keeps them to the
+// second).
+const tagPreviousVersion = "krakenkey-connector-previous-version"
+
 type ownerState int
 
 const (
@@ -34,9 +40,26 @@ type ownership struct {
 	otherID string
 }
 
-// checkOwner reads the tag of the latest version of a certificate.
+// checkOwner reads the tag of the latest version of a certificate. For a
+// certificate without versions it also looks for a pending request, which
+// the key store may delete.
 func checkOwner(ctx context.Context, c *vaultClients, name, certID string) (ownership, error) {
+	return readOwner(ctx, c, name, certID, true)
+}
+
+// checkVersionOwner is checkOwner without the pending request, for the
+// target, which only imports versions: Key Vault refuses an import while a
+// request is pending, and reading pending requests needs more permissions
+// than an import (in vaults that use access policies, certificate Create).
+func checkVersionOwner(ctx context.Context, c *vaultClients, name, certID string) (ownership, error) {
+	return readOwner(ctx, c, name, certID, false)
+}
+
+func readOwner(ctx context.Context, c *vaultClients, name, certID string, pending bool) (ownership, error) {
 	resp, err := c.certs.GetCertificate(ctx, name, "", nil)
+	if isNotFound(err) && !pending {
+		return ownership{state: ownerAbsent}, nil
+	}
 	if isNotFound(err) {
 		op, err := c.certs.GetCertificateOperation(ctx, name, nil)
 		if isNotFound(err) {

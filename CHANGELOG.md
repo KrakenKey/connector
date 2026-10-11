@@ -49,8 +49,35 @@ protocol and the KrakenKey API the connector uses.
   `plugin.KeyStoreDeploymentRollbackUnavailable`. Older plugins and
   connectors ignore the new fields and keep today's behavior.
 
+- `azure-keyvault` target: deploys certificates to Key Vault certificates
+  as new versions, for services that read them without a version (App
+  Service, Container Apps, API Management, Front Door, the AKS Secrets
+  Store CSI driver, the VM Key Vault extension). With the `azure-keyvault`
+  key store, the key store's own certificate is the implicit target
+  `azure-keyvault`: it finds the merged version in place and imports
+  nothing. Other vaults or certificate names get the certificate, chain and
+  key imported as PKCS#12, with the same ownership rules and `adopt` setting
+  as the key store, and optional `tags`. Rollback imports the previous
+  certificate and key again as the latest version, and is refused when the
+  key cannot be exported. Verification failures are reported as failed and
+  checked again on later passes, not rolled back, since services pick up
+  new versions on their own schedule. Versions the plugin creates (merged
+  by the key store or imported by the target) name the version they
+  replaced in the tag `krakenkey-connector-previous-version`, so a rollback
+  does not depend on creation times, which Key Vault keeps to the second.
+
 ### Changed
 
+- `azure-keyvault`: errors keep Key Vault's HTTP status and error codes but
+  no longer its message, which names the caller's application and object
+  ids and tenant; ids and token issuer URLs are also removed from
+  credential errors. A 403 names the permission Key Vault says is missing
+  when it says so. Reading a pending request is documented as needing
+  certificate permission Create in vaults that use access policies.
+- `azure-keyvault` key store: `validate` uses the capabilities for each
+  certificate's settings, so a certificate with `exportable: false` is
+  refused for targets that need the key (such as Application Gateway)
+  instead of failing at the first deployment.
 - A certificate whose key store is an external plugin may list no
   targets; the connector reports it as a problem when the key store adds no
   target by itself. Certificates with the built-in `local` key store still

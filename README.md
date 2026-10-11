@@ -866,7 +866,7 @@ its version: release `v0.1.0` ships version `0.1.0` of each.
 | Plugin | Kind | What it does |
 |--------|------|--------------|
 | [`aws-acm`](plugins/aws-acm/README.md) | target | Re-imports certificates into an existing AWS Certificate Manager certificate, keeping its ARN, so load balancers, CloudFront and API Gateway pick up the new certificate. |
-| [`azure-keyvault`](plugins/azure-keyvault/README.md) | key store | Keeps keys and certificates in Azure Key Vault: the vault creates the key and the CSR, and the key leaves it only for exportable certificates whose targets need PEM or PFX. |
+| [`azure-keyvault`](plugins/azure-keyvault/README.md) | key store and target | Keeps keys and certificates in Azure Key Vault: the vault creates the key and the CSR, and the key leaves it only for exportable certificates whose targets need it. Services that read the certificate without a version get each renewal through the implicit target. As a target, it imports certificates into other vaults or certificate names. |
 | [`azure-appgateway`](plugins/azure-appgateway/README.md) | target | Points an Azure Application Gateway v2 SSL certificate at a specific Key Vault secret version, and rolls back by restoring the previous version. |
 
 Each plugin's README covers its settings, credentials and the permissions it
