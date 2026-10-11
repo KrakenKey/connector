@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/acm v1.50.4
 	github.com/aws/smithy-go v1.28.5
 	github.com/hashicorp/go-plugin v1.8.0
-	github.com/krakenkey/connector v0.1.0
+	github.com/krakenkey/connector v0.2.0
 )
 
 require (
