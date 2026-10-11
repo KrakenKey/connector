@@ -160,6 +160,16 @@ jobs:
       - name: Check config
         run: goreleaser check
 
+      # The same commit with a lower version (0.0.1-SNAPSHOT-...), for the
+      # package upgrade check below. Only the binaries are compiled twice,
+      # and those mostly come from the build cache.
+      - name: Snapshot build of an older version
+        env:
+          GORELEASER_CURRENT_TAG: v0.0.1
+        run: |
+          goreleaser release --snapshot --clean --skip=publish,sign,docker
+          mv dist "$RUNNER_TEMP/dist-old"
+
       # Builds every archive (the connector and each plugin), the .deb and
       # .rpm packages, the Homebrew cask and both image architectures without
       # publishing or signing, so a broken release config shows up here, not
@@ -177,12 +187,14 @@ jobs:
 
       # The packages must install, carry the plugin binaries GoReleaser
       # built with a matching plugins.lock, let the service user start every
-      # plugin with `validate --offline`, and remove cleanly.
+      # plugin with `validate --offline`, and remove cleanly. Upgrading from
+      # the older build must keep plugins without a version working.
       - name: Check the amd64 packages
         run: |
           version=$(jq -r .version dist/metadata.json)
-          scripts/check-packages.sh debian:12 "dist/krakenkey-connector_${version}_linux_amd64.deb"
-          scripts/check-packages.sh rockylinux:9 "dist/krakenkey-connector_${version}_linux_amd64.rpm"
+          old="$RUNNER_TEMP/dist-old"
+          scripts/check-packages.sh debian:12 "dist/krakenkey-connector_${version}_linux_amd64.deb" linux/amd64 "$old"/krakenkey-connector_*_linux_amd64.deb
+          scripts/check-packages.sh rockylinux:9 "dist/krakenkey-connector_${version}_linux_amd64.rpm" linux/amd64 "$old"/krakenkey-connector_*_linux_amd64.rpm
 
       # The arm64 packages are checked on an arm64 runner: under QEMU the
       # connector cannot start plugins through /proc/self/fd.

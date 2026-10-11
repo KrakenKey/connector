@@ -278,6 +278,11 @@ nfpms:
       postinstall: packaging/scripts/postinstall.sh
       preremove: packaging/scripts/preremove.sh
       postremove: packaging/scripts/postremove.sh
+    rpm:
+      scripts:
+        # RPM runs postinstall before removing the old package's files, so
+        # the restart after an upgrade happens here.
+        posttrans: packaging/scripts/posttrans.sh
 
 # Homebrew cask in KrakenKey/homebrew-tap: the connector only. Plugins are
 # installed from their release archives (see the README), and Homebrew does

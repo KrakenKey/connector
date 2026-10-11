@@ -333,8 +333,9 @@ The `.deb` and `.rpm` packages set up the connector to run under systemd:
 To start it:
 
 1. Edit `/etc/krakenkey-connector/config.yaml` (`sudoedit` works). Declare
-   the plugins you use with the connector's version, as shown in
-   [In the container image and the Linux packages](#in-the-container-image-and-the-linux-packages).
+   the plugins you use without a version, as shown in
+   [In the container image and the Linux packages](#in-the-container-image-and-the-linux-packages),
+   so they keep working across package upgrades.
 2. Enroll the connector as the service user, so its identity in
    `/var/lib/krakenkey-connector` belongs to that user. The token file must
    be readable by the service user and not by others:
@@ -450,11 +451,17 @@ drop-in.
 
 ### Upgrades and removal
 
-The included plugins carry the connector's version, and the config names
-the version it uses. After an upgrade, change the plugin versions in
-`config.yaml` to the new version (`krakenkey-connector version`) and run
-`sudo systemctl restart krakenkey-connector`. The package restarts a running
-service on upgrade and prints a reminder when the config declares plugins.
+An upgrade replaces the included plugins with the new version and restarts
+a running service. Plugins declared without a version pick up the new ones
+on their own.
+
+If the config pins a plugin to a version the upgrade removed, the package
+does not restart the service, which keeps running with the plugins it
+already started, and prints the plugins to fix. Remove their `version`, or
+set it to the new one (`krakenkey-connector version`), then run
+`sudo systemctl restart krakenkey-connector`. Plugins you installed under
+the data directory with `version` and `sha256` are not affected by
+upgrades.
 
 Removing the package (`apt remove`, `dnf remove`) stops and disables the
 service, and keeps the config, the data directory and the

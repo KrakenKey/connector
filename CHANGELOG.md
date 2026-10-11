@@ -23,7 +23,10 @@ protocol and the KrakenKey API the connector uses.
   system plugin directory with their `plugins.lock` (the same binaries and
   layout as the container image), an example config, and a hardened
   systemd unit, `krakenkey-connector.service`, that runs as a dedicated
-  system user. The service is not enabled or started on install.
+  system user. The service is not enabled or started on install. An
+  upgrade restarts a running service, unless the config pins a plugin
+  version the upgrade removed: then it says which, and leaves the service
+  running.
 - A Homebrew cask, `krakenkey/tap/krakenkey-connector`, for macOS and Linux.
   It installs the connector only.
 

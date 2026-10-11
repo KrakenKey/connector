@@ -26,17 +26,18 @@ data_dir: /var/lib/krakenkey-connector
 
 # The package installs the included plugins (aws-acm, azure-keyvault and
 # azure-appgateway) in /usr/lib/krakenkey-connector/plugins, pinned by its
-# plugins.lock. Declare the ones you use with the connector's version, as
-# printed by `krakenkey-connector version` without the leading v. After a
-# package upgrade, change the versions here to the new one and restart the
-# service.
+# plugins.lock. Declare the ones you use without a version, and the
+# connector uses the installed one, also after package upgrades. To pin a
+# plugin instead, add `version:` with the connector's version (as printed
+# by `krakenkey-connector version`, without the leading v); then change it
+# after every package upgrade.
 # Cloud credentials for the plugins go in /etc/default/krakenkey-connector
 # (Debian, Ubuntu) or /etc/sysconfig/krakenkey-connector (RPM-based systems).
 #
 # plugins:
-#   azure-keyvault: { version: 0.1.0 }
-#   azure-appgateway: { version: 0.1.0, call_timeout: 15m }
-#   aws-acm: { version: 0.1.0 }
+#   azure-keyvault: {}
+#   azure-appgateway: { call_timeout: 15m }
+#   aws-acm: {}
 
 # The certificates to renew and deploy. At least one is required.
 #
