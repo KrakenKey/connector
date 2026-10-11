@@ -3,8 +3,10 @@
 #   - the connector runs and its version matches the plugin directories,
 #   - the system user, the data and config directories and the plugin files
 #     have the expected owners and modes,
-#   - plugins.lock matches the plugin binaries, and `validate --offline`,
-#     run as the service user, finds and starts every plugin through it,
+#   - plugins.lock matches the plugin binaries, those are the binaries
+#     GoReleaser built (when the package sits in GoReleaser's dist
+#     directory), and `validate --offline`, run as the service user, finds
+#     and starts every plugin through it,
 #   - the shipped config.yaml is refused until a certificate is added,
 #   - removing (and for .deb, purging) the package cleans up.
 #
@@ -25,7 +27,7 @@ dir=$(cd "$(dirname "$pkg")" && pwd)
 file=$(basename "$pkg")
 
 echo "== $file on $image ($platform)"
-docker run --rm -i --platform "$platform" -v "$dir/$file:/tmp/pkg/$file:ro" -e PKG="/tmp/pkg/$file" "$image" bash -s <<'EOF'
+docker run --rm -i --platform "$platform" -v "$dir:/dist:ro" -e PKG="/dist/$file" -e ARCH="${platform#linux/}" "$image" bash -s <<'EOF'
 set -euo pipefail
 fail() { echo "FAIL: $*" >&2; exit 1; }
 plugin_dir=/usr/lib/krakenkey-connector/plugins
@@ -97,6 +99,20 @@ echo "== plugins.lock"
 cat "$plugin_dir/plugins.lock"
 [ "$(grep -c . "$plugin_dir/plugins.lock")" -eq "${#plugins[@]}" ] || fail "plugins.lock should list ${#plugins[@]} plugins"
 (cd "$plugin_dir" && sha256sum -c plugins.lock) || fail "plugins.lock does not match the binaries"
+for p in "${plugins[@]}"; do
+  bin=krakenkey-connector-plugin-$p
+  built=
+  for f in /dist/plugin-"${p}"_linux_"${ARCH}"*/"$bin"; do
+    if [ -f "$f" ]; then built=$f; break; fi
+  done
+  if [ -z "$built" ]; then
+    echo "no GoReleaser build of $p for $ARCH next to the package; not compared"
+    continue
+  fi
+  [ "$(sha256sum <"$built")" = "$(sha256sum <"$plugin_dir/$p/$version/$bin")" ] ||
+    fail "$p differs from the GoReleaser build $built"
+  echo "$p: same binary as ${built#/dist/}"
+done
 
 echo "== the shipped config is refused until it has a certificate"
 if out=$(as_user krakenkey-connector validate --offline 2>&1); then
