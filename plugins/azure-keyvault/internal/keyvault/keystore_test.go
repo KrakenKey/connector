@@ -259,7 +259,9 @@ func TestWildcardNames(t *testing.T) {
 			t.Errorf("%q: err = %v, want ErrInvalid", names, err)
 		}
 	}
-	if calls := e.srv.Calls(); len(calls) != 4 {
+	// Only the first CreateCSR's calls: ownership, pending request, latest
+	// version, create.
+	if calls := e.srv.Calls(); len(calls) != 5 {
 		t.Errorf("rejected names reached Key Vault: %v", calls)
 	}
 }
@@ -814,5 +816,91 @@ func TestPEMSecret(t *testing.T) {
 	}
 	if _, err := keyMaterial(r, plugin.KeyFormatPFX, "application/x-pkcs12", "!!not base64 secret!!"); !errors.Is(err, plugin.ErrPermanent) || strings.Contains(err.Error(), "secret!!") {
 		t.Errorf("bad base64: %v", err)
+	}
+}
+
+// TestMergedVersionNamesPrevious: every version the key store merges names
+// the version that was the latest before it, however Key Vault treats the
+// tags of the create and merge requests.
+func TestMergedVersionNamesPrevious(t *testing.T) {
+	modes := map[string]func(*fakevault.Server){
+		"merge tags replace":        func(*fakevault.Server) {},
+		"merge tags ignored":        func(s *fakevault.Server) { s.IgnoreMergeTags() },
+		"tags dropped on merge":     func(s *fakevault.Server) { s.StripTagsOnMerge(tagPreviousVersion) },
+		"all tags dropped on merge": func(s *fakevault.Server) { s.StripTagsOnMerge(tagPreviousVersion, tagCertificateID) },
+	}
+	for name, mode := range modes {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			mode(e.srv)
+			cfg := e.config("")
+			e.issue(t, cfg)
+			if tags := e.srv.Tags("web", ""); tags[tagCertificateID] != "7" || tags[tagPreviousVersion] != "" {
+				t.Errorf("first version tags = %v", tags)
+			}
+			e.issue(t, cfg)
+			e.issue(t, cfg)
+			versions := e.srv.Versions("web")
+			for i := 1; i < len(versions); i++ {
+				tags := e.srv.Tags("web", versions[i])
+				if tags[tagCertificateID] != "7" || tags[tagPreviousVersion] != versions[i-1] {
+					t.Errorf("version %d tags = %v, want previous %s", i, tags, versions[i-1])
+				}
+			}
+		})
+	}
+
+	// Without permission to tag afterwards, the certificate still merges.
+	e := newEnv(t)
+	e.srv.StripTagsOnMerge(tagPreviousVersion)
+	e.srv.Deny(fakevault.OpUpdate)
+	cfg := e.config("")
+	e.issue(t, cfg)
+	e.issue(t, cfg)
+	if n := len(e.srv.Versions("web")); n != 2 || e.srv.Tags("web", "")[tagPreviousVersion] != "" {
+		t.Errorf("versions %d, tags %v", n, e.srv.Tags("web", ""))
+	}
+}
+
+func TestRenewedWithSameKeyNamesPrevious(t *testing.T) {
+	e := newEnv(t)
+	e.srv.StripTagsOnMerge(tagPreviousVersion)
+	cfg := e.config("")
+	ref, _, _, req := e.issue(t, cfg)
+	leafPEM, chainPEM, err := fakevault.SignPublicKey(req.PublicKey, "www.example.com", []string{"www.example.com", "example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.ks.Complete(e.ctx, plugin.CompleteRequest{Config: cfg, KeyRef: ref, CertPEM: leafPEM, ChainPEM: chainPEM}); err != nil {
+		t.Fatalf("Complete (same key): %v", err)
+	}
+	versions := e.srv.Versions("web")
+	if tags := e.srv.Tags("web", ""); len(versions) != 2 || tags[tagPreviousVersion] != versions[0] || tags[tagCertificateID] != "7" {
+		t.Errorf("renewed version tags = %v (versions %v)", tags, versions)
+	}
+}
+
+func TestPendingRefWithPreviousVersion(t *testing.T) {
+	e := newEnv(t)
+	cfg := e.config("")
+	e.issue(t, cfg)
+	csr, _ := e.csr(t, cfg, plugin.KeyTypeECDSAP256)
+	first := e.srv.Versions("web")[0]
+	if !strings.HasSuffix(csr.KeyRef, "&previous_version="+first) {
+		t.Errorf("pending ref = %s", csr.KeyRef)
+	}
+	r, err := parseRef(csr.KeyRef)
+	if err != nil || r.prev != first || r.String() != csr.KeyRef {
+		t.Errorf("parse = %+v, %v", r, err)
+	}
+	// References from before the previous version was recorded still parse.
+	old := strings.TrimSuffix(csr.KeyRef, "&previous_version="+first)
+	if r, err := parseRef(old); err != nil || r.prev != "" || r.String() != old {
+		t.Errorf("old ref = %+v, %v", r, err)
+	}
+	for _, bad := range []string{old + "&previous_version=", old + "&previous_version=a/b", old + "&other=1"} {
+		if _, err := parseRef(bad); err == nil {
+			t.Errorf("parseRef(%q) accepted", bad)
+		}
 	}
 }

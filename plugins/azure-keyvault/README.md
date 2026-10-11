@@ -25,7 +25,7 @@ Gateway, get a versioned secret id instead (`vault_ref`).
 | `Validate` | Checks the settings, then reads the certificate's policy and ownership tag. A missing certificate is fine (it is created on first issuance); a certificate the connector does not own, or a soft-deleted one, is reported; a 403 fails with the permission to grant. For exportable certificates it also checks that the identity may read secrets (see [Permissions](#permissions)). |
 | `CreateCSR` | Checks [ownership](#ownership), then creates a new version of `certificate_name` with issuer `Unknown`, subject `CN=<first name of 64 characters or fewer>`, every name as a DNS SAN, content type `application/x-pkcs12`, the key type, `exportable` and `reuse_key` settings, and the ownership tag. Returns the CSR of the pending request. |
 | `PublicKey` | Reads the key from the pending request's CSR, or from the certificate of a completed version. |
-| `Complete` | Merges the issued leaf and intermediates (x5c, leaf first) into the pending request, with the ownership tag. The result is a new certificate version. |
+| `Complete` | Merges the issued leaf and intermediates (x5c, leaf first) into the pending request, with the ownership tag and `krakenkey-connector-previous-version` (the version that was the latest when the request was created). The result is a new certificate version; if it lacks those tags, they are set on it. |
 | `Export` | `vault_ref`: the versioned secret id `https://<vault>.vault.azure.net/secrets/<name>/<version>`. `pem` and `pfx`: reads that secret (exportable certificates only). |
 | `Release` | Deletes a pending request that will not be completed. Completed versions are left alone. |
 
@@ -34,7 +34,9 @@ Gateway, get a versioned secret id instead (`vault_ref`).
 The connector stores an opaque key reference per key. This plugin uses:
 
 - Pending (after `CreateCSR`):
-  `https://<vault>/certificates/<name>/pending?certificate_id=<id>&spki_sha256=<hex>`.
+  `https://<vault>/certificates/<name>/pending?certificate_id=<id>&spki_sha256=<hex>&previous_version=<version>`
+  (`previous_version`, the version that was the latest when the request was
+  created, is left out when there was none).
   Key Vault allows one pending request per certificate; the SHA-256 of the
   CSR's public key tells this request apart from a later one.
   `certificate_id` is the KrakenKey certificate id, written into the ownership
@@ -546,9 +548,9 @@ apply to the whole vault.
 | Call | Key Vault operation | RBAC data action | Access policy |
 |---|---|---|---|
 | `Validate` | Get certificate policy, latest version and pending request; for exportable certificates, get a secret version that does not exist (a 404 or 403 tells whether secrets can be read, without reading one); for a missing certificate, check for a soft-deleted one (skipped without permission) | `certificates/read`, `secrets/getSecret/action` (optional) | certificates: Get (and Create, which Key Vault asks for to read a pending request), secrets: Get (optional) |
-| `CreateCSR` | Get latest version (ownership tag), get and delete pending request, create certificate | `certificates/read`, `certificates/update/action`, `certificates/create/action` | certificates: Get, Update, Create |
+| `CreateCSR` | Get latest version (ownership tag, and its id for the previous-version tag), get and delete pending request, create certificate | `certificates/read`, `certificates/update/action`, `certificates/create/action` | certificates: Get, Update, Create |
 | `PublicKey` | Get pending request or certificate | `certificates/read` | certificates: Get, Create (pending request) |
-| `Complete` | Get the latest version (to name it in the new version's `krakenkey-connector-previous-version` tag), merge certificate (renewal with the same key also reads the policy and creates a version) | `certificates/create/action`, `certificates/read` | certificates: Create, Get |
+| `Complete` | Merge certificate with the ownership and `krakenkey-connector-previous-version` tags, and set them on the merged version if it lacks them (renewal with the same key also reads the latest version and the policy and creates a version) | `certificates/create/action`, `certificates/read`, `certificates/update/action` | certificates: Create, Get, Update |
 | `Export` (`vault_ref`) | Get certificate | `certificates/read` | certificates: Get |
 | `Export` (`pem`, `pfx`) | Get secret | `secrets/getSecret/action` | secrets: Get |
 | `Release` | Get and delete pending request | `certificates/read`, `certificates/update/action` | certificates: Get, Create, Update |

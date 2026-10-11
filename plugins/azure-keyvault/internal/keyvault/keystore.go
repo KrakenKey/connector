@@ -264,10 +264,13 @@ func (k *KeyStore) CreateCSR(ctx context.Context, req plugin.CSRRequest) (plugin
 	if err := k.deleteStalePending(ctx, c, s.name); err != nil {
 		return plugin.CSR{}, err
 	}
+	// The version that is the latest now is what services use until this
+	// request is merged; record it for the merged version's tag.
+	prev := k.latestVersion(ctx, c, s.name)
 
 	kp.Exportable = &s.exportable
 	kp.ReuseKey = &s.reuseKey
-	op, err := k.create(ctx, c, s.name, newPolicy(req.Names, kp), tagsFor(req.CertificateID))
+	op, err := k.create(ctx, c, s.name, newPolicy(req.Names, kp), withPrevious(tagsFor(req.CertificateID), prev))
 	if err != nil {
 		return plugin.CSR{}, err
 	}
@@ -278,7 +281,7 @@ func (k *KeyStore) CreateCSR(ctx context.Context, req plugin.CSRRequest) (plugin
 	if err := csr.CheckSignature(); err != nil {
 		return plugin.CSR{}, fmt.Errorf("%w: Key Vault returned a CSR with a bad signature: %v", plugin.ErrPermanent, err)
 	}
-	ref := keyRef{vaultURL: s.vaultURL, name: s.name, spki: spkiHash(csr.RawSubjectPublicKeyInfo), certID: req.CertificateID}
+	ref := keyRef{vaultURL: s.vaultURL, name: s.name, spki: spkiHash(csr.RawSubjectPublicKeyInfo), certID: req.CertificateID, prev: prev}
 	return plugin.CSR{
 		PEM:    string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csr.Raw})),
 		KeyRef: ref.String(),
@@ -536,7 +539,7 @@ func (k *KeyStore) Complete(ctx context.Context, req plugin.CompleteRequest) (st
 			}
 			return "", fmt.Errorf("%w: no pending request of %q holds this key any more", plugin.ErrNotFound, r.name)
 		}
-		return k.merge(ctx, c, r.name, x5c, tagsFor(r.certID))
+		return k.merge(ctx, c, r.name, x5c, withPrevious(tagsFor(r.certID), r.prev))
 	}
 
 	// A completed version: the certificate was renewed with the same key.
@@ -593,6 +596,7 @@ func (k *KeyStore) renewSameKey(ctx context.Context, c *vaultClients, s settings
 	if err := pendingBlocks(ctx, c, r.name); err != nil {
 		return "", err
 	}
+	tags = withPrevious(tags, k.latestVersion(ctx, c, r.name))
 	op, err := k.create(ctx, c, r.name, newPol, tags)
 	if err != nil {
 		return "", err
@@ -627,28 +631,77 @@ func pendingBlocks(ctx context.Context, c *vaultClients, name string) error {
 		plugin.ErrPermanent, name)
 }
 
-// merge merges x5c into the pending request. The tags are set on the new
-// version so later calls can tell the connector created it.
+// merge merges x5c into the pending request, passing tags for the new
+// version: the ownership tag, so later calls can tell the connector created
+// it, and tagPreviousVersion, for the target's rollback.
 //
-// The new version also names the version that was the latest before it
-// (tagPreviousVersion), for the target's rollback. Without permission to
-// read it, or without an earlier version, the tag is left out.
+// The tags are passed both when the request is created and when it is
+// merged. If the merged version still lacks one of them (Key Vault does not
+// document which of the two it keeps), they are set on the version
+// afterwards. That needs certificates/update/action, which the key store
+// has; if it fails, the certificate stays merged and a warning is logged:
+// without the tag, the target falls back to creation times for this
+// version.
 func (k *KeyStore) merge(ctx context.Context, c *vaultClients, name string, x5c [][]byte, tags map[string]*string) (string, error) {
-	withPrev := make(map[string]*string, len(tags)+1)
-	for key, v := range tags {
-		if key != tagPreviousVersion {
-			withPrev[key] = v
-		}
-	}
-	if cur, err := c.certs.GetCertificate(ctx, name, "", nil); err == nil && cur.ID != nil {
-		v := cur.ID.Version()
-		withPrev[tagPreviousVersion] = &v
-	}
-	resp, err := c.certs.MergeCertificate(ctx, name, azcertificates.MergeCertificateParameters{X509Certificates: x5c, Tags: withPrev}, nil)
+	resp, err := c.certs.MergeCertificate(ctx, name, azcertificates.MergeCertificateParameters{X509Certificates: x5c, Tags: tags}, nil)
 	if err != nil {
 		return "", classify(opMerge, name, err)
 	}
-	return idRef(resp.Certificate)
+	ref, err := idRef(resp.Certificate)
+	if err != nil {
+		return "", err
+	}
+	if missing := missingTags(resp.Tags, tags); len(missing) > 0 {
+		all := make(map[string]*string, len(resp.Tags)+len(missing))
+		for key, v := range resp.Tags {
+			all[key] = v
+		}
+		for key, v := range missing {
+			all[key] = v
+		}
+		if _, err := c.certs.UpdateCertificate(ctx, name, resp.ID.Version(), azcertificates.UpdateCertificateParameters{Tags: all}, nil); err != nil {
+			k.opts.Logger.Warn("could not tag the merged certificate version; a rollback of this version falls back to creation times",
+				"certificate_name", name, "error", classify(opUpdateTags, name, err).Error())
+		}
+	}
+	return ref, nil
+}
+
+// missingTags returns the tags in want that got lacks or has with another
+// value.
+func missingTags(got, want map[string]*string) map[string]*string {
+	missing := map[string]*string{}
+	for key, v := range want {
+		if deref(got[key]) != deref(v) {
+			missing[key] = v
+		}
+	}
+	return missing
+}
+
+// latestVersion returns the id of the certificate's latest completed
+// version, or "" when there is none or it cannot be read.
+func (k *KeyStore) latestVersion(ctx context.Context, c *vaultClients, name string) string {
+	resp, err := c.certs.GetCertificate(ctx, name, "", nil)
+	if err != nil || resp.ID == nil || len(resp.CER) == 0 {
+		return ""
+	}
+	return resp.ID.Version()
+}
+
+// withPrevious returns tags with tagPreviousVersion set to prev, or
+// without it when prev is empty. It does not change tags.
+func withPrevious(tags map[string]*string, prev string) map[string]*string {
+	out := make(map[string]*string, len(tags)+1)
+	for key, v := range tags {
+		if key != tagPreviousVersion {
+			out[key] = v
+		}
+	}
+	if prev != "" {
+		out[tagPreviousVersion] = &prev
+	}
+	return out
 }
 
 func idRef(cert azcertificates.Certificate) (string, error) {

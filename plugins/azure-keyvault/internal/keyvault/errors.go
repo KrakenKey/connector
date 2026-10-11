@@ -42,6 +42,8 @@ var (
 		"Microsoft.KeyVault/vaults/certificates/update/action", "certificate permission Update"}
 	opGetSecret = operation{"read the certificate's secret (private key)",
 		"Microsoft.KeyVault/vaults/secrets/getSecret/action", "secret permission Get"}
+	opUpdateTags = operation{"tag the certificate version",
+		"Microsoft.KeyVault/vaults/certificates/update/action", "certificate permission Update"}
 	opImport = operation{"import a certificate version",
 		"Microsoft.KeyVault/vaults/certificates/import/action", "certificate permission Import"}
 	opListVersions = operation{"list the certificate's versions",

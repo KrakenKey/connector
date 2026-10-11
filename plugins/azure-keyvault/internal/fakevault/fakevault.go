@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +46,7 @@ const (
 	OpGetDeleted    = "getDeleted"
 	OpImport        = "import"
 	OpListVersions  = "listVersions"
+	OpUpdate        = "update"
 )
 
 // Token is the only bearer token the fake accepts.
@@ -86,7 +88,25 @@ type Server struct {
 	// answer with this status, as if the answer was lost.
 	applyFailed map[string]int
 	imports     []ImportRecord
+	// ignoreMergeTags makes merges keep the tags of the create request and
+	// ignore the ones passed to the merge.
+	ignoreMergeTags bool
+	// stripOnMerge lists tags merges drop from the new version.
+	stripOnMerge []string
 }
+
+// StripTagsOnMerge makes merges drop these tags from the new version,
+// whatever the create and merge requests said.
+func (s *Server) StripTagsOnMerge(keys ...string) {
+	s.mu.Lock()
+	s.stripOnMerge = append(s.stripOnMerge, keys...)
+	s.mu.Unlock()
+}
+
+// IgnoreMergeTags makes merges ignore the tags passed to them, keeping
+// those of the create request. By default, tags passed to a merge replace
+// them, as Key Vault does when it applies them.
+func (s *Server) IgnoreMergeTags() { s.mu.Lock(); s.ignoreMergeTags = true; s.mu.Unlock() }
 
 type certificate struct {
 	policy   *azcertificates.CertificatePolicy
@@ -471,6 +491,21 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.merge(w, name, c, body)
 	case OpImport:
 		s.importCert(w, r, name, c, body)
+	case OpUpdate:
+		v := c.find(segment(parts, 2))
+		if v == nil || segment(parts, 2) == "" {
+			kvError(w, http.StatusNotFound, "CertificateNotFound", "A certificate with (name/id) "+name+" was not found in this key vault.")
+			return
+		}
+		var params azcertificates.UpdateCertificateParameters
+		if err := json.Unmarshal(body, &params); err != nil {
+			kvError(w, http.StatusBadRequest, "BadParameter", "invalid update request")
+			return
+		}
+		if params.Tags != nil {
+			v.tags = params.Tags
+		}
+		writeJSON(w, http.StatusOK, s.certJSON(name, c, v))
 	case OpListVersions:
 		s.listVersions(w, r, name, c)
 	case OpGetDeleted:
@@ -540,6 +575,8 @@ func route(method string, p []string) (op, name string) {
 		return OpImport, name
 	case p[0] == "certificates" && len(p) == 3 && p[2] == "versions" && method == http.MethodGet:
 		return OpListVersions, name
+	case p[0] == "certificates" && len(p) == 3 && method == http.MethodPatch:
+		return OpUpdate, name
 	case p[0] == "certificates" && method == http.MethodGet:
 		return OpGetCert, name
 	case p[0] == "secrets" && method == http.MethodGet:
@@ -678,8 +715,17 @@ func (s *Server) merge(w http.ResponseWriter, name string, c *certificate, body 
 		return
 	}
 	v := &version{id: randomHex(16), created: s.tick(), key: c.pending.key, certs: params.X509Certificates, exportable: true, contentType: "application/x-pkcs12", tags: c.pending.tags}
-	if params.Tags != nil {
+	if params.Tags != nil && !s.ignoreMergeTags {
 		v.tags = params.Tags
+	}
+	if len(s.stripOnMerge) > 0 {
+		kept := map[string]*string{}
+		for k, val := range v.tags {
+			if !slices.Contains(s.stripOnMerge, k) {
+				kept[k] = val
+			}
+		}
+		v.tags = kept
 	}
 	if kp := c.pending.policy.KeyProperties; kp != nil && kp.Exportable != nil {
 		v.exportable = *kp.Exportable
