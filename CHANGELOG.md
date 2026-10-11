@@ -17,6 +17,15 @@ protocol and the KrakenKey API the connector uses.
   versions there, the connector refuses with an error that says so, and it
   never takes an unpinned plugin from `<data_dir>/plugins`. `validate`
   shows the version it used. An explicit `version` works as before.
+- `.deb` and `.rpm` packages for Linux amd64 and arm64, published to the
+  signed apt and dnf repositories at packages.krakenkey.io and attached to
+  each release. They install the connector, the included plugins in the
+  system plugin directory with their `plugins.lock` (the same binaries and
+  layout as the container image), an example config, and a hardened
+  systemd unit, `krakenkey-connector.service`, that runs as a dedicated
+  system user. The service is not enabled or started on install.
+- A Homebrew cask, `krakenkey/tap/krakenkey-connector`, for macOS and Linux.
+  It installs the connector only.
 
 ## [v0.1.0] - 2026-10-10
 

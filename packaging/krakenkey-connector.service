@@ -1,0 +1,70 @@
+[Unit]
+Description=KrakenKey Connector: renews KrakenKey certificates and deploys them
+Documentation=https://github.com/KrakenKey/connector#readme
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=krakenkey-connector
+Group=krakenkey-connector
+# Reads /etc/krakenkey-connector/config.yaml.
+ExecStart=/usr/bin/krakenkey-connector run
+# Environment for the connector and its plugins, such as cloud credentials
+# (AZURE_CLIENT_ID, AWS_REGION, ...). The package installs the first on
+# Debian and Ubuntu and the second on RPM-based systems.
+EnvironmentFile=-/etc/default/krakenkey-connector
+EnvironmentFile=-/etc/sysconfig/krakenkey-connector
+# To use an API key instead of enrolling, add a drop-in
+# (systemctl edit krakenkey-connector) with:
+#   LoadCredential=kk_api_key:/etc/krakenkey-connector/api-key
+
+Restart=on-failure
+RestartSec=30s
+# 3: the API key or enrollment token was rejected. 5: KrakenKey refused the
+# connector's identity. Restarting cannot fix either.
+RestartPreventExitStatus=3 5
+
+# Keys, identity, state and the audit log: /var/lib/krakenkey-connector.
+# systemd creates it, gives it to the service user and keeps it at 0700,
+# which the connector requires.
+StateDirectory=krakenkey-connector
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/krakenkey-connector
+
+# Hardening. The file system is read-only apart from the state directory
+# and a private /tmp (plugins talk to the connector over Unix sockets there).
+# A file target that writes elsewhere, such as /etc/nginx/tls, needs a
+# drop-in with ReadWritePaths=; see the README.
+# Network access is not restricted: the connector and its plugins call
+# HTTPS APIs and cloud instance metadata (169.254.169.254).
+# MemoryDenyWriteExecute= is left off because exec targets and then.exec
+# commands may run programs with a JIT (Java keytool, Node.js).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+# AF_NETLINK: interface lookups by the Go and C resolvers.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

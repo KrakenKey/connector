@@ -1,0 +1,60 @@
+# KrakenKey Connector configuration (installed by the krakenkey-connector
+# package). Upgrades keep your edits to this file.
+#
+# Full reference: https://github.com/KrakenKey/connector#configuration
+#
+# Add at least one certificate below, enroll the connector, check the
+# config, then start the service:
+#
+#   sudo -u krakenkey-connector krakenkey-connector validate
+#   sudo systemctl enable --now krakenkey-connector
+#
+# This file is readable by root and the krakenkey-connector group only.
+
+krakenkey:
+  api_url: https://api.krakenkey.io
+
+# Time between passes.
+check_interval: 6h
+
+# Keys, identity and state. The systemd unit gives the service write access
+# here only, and systemd keeps it at mode 0700, which the connector requires.
+data_dir: /var/lib/krakenkey-connector
+
+# Audit log, one JSON object per line. Default: <data_dir>/audit.jsonl.
+# audit_log: /var/lib/krakenkey-connector/audit.jsonl
+
+# The package installs the included plugins (aws-acm, azure-keyvault and
+# azure-appgateway) in /usr/lib/krakenkey-connector/plugins, pinned by its
+# plugins.lock. Declare the ones you use with the connector's version, as
+# printed by `krakenkey-connector version` without the leading v. After a
+# package upgrade, change the versions here to the new one and restart the
+# service.
+# Cloud credentials for the plugins go in /etc/default/krakenkey-connector
+# (Debian, Ubuntu) or /etc/sysconfig/krakenkey-connector (RPM-based systems).
+#
+# plugins:
+#   azure-keyvault: { version: 0.1.0 }
+#   azure-appgateway: { version: 0.1.0, call_timeout: 15m }
+#   aws-acm: { version: 0.1.0 }
+
+# The certificates to renew and deploy. At least one is required.
+#
+# certificates:
+#   - id: 1043                     # KrakenKey certificate id
+#     names: [api.example.com]     # must match the certificate's names
+#     key_store: { plugin: local, key_type: ecdsa-p256 }
+#     targets:
+#       # The directory must exist and be writable by the krakenkey-connector
+#       # user, and the service needs a drop-in that allows writing there:
+#       #   sudo systemctl edit krakenkey-connector
+#       #   [Service]
+#       #   ReadWritePaths=/etc/nginx/tls/api
+#       - label: example-nginx
+#         plugin: file
+#         dir: /etc/nginx/tls/api
+#         files: { cert: cert.pem, chain: chain.pem, fullchain: fullchain.pem, key: key.pem }
+#         owner: ":nginx"            # a group the krakenkey-connector user is in
+#         mode: "0640"
+#         then: { exec: [systemctl, reload, nginx] }
+#         verify: { host: api.example.com, port: 443, window: 10m }

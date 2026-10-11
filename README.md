@@ -65,8 +65,8 @@ plugins, places such as key vaults and cloud load balancers.
 - Plugins and deployment commands run with the connector's permissions. Only
   install plugins you trust. Plugins you install under the data directory
   must have their `sha256` pinned in the config; the plugins in the
-  container image are pinned by its `plugins.lock` (see
-  [External plugins](#external-plugins)).
+  container image and the Linux packages are pinned by their
+  `plugins.lock` (see [External plugins](#external-plugins)).
 - Plugins get the connector's environment without `KK_API_KEY`,
   `KK_API_KEY_FILE`, `CREDENTIALS_DIRECTORY` and `KK_ENROLLMENT_TOKEN*`.
   Everything else is passed on, because cloud SDKs read their credentials and
@@ -83,6 +83,86 @@ plugins, places such as key vaults and cloud load balancers.
     and `NO_PROXY`.
 
 ## Install
+
+### Debian, Ubuntu, Fedora, RHEL and Amazon Linux
+
+The `krakenkey-connector` package installs the connector, the
+[included plugins](#included-plugins) and a systemd service. See
+[Running as a service](#running-as-a-service) for what it sets up and how to
+start it.
+
+**Debian and Ubuntu** (amd64 and arm64): add the KrakenKey apt repository,
+then install and upgrade with apt.
+
+```sh
+curl -fsSLo /tmp/krakenkey-archive-keyring.deb https://packages.krakenkey.io/keys/krakenkey-archive-keyring.deb
+sudo apt install /tmp/krakenkey-archive-keyring.deb
+sudo apt update && sudo apt install krakenkey-connector
+```
+
+**Fedora, RHEL, Rocky, Alma, Amazon Linux 2023** (x86_64 and aarch64): add
+the KrakenKey rpm repository, then install and upgrade with dnf.
+
+```sh
+sudo dnf install https://packages.krakenkey.io/keys/krakenkey-archive-keyring.rpm
+sudo dnf install krakenkey-connector
+```
+
+`krakenkey-archive-keyring` installs the signing key and the repository
+settings (`/etc/apt/sources.list.d/krakenkey.sources`, or
+`/etc/yum.repos.d/krakenkey.repo`). It is the same repository as the
+KrakenKey CLI's, so skip that step if the CLI is already installed from it.
+Supported: Debian 11+, Ubuntu 20.04+, RHEL/Rocky/Alma 8+, Fedora, Amazon
+Linux 2023. On older systems, use the [release binaries](#release-binaries).
+
+The repositories are signed with this key. The first time dnf uses it, it
+asks you to confirm the key; check the fingerprint:
+
+```text
+KrakenKey Packages <packages@krakenkey.io>
+386E 2558 2384 DD74 692A  4EE9 F7BA 53A4 E94F A5DA
+```
+
+To check it yourself:
+`curl -fsSL https://packages.krakenkey.io/keys/krakenkey.asc | gpg --show-keys`.
+If you'd rather not add a repository, each
+[release](https://github.com/KrakenKey/connector/releases) also has the
+`.deb` and `.rpm` files (`krakenkey-connector_<version>_linux_<arch>.deb`
+and `.rpm`), covered by the signed `checksums.txt` described below:
+
+```sh
+# Debian, Ubuntu
+sudo apt install ./krakenkey-connector_*_linux_amd64.deb
+
+# RHEL, Fedora, Amazon Linux
+sudo dnf install ./krakenkey-connector_*_linux_amd64.rpm
+```
+
+Replace `amd64` with `arm64` on ARM machines.
+
+### Homebrew
+
+On macOS (and Linux):
+
+```sh
+brew install krakenkey/tap/krakenkey-connector
+```
+
+Update with `brew upgrade krakenkey-connector`. The cask comes from
+[KrakenKey/homebrew-tap](https://github.com/KrakenKey/homebrew-tap), is
+updated by each release, and checks the download against the release
+checksums. It installs the connector only:
+
+- Install the plugins you need from their release archives under the data
+  directory, with their `sha256` in the config, as described in
+  [On a host](#on-a-host).
+- Homebrew does not run the connector as a service. Run
+  `krakenkey-connector run` yourself, or `run --once` from launchd or cron.
+- Set `data_dir` in the config to a directory you own, since the default,
+  `/var/lib/krakenkey-connector`, does not exist on macOS.
+
+On Linux, prefer the packages above: they include the plugins and the
+systemd service.
 
 ### Release binaries
 
@@ -123,8 +203,6 @@ Windows builds are not published yet: the connector's file permission,
 plugin ownership and key mode checks are not implemented on Windows.
 Building from source for Windows works, but is unsupported.
 
-Packages for Homebrew, apt and dnf are planned for later releases.
-
 ### Container image
 
 `ghcr.io/krakenkey/connector`, for `linux/amd64` and `linux/arm64`. The image
@@ -150,6 +228,9 @@ cosign verify ghcr.io/krakenkey/connector:v${VERSION} \
 See [Docker](#docker) for how to run it.
 
 ## Quick start
+
+With the Linux packages, follow [Running as a service](#running-as-a-service)
+instead: it covers the same steps for the systemd service.
 
 1. Create a connector in the KrakenKey dashboard and copy its enrollment
    token (`kkce_...`, shown once, valid for 24 hours). Alternatively, create
@@ -235,6 +316,154 @@ To renew now, regardless of the schedule (for example to test a new target):
 ```sh
 krakenkey-connector run --once --force --cert 1043
 ```
+
+## Running as a service
+
+The `.deb` and `.rpm` packages set up the connector to run under systemd:
+
+| Path | What it is |
+|------|------------|
+| `/usr/bin/krakenkey-connector` | The connector. |
+| `/usr/lib/krakenkey-connector/plugins/` | The [included plugins](#included-plugins), `<name>/<version>/krakenkey-connector-plugin-<name>`, with a `plugins.lock`. Owned by root, the same layout as the container image. |
+| `/etc/krakenkey-connector/config.yaml` | The config. Mode `0640`, owned by `root:krakenkey-connector`, kept on upgrade. It has no certificates yet, so the connector refuses it until you add one. |
+| `/etc/default/krakenkey-connector` (Debian, Ubuntu) or `/etc/sysconfig/krakenkey-connector` (RPM-based) | Environment for the service, such as cloud credentials for the plugins. Same owner and mode as the config. |
+| `/var/lib/krakenkey-connector` | The data directory: keys, identity, state and the audit log. Mode `0700`, owned by `krakenkey-connector`. |
+| `krakenkey-connector.service` | Runs `krakenkey-connector run` as the `krakenkey-connector` system user. Not enabled or started on install. |
+
+To start it:
+
+1. Edit `/etc/krakenkey-connector/config.yaml` (`sudoedit` works). Declare
+   the plugins you use with the connector's version, as shown in
+   [In the container image and the Linux packages](#in-the-container-image-and-the-linux-packages).
+2. Enroll the connector as the service user, so its identity in
+   `/var/lib/krakenkey-connector` belongs to that user. The token file must
+   be readable by the service user and not by others:
+
+   ```sh
+   sudo install -m 0640 -o root -g krakenkey-connector /dev/null /etc/krakenkey-connector/enrollment-token
+   sudoedit /etc/krakenkey-connector/enrollment-token   # paste the kkce_... token
+   sudo -u krakenkey-connector env KK_ENROLLMENT_TOKEN_FILE=/etc/krakenkey-connector/enrollment-token \
+     krakenkey-connector enroll
+   sudo rm /etc/krakenkey-connector/enrollment-token    # it works only once
+   ```
+
+3. Check the config, the plugins and the API access as the service user:
+
+   ```sh
+   sudo -u krakenkey-connector krakenkey-connector validate
+   ```
+
+   If the plugins read credentials from the environment file, load it the
+   way the service does (on RPM-based systems the file is
+   `/etc/sysconfig/krakenkey-connector`):
+
+   ```sh
+   sudo -u krakenkey-connector sh -c 'set -a; . /etc/default/krakenkey-connector; exec krakenkey-connector validate'
+   ```
+
+4. Enable and start the service, and follow its log:
+
+   ```sh
+   sudo systemctl enable --now krakenkey-connector
+   journalctl -u krakenkey-connector -f
+   ```
+
+The service restarts after a failure, except after exit code `3` (the API
+key or enrollment token was rejected) or `5` (KrakenKey refused the
+connector's identity), which a restart cannot fix.
+
+**With an API key instead of enrollment**, keep the key in a file only root
+can read and hand it to the service as a systemd credential:
+
+```sh
+sudo install -m 0600 /dev/null /etc/krakenkey-connector/api-key
+sudoedit /etc/krakenkey-connector/api-key           # paste the kk_... key
+sudo systemctl edit krakenkey-connector
+```
+
+```ini
+[Service]
+LoadCredential=kk_api_key:/etc/krakenkey-connector/api-key
+```
+
+`LoadCredential` needs systemd 247 or later. On older systems (RHEL 8),
+make the key file mode `0640` with group `krakenkey-connector` and set
+`KK_API_KEY_FILE=/etc/krakenkey-connector/api-key` in the environment file
+instead. To validate with the key, run `validate` the way the service gets
+it:
+
+```sh
+sudo systemd-run --pipe --wait --quiet -p User=krakenkey-connector \
+  -p LoadCredential=kk_api_key:/etc/krakenkey-connector/api-key \
+  krakenkey-connector validate
+```
+
+### Sandbox
+
+The unit runs the connector with most of the file system read-only
+(`ProtectSystem=strict`, `ProtectHome=yes`, a private `/tmp`), no
+capabilities, `NoNewPrivileges=yes`, and a system call filter. It can
+write only to `/var/lib/krakenkey-connector` and its private `/tmp`, where
+plugins and the connector talk over Unix sockets. Outbound network access
+is not restricted, so the connector reaches the KrakenKey API, and plugins
+reach cloud APIs and instance metadata (`169.254.169.254`).
+
+**`file` targets** need a drop-in that lets the service write to their
+directories. The directory must also be writable by the
+`krakenkey-connector` user, and `owner` can only name that user or a group
+it belongs to. For the nginx example in [Quick start](#quick-start), with
+`owner: ":nginx"`:
+
+```sh
+sudo install -d -m 0750 -o krakenkey-connector -g nginx /etc/nginx/tls/api
+sudo usermod -aG nginx krakenkey-connector
+sudo systemctl edit krakenkey-connector
+```
+
+```ini
+[Service]
+ReadWritePaths=/etc/nginx/tls/api
+```
+
+A target under `/home` also needs `ProtectHome=no` there.
+
+**Reload commands** such as `then: { exec: [systemctl, reload, nginx] }` run
+as the `krakenkey-connector` user, and `NoNewPrivileges` rules out `sudo`.
+Allow the reload with a polkit rule instead (polkit 0.106 or later; install
+`polkitd` on Debian and Ubuntu if it is missing):
+
+```js
+// /etc/polkit-1/rules.d/50-krakenkey-connector.rules
+polkit.addRule(function (action, subject) {
+  if (action.id == "org.freedesktop.systemd1.manage-units" &&
+      subject.user == "krakenkey-connector" &&
+      action.lookup("unit") == "nginx.service" &&
+      action.lookup("verb") == "reload") {
+    return polkit.Result.YES;
+  }
+});
+```
+
+Use absolute paths in `then.exec`, `exec` targets and plugin settings that
+point at files, and check the result with `validate` after adding a
+drop-in.
+
+### Upgrades and removal
+
+The included plugins carry the connector's version, and the config names
+the version it uses. After an upgrade, change the plugin versions in
+`config.yaml` to the new version (`krakenkey-connector version`) and run
+`sudo systemctl restart krakenkey-connector`. The package restarts a running
+service on upgrade and prints a reminder when the config declares plugins.
+
+Removing the package (`apt remove`, `dnf remove`) stops and disables the
+service, and keeps the config, the data directory and the
+`krakenkey-connector` user, so a reinstall picks up where it left off. `dnf
+remove` saves an edited config as `config.yaml.rpmsave`. `apt purge` also
+deletes the config files the package installed and
+`/var/lib/krakenkey-connector`, including the connector's identity and
+private keys. Files you added to `/etc/krakenkey-connector` and the user
+are kept.
 
 ## Commands
 
@@ -481,7 +710,8 @@ in the first of these places that applies:
    is required.
 3. `<plugin_dir>/<name>/<version>/`, the system plugin directory (default
    `/usr/lib/krakenkey-connector/plugins`). This is where the
-   [container image](#container-image) keeps the
+   [container image](#container-image) and the
+   [Linux packages](#debian-ubuntu-fedora-rhel-and-amazon-linux) keep the
    [included plugins](#included-plugins). `sha256` is optional here: the
    binary must match its line in `<plugin_dir>/plugins.lock`, and also the
    `sha256` setting if there is one.
@@ -568,13 +798,14 @@ its version: release `v0.1.0` ships version `0.1.0` of each.
 Each plugin's README covers its settings, credentials and the permissions it
 needs.
 
-### In the container image
+### In the container image and the Linux packages
 
-The image has the plugins in the system plugin directory,
+The image and the `.deb` and `.rpm` packages have the plugins in the
+system plugin directory,
 `/usr/lib/krakenkey-connector/plugins/<name>/<version>/`, owned by root and
 read-only for the connector's user, with a `plugins.lock` written when the
-image was built. Declare the plugins you use without a version, and the
-connector uses the ones in the image:
+release was built. Declare the plugins you use without a version, and the
+connector uses the ones installed with it:
 
 ```yaml
 plugins:
@@ -582,16 +813,17 @@ plugins:
   azure-appgateway: { call_timeout: 15m }
 ```
 
-The config then keeps working when you upgrade the image. To pin a plugin
-instead, set `version` to the connector's version (what
+The config then keeps working when you upgrade the image or the package.
+To pin a plugin instead, set `version` to the connector's version (what
 `krakenkey-connector version` prints, without the leading `v`), and change
-it whenever you upgrade the image. An image built from source with
-`docker build` uses the `VERSION` build argument (default `dev`) as the
-plugins' version.
+it whenever you upgrade. An image built from source with `docker build`
+uses the `VERSION` build argument (default `dev`) as the plugins' version.
 
 ### On a host
 
-Download the plugin's archive from the same release as the connector,
+With the Linux packages, the plugins are already installed (see above).
+Elsewhere, for example on macOS or with the release binaries, download the
+plugin's archive from the same release as the connector,
 verify it like the connector's archive (see
 [Release binaries](#release-binaries)), and install the binary under the
 data directory with its checksum in the config:

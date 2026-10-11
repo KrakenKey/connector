@@ -48,6 +48,20 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Write deploy key for KrakenKey/homebrew-tap (that repo only).
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           # Build the connector from its own go.mod, not the go.work
           # workspace that also holds the plugin modules.
           GOWORK: 'off'
+
+      # Publish the .deb and .rpm files to the signed apt and dnf
+      # repositories at packages.krakenkey.io, the same way the CLI and the
+      # probe do. Stable tags only.
+      - name: Publish to packages.krakenkey.io
+        if: ${{ !contains(github.ref_name, '-') }}
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          token: ${{ secrets.INFRA_DEPLOY_PAT }}
+          repository: KrakenKey/infra-int
+          event-type: package-released
+          client-payload: '{"repo": "connector", "tag": "${{ github.ref_name }}"}'
