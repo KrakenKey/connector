@@ -24,8 +24,27 @@ func (e *IncompatibleError) Error() string {
 // When they cannot work together the error is an *IncompatibleError listing
 // every problem found, not only the first.
 func Match(ks KeyStoreCapabilities, t TargetCapabilities, keyType KeyType) (KeyFormat, error) {
-	var reasons []string
+	reasons := keyTypeReasons(ks, t, keyType)
 
+	if t.NeedsExportableKey && !ks.Exportable {
+		reasons = append(reasons, "target needs the private key, but the key store does not allow export")
+	}
+
+	format, formatReason := pickFormat(ks, t)
+	if formatReason != "" {
+		reasons = append(reasons, formatReason)
+	}
+
+	if len(reasons) > 0 {
+		return "", &IncompatibleError{Reasons: reasons}
+	}
+	return format, nil
+}
+
+// keyTypeReasons returns why the key store and target cannot agree on
+// keyType, or on any key type when keyType is empty.
+func keyTypeReasons(ks KeyStoreCapabilities, t TargetCapabilities, keyType KeyType) []string {
+	var reasons []string
 	if keyType != "" {
 		if !slices.Contains(ks.KeyTypes, keyType) {
 			reasons = append(reasons, fmt.Sprintf("key store cannot create %s keys (supports %s)",
@@ -41,20 +60,7 @@ func Match(ks KeyStoreCapabilities, t TargetCapabilities, keyType KeyType) (KeyF
 		reasons = append(reasons, fmt.Sprintf("no key type in common: key store creates %s, target accepts %s",
 			orNone(joinKeyTypes(ks.KeyTypes)), joinKeyTypes(t.KeyTypes)))
 	}
-
-	if t.NeedsExportableKey && !ks.Exportable {
-		reasons = append(reasons, "target needs the private key, but the key store does not allow export")
-	}
-
-	format, formatReason := pickFormat(ks, t)
-	if formatReason != "" {
-		reasons = append(reasons, formatReason)
-	}
-
-	if len(reasons) > 0 {
-		return "", &IncompatibleError{Reasons: reasons}
-	}
-	return format, nil
+	return reasons
 }
 
 // pickFormat returns the preferred format both sides support. Formats other
@@ -85,6 +91,41 @@ func orNone(s string) string {
 		return "none"
 	}
 	return s
+}
+
+// MatchKeyStoreDeployment is Match for a target that is the key store's own
+// deployment (see ImplicitTarget): the key store already put the
+// certificate there, so the target does not need an exportable key. It
+// checks key types as Match does and returns the format in which the core
+// hands the key to the target: a vault reference when both support it,
+// else a format carrying key bytes when the key store allows export, else
+// "" (the target gets no key). An error is an *IncompatibleError.
+func MatchKeyStoreDeployment(ks KeyStoreCapabilities, t TargetCapabilities, keyType KeyType) (KeyFormat, error) {
+	if reasons := keyTypeReasons(ks, t, keyType); len(reasons) > 0 {
+		return "", &IncompatibleError{Reasons: reasons}
+	}
+	// No common format only means the target gets no key.
+	format, _ := pickFormat(ks, t)
+	return format, nil
+}
+
+// KeyStoreDeploymentRollbackUnavailable is RollbackUnavailable for the key
+// store's own deployment, matched with MatchKeyStoreDeployment in format.
+// Going back there means putting the previous certificate and its key in
+// place again, so a target with RollbackNeedsMaterial also needs a key
+// store that allows export when it is handed a vault reference.
+func KeyStoreDeploymentRollbackUnavailable(ks KeyStoreCapabilities, t TargetCapabilities, format KeyFormat) string {
+	switch {
+	case !t.SupportsRollback:
+		return "target does not support rollback"
+	case !t.RollbackNeedsMaterial:
+		return ""
+	case format == "":
+		return "the key store and the target share no key format, so the previous key cannot be handed back"
+	case !ks.Exportable:
+		return "putting the previous certificate back needs its private key, and the key store does not allow export"
+	}
+	return ""
 }
 
 // RollbackUnavailable returns why the core cannot roll back target t when

@@ -168,3 +168,63 @@ func TestRollbackUnavailable(t *testing.T) {
 		t.Errorf("locked PEM: %q", got)
 	}
 }
+
+func TestMatchKeyStoreDeployment(t *testing.T) {
+	vault := KeyStoreCapabilities{Provides: []KeyFormat{KeyFormatVaultRef, KeyFormatPEM}, Exportable: true, KeyTypes: []KeyType{KeyTypeECDSAP256, KeyTypeRSA2048}}
+	locked := vault
+	locked.Exportable = false
+	pemOnly := KeyStoreCapabilities{Provides: []KeyFormat{KeyFormatPEM}, KeyTypes: []KeyType{KeyTypeECDSAP256}}
+	target := TargetCapabilities{
+		Accepts: []KeyFormat{KeyFormatVaultRef, KeyFormatPEM}, NeedsExportableKey: true,
+		SupportsRollback: true, RollbackNeedsMaterial: true, KeyTypes: []KeyType{KeyTypeECDSAP256},
+	}
+	pemTarget := target
+	pemTarget.Accepts = []KeyFormat{KeyFormatPEM}
+
+	for _, tt := range []struct {
+		name       string
+		ks         KeyStoreCapabilities
+		t          TargetCapabilities
+		keyType    KeyType
+		format     KeyFormat
+		err        string
+		noRollback string
+	}{
+		{"vault reference preferred", vault, target, KeyTypeECDSAP256, KeyFormatVaultRef, "", ""},
+		{"locked key store, no export needed", locked, target, KeyTypeECDSAP256, KeyFormatVaultRef, "", "does not allow export"},
+		{"key bytes when exportable", vault, pemTarget, KeyTypeECDSAP256, KeyFormatPEM, "", ""},
+		{"no key when nothing can be handed over", pemOnly, pemTarget, KeyTypeECDSAP256, "", "", "share no key format"},
+		{"key type still checked", vault, target, KeyTypeRSA2048, "", "target cannot serve rsa-2048 keys", ""},
+	} {
+		f, err := MatchKeyStoreDeployment(tt.ks, tt.t, tt.keyType)
+		if tt.err != "" {
+			var inc *IncompatibleError
+			if !errors.As(err, &inc) || !strings.Contains(err.Error(), tt.err) {
+				t.Errorf("%s: err = %v, want %q", tt.name, err, tt.err)
+			}
+			continue
+		}
+		if err != nil || f != tt.format {
+			t.Errorf("%s: MatchKeyStoreDeployment = %q, %v; want %q", tt.name, f, err, tt.format)
+			continue
+		}
+		got := KeyStoreDeploymentRollbackUnavailable(tt.ks, tt.t, f)
+		if (tt.noRollback == "") != (got == "") || !strings.Contains(got, tt.noRollback) {
+			t.Errorf("%s: rollback unavailable = %q, want %q", tt.name, got, tt.noRollback)
+		}
+	}
+
+	// Match itself still refuses the locked pair for an ordinary target.
+	if _, err := Match(locked, target, KeyTypeECDSAP256); err == nil {
+		t.Error("Match accepted a locked key store for a target that needs the key")
+	}
+	plain := target
+	plain.RollbackNeedsMaterial = false
+	if got := KeyStoreDeploymentRollbackUnavailable(locked, plain, KeyFormatVaultRef); got != "" {
+		t.Errorf("target that keeps its own history: %q", got)
+	}
+	plain.SupportsRollback = false
+	if got := KeyStoreDeploymentRollbackUnavailable(vault, plain, KeyFormatVaultRef); !strings.Contains(got, "does not support rollback") {
+		t.Errorf("no rollback: %q", got)
+	}
+}

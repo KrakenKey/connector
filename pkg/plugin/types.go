@@ -71,6 +71,31 @@ type KeyStoreCapabilities struct {
 	Exportable bool
 	// KeyTypes lists the key types CreateCSR accepts.
 	KeyTypes []KeyType
+	// ImplicitTarget, when set, is the deployment the key store makes by
+	// itself in Complete (see ImplicitTarget). It depends on the settings,
+	// so the connector reads it only from ValidateCapabilities and ignores
+	// it in Describe.
+	ImplicitTarget *ImplicitTarget
+}
+
+// ImplicitTarget describes a key store whose certificate is itself a
+// deployment: Complete puts the issued certificate where services already
+// read it (for example a Key Vault certificate that services reference
+// without a version). The connector adds a target of the key store's own
+// plugin with these settings to every certificate that uses the key store,
+// labeled with the plugin's name from the config, unless a configured
+// target of that plugin reports the same DeploymentID from Validate; that
+// target then takes its place.
+//
+// The key store's own deployment is matched with MatchKeyStoreDeployment
+// instead of Match: it does not need an exportable key, since the
+// certificate is already there.
+type ImplicitTarget struct {
+	// Config is the target's settings, sent as Config in Target calls.
+	Config json.RawMessage
+	// DeploymentID says where the key store deploys, in the form the
+	// plugin's target returns in TargetValidation.DeploymentID. Required.
+	DeploymentID string
 }
 
 // TargetCapabilities is what a target reports from Describe.
@@ -245,6 +270,43 @@ type TargetValidateRequest struct {
 	Config        json.RawMessage
 	CertificateID string
 	Label         string
+	// KeyStoreDeploymentID is the DeploymentID of the ImplicitTarget that
+	// the certificate's key store reports, set only when the key store is
+	// served by the same plugin as this target. A target whose settings
+	// have this DeploymentID is the key store's own deployment, and may
+	// skip checks the key store already makes.
+	KeyStoreDeploymentID string
+}
+
+// TargetValidation is a target's answer to ValidateDeployment.
+type TargetValidation struct {
+	// Problems are human readable; empty means the settings are usable.
+	Problems []string
+	// DeploymentID is an opaque, stable id of the place the settings
+	// deploy to (for example a normalized vault URL and certificate name),
+	// or "" when the target does not say. Set it even when there are
+	// problems, if the settings say where that is. The connector reports
+	// two targets of one certificate with the same plugin and DeploymentID
+	// as a problem, and a target with the DeploymentID of the key store's
+	// ImplicitTarget replaces that implicit target.
+	DeploymentID string
+}
+
+// TargetDeploymentValidator is implemented by targets that say where their
+// settings deploy to. The SDK calls ValidateDeployment instead of Validate
+// when it is implemented.
+type TargetDeploymentValidator interface {
+	ValidateDeployment(ctx context.Context, req TargetValidateRequest) (TargetValidation, error)
+}
+
+// ValidateTarget validates t's settings, with the deployment id when t
+// implements TargetDeploymentValidator.
+func ValidateTarget(ctx context.Context, t Target, req TargetValidateRequest) (TargetValidation, error) {
+	if v, ok := t.(TargetDeploymentValidator); ok {
+		return v.ValidateDeployment(ctx, req)
+	}
+	problems, err := t.Validate(ctx, req)
+	return TargetValidation{Problems: problems}, err
 }
 
 // CurrentRequest asks a target what it serves now.

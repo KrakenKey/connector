@@ -163,3 +163,58 @@ func TestInstallIDCrossesTheWire(t *testing.T) {
 		}
 	}
 }
+
+// deploymentTarget reports a deployment id and records the key store
+// deployment id it was given.
+type deploymentTarget struct {
+	plugin.UnimplementedTarget
+	seen chan string
+}
+
+func (d deploymentTarget) ValidateDeployment(_ context.Context, req plugin.TargetValidateRequest) (plugin.TargetValidation, error) {
+	d.seen <- req.KeyStoreDeploymentID
+	return plugin.TargetValidation{Problems: []string{"p"}, DeploymentID: "vault:" + string(req.Config)}, nil
+}
+
+func TestImplicitTargetCrossesTheWire(t *testing.T) {
+	implicit := plugin.KeyStoreCapabilities{
+		Provides: []plugin.KeyFormat{plugin.KeyFormatVaultRef}, KeyTypes: []plugin.KeyType{plugin.KeyTypeRSA2048},
+		ImplicitTarget: &plugin.ImplicitTarget{Config: []byte(`{"vault":"main"}`), DeploymentID: "vault:main"},
+	}
+	fk := featureKeyStore{KeyStore: testplugin.NewKeyStore(), seen: make(chan []string, 1), caps: &implicit}
+	dt := deploymentTarget{seen: make(chan string, 2)}
+	client, _ := goplugin.TestPluginGRPCConn(t, false, plugin.ServeOpts{KeyStore: fk, Target: dt}.PluginSet())
+	defer func() { _ = client.Close() }()
+	ks, _ := plugin.DispenseKeyStore(client)
+	tg, _ := plugin.DispenseTarget(client)
+	ctx := context.Background()
+
+	v, err := plugin.ValidateKeyStore(ctx, ks, plugin.KeyStoreValidateRequest{CertificateID: "9"})
+	if err != nil || v.Capabilities == nil || v.Capabilities.ImplicitTarget == nil {
+		t.Fatalf("ValidateKeyStore = %+v, %v", v, err)
+	}
+	if it := v.Capabilities.ImplicitTarget; string(it.Config) != `{"vault":"main"}` || it.DeploymentID != "vault:main" {
+		t.Errorf("implicit target = %+v", it)
+	}
+
+	tv, err := plugin.ValidateTarget(ctx, tg, plugin.TargetValidateRequest{Config: []byte("x"), KeyStoreDeploymentID: "vault:main"})
+	if err != nil || tv.DeploymentID != "vault:x" || !slices.Equal(tv.Problems, []string{"p"}) {
+		t.Errorf("ValidateTarget = %+v, %v", tv, err)
+	}
+	if got := <-dt.seen; got != "vault:main" {
+		t.Errorf("target saw key store deployment %q", got)
+	}
+	// Plain Validate still returns the problems.
+	if p, err := tg.Validate(ctx, plugin.TargetValidateRequest{}); err != nil || len(p) != 1 {
+		t.Errorf("Validate = %v, %v", p, err)
+	}
+	<-dt.seen
+
+	// A target without ValidateDeployment reports no deployment id.
+	if tv, err := plugin.ValidateTarget(ctx, testplugin.NewTarget(), plugin.TargetValidateRequest{Config: []byte(`{"name":"x"}`)}); err != nil || tv.DeploymentID != "" || len(tv.Problems) != 0 {
+		t.Errorf("plain target: %+v, %v", tv, err)
+	}
+	if !slices.Contains(plugin.CoreFeatures, plugin.FeatureImplicitTarget) {
+		t.Error("the connector does not announce implicit targets")
+	}
+}

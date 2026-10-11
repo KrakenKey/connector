@@ -82,7 +82,7 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 	authFailed := false
 	for _, cert := range cfg.Certificates {
 		fmt.Fprintf(w, "\nCertificate %d [%s]\n", cert.ID, strings.Join(cert.Names, ", "))
-		_, rep := BuildJob(ctx, cert, r)
+		job, rep := BuildJob(ctx, cert, r)
 
 		fmt.Fprintf(w, "  key store %s (%s)", rep.KeyStore, cert.KeyStore.KeyType)
 		if c := rep.KeyStoreCaps; c != nil {
@@ -94,7 +94,14 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 		}
 
 		for i, t := range rep.Targets {
-			fmt.Fprintf(w, "  target %s (%s)", t.Label, t.Plugin)
+			fmt.Fprintf(w, "  target %s (%s", t.Label, t.Plugin)
+			switch {
+			case t.Implicit:
+				fmt.Fprint(w, ", implicit: added by the key store, which deploys there itself")
+			case t.KeyStoreDeployment:
+				fmt.Fprint(w, ", the key store's own deployment, replacing the implicit target")
+			}
+			fmt.Fprint(w, ")")
 			if t.Format != "" {
 				fmt.Fprintf(w, ": key as %s", t.Format)
 			}
@@ -120,7 +127,7 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 				warnings++
 				fmt.Fprintf(w, "    WARNING: %s\n", warn)
 			}
-			tc := cert.Targets[i]
+			tc := job.Cert.Targets[i]
 			if t.Plugin != "" && t.Caps != nil {
 				if tg, err := r.Target(t.Plugin); err == nil {
 					settings, _ := tc.SettingsJSON()
@@ -143,6 +150,9 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 				fmt.Fprintf(w, "    verify: TLS to %s with SNI %s, window %s, %s\n", v.DialAddress(), v.Host, t.Window, chain)
 			} else {
 				fmt.Fprintf(w, "    verify: none\n")
+				if t.Implicit {
+					fmt.Fprintf(w, "    (to verify it, add a target of plugin %s that deploys to the key store's certificate, with a verify block)\n", t.Plugin)
+				}
 			}
 		}
 

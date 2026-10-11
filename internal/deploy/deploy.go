@@ -26,6 +26,10 @@
 //     previous certificate and key itself (RollbackNeedsMaterial) is handed
 //     them on rollback: the state keeps every earlier certificate a target
 //     still serves, and the key store keeps its key.
+//     The key store's own deployment (config.Target.KeyStoreDeployment)
+//     already serves the new certificate when its turn comes, since the
+//     key store made it live in Complete; a rollback there restores the
+//     certificate the state recorded before that.
 //  6. When every target serves the new certificate, release the old keys
 //     and forget the earlier certificates.
 //
@@ -124,7 +128,10 @@ type TargetJob struct {
 	Plugin   plugin.Target
 	Settings json.RawMessage
 	Caps     plugin.TargetCapabilities
-	// Format is the key format agreed by plugin.Match.
+	// Format is the key format agreed by plugin.Match, or by
+	// plugin.MatchKeyStoreDeployment for the key store's own deployment
+	// (Config.KeyStoreDeployment). It is empty only for such a target that
+	// gets no key.
 	Format plugin.KeyFormat
 	// Window is the resolved verify window.
 	Window time.Duration
@@ -867,10 +874,14 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	st, tj := t.st, t.tj
 	certID := strconv.Itoa(t.job.Cert.ID)
 
-	key, err := t.job.KeyStore.Export(ctx, plugin.ExportRequest{Config: t.job.KeyStoreConfig, KeyRef: st.KeyRef, Format: tj.Format})
-	if err != nil {
-		t.failStep(audit.StepExport, err)
-		return t.recordFailure(err, OutcomeFailed)
+	var key plugin.KeyMaterial
+	if tj.Format != "" {
+		var err error
+		key, err = t.job.KeyStore.Export(ctx, plugin.ExportRequest{Config: t.job.KeyStoreConfig, KeyRef: st.KeyRef, Format: tj.Format})
+		if err != nil {
+			t.failStep(audit.StepExport, err)
+			return t.recordFailure(err, OutcomeFailed)
+		}
 	}
 	stagedRef, err := tj.Plugin.Stage(ctx, plugin.StageRequest{
 		Config:        tj.Settings,
@@ -898,8 +909,13 @@ func (t *targetRun) deployCurrent(ctx context.Context) error {
 	ts.Phase = PhaseActivating
 	if tj.Caps.RollbackNeedsMaterial {
 		// What the target serves now is what a rollback must restore,
-		// whatever the state says it was given last.
-		ts.LiveBefore = t.current(ctx)
+		// whatever the state says it was given last. The key store's own
+		// deployment is the exception: the key store put the new
+		// certificate there in Complete, so a rollback undoes that and
+		// restores what the state recorded before it.
+		if cur := t.current(ctx); !tj.Config.KeyStoreDeployment || cur != st.Serial {
+			ts.LiveBefore = cur
+		}
 	}
 	t.setTS(ts)
 	if err := t.save(); err != nil {

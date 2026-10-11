@@ -29,6 +29,31 @@ protocol and the KrakenKey API the connector uses.
   running.
 - A Homebrew cask, `krakenkey/tap/krakenkey-connector`, for macOS and Linux.
   It installs the connector only.
+- Implicit targets: a key store whose certificate is itself a deployment
+  (such as a Key Vault certificate that services read without a version)
+  adds a target by itself, labeled with the key store plugin's name. A
+  certificate with such a key store needs no configured targets, and is
+  still deployed, verified when configured, rolled back, reported to
+  KrakenKey and alerted on. A configured target of the same plugin that
+  deploys to the same place replaces the implicit one, for example to add a
+  `verify` block. `validate` marks the implicit target.
+- Plugin protocol: `KeyStoreCapabilities.implicit_target` (from the key
+  store's `Validate`), `TargetServiceValidateRequest.key_store_deployment_id`
+  and `TargetServiceValidateResponse.deployment_id`, and the core feature
+  `implicit_target`. In the Go SDK: `plugin.ImplicitTarget`,
+  `plugin.TargetDeploymentValidator`, `plugin.ValidateTarget`,
+  `plugin.MatchKeyStoreDeployment` and
+  `plugin.KeyStoreDeploymentRollbackUnavailable`. Older plugins and
+  connectors ignore the new fields and keep today's behavior.
+
+### Changed
+
+- A certificate whose key store is an external plugin may list no
+  targets; the connector reports it as a problem when the key store adds no
+  target by itself. Certificates with the built-in `local` key store still
+  need at least one target.
+- `validate` reports two targets of one certificate that deploy to the same
+  place (same plugin and deployment id) as a problem.
 
 ## [v0.1.0] - 2026-10-10
 

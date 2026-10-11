@@ -468,6 +468,18 @@ func (r *remoteTarget) Validate(ctx context.Context, req plugin.TargetValidateRe
 	return t.Validate(ctx, req)
 }
 
+// ValidateDeployment forwards to the plugin, keeping the deployment id it
+// returns for these settings.
+func (r *remoteTarget) ValidateDeployment(ctx context.Context, req plugin.TargetValidateRequest) (plugin.TargetValidation, error) {
+	ctx, cancel := r.ctx(ctx, true)
+	defer cancel()
+	t, err := r.get()
+	if err != nil {
+		return plugin.TargetValidation{}, err
+	}
+	return plugin.ValidateTarget(ctx, t, req)
+}
+
 func (r *remoteTarget) Current(ctx context.Context, req plugin.CurrentRequest) (string, error) {
 	ctx, cancel := r.ctx(ctx, true)
 	defer cancel()
@@ -523,6 +535,8 @@ func (r *remoteTarget) Discard(ctx context.Context, req plugin.DiscardRequest) e
 }
 
 var (
-	_ plugin.KeyStore = (*remoteKeyStore)(nil)
-	_ plugin.Target   = (*remoteTarget)(nil)
+	_ plugin.KeyStore                    = (*remoteKeyStore)(nil)
+	_ plugin.Target                      = (*remoteTarget)(nil)
+	_ plugin.KeyStoreCapabilityValidator = (*remoteKeyStore)(nil)
+	_ plugin.TargetDeploymentValidator   = (*remoteTarget)(nil)
 )

@@ -108,7 +108,21 @@ type Target struct {
 	Then     *Then          `yaml:"then"`
 	Verify   *Verify        `yaml:"verify"`
 	Settings map[string]any `yaml:",inline"`
+	// Implicit is set on the target a key store adds by itself (see
+	// plugin.ImplicitTarget). It is never read from the config file.
+	Implicit bool `yaml:"-"`
+	// KeyStoreDeployment is set on the key store's own deployment: the
+	// implicit target, or a configured target that deploys to the same
+	// place. It is never read from the config file.
+	KeyStoreDeployment bool `yaml:"-"`
 }
+
+// ImplicitTargetLabel is the label of the target a key store plugin adds
+// by itself: the plugin's name from the config. Plugin names are 1-63
+// lowercase letters, digits and dashes, so the label is valid, and stable
+// as long as the plugin keeps its name. A certificate has one key store,
+// so it is unique per certificate.
+func ImplicitTargetLabel(keyStorePlugin string) string { return keyStorePlugin }
 
 // Then is a command the core runs after a target is activated, and again
 // after it is rolled back (for example to reload a web server).
@@ -351,7 +365,11 @@ func (c *Config) Validate() error {
 			add("%s: key_store: %v", where, err)
 		}
 
-		if len(cert.Targets) == 0 {
+		// An external key store may add a target by itself (see
+		// plugin.ImplicitTarget); whether it does is known only once the
+		// plugin runs, so the connector checks that when it builds the
+		// certificate's job.
+		if len(cert.Targets) == 0 && slices.Contains(BuiltinKeyStores, ks.Plugin) {
 			add("%s: targets must list at least one target", where)
 		}
 		seenLabels := map[string]bool{}

@@ -80,7 +80,7 @@ func TestReportMapsState(t *testing.T) {
 	}})
 	r := &Reporter{Config: cfg, State: store, Log: slog.New(slog.DiscardHandler), Version: "1.2.3", OS: "linux", Arch: "arm64",
 		Now: func() time.Time { return at.Add(time.Hour) }}
-	reports := r.Build(map[int]error{1: nil, 2: errors.New("certificate 2: KrakenKey API: not found")})
+	reports := r.Build(map[int]error{1: nil, 2: errors.New("certificate 2: KrakenKey API: not found")}, nil)
 	if len(reports) != 1 {
 		t.Fatalf("%d reports", len(reports))
 	}
@@ -162,7 +162,7 @@ func TestReportLimits(t *testing.T) {
 	for _, c := range cfg.Certificates {
 		all[c.ID] = nil
 	}
-	reports := r.Build(all)
+	reports := r.Build(all, nil)
 	if len(reports) != 2 || len(reports[0].Certificates) != 500 || len(reports[1].Certificates) != 1 {
 		t.Fatalf("split into %d reports", len(reports))
 	}
@@ -279,7 +279,7 @@ certificates:
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			reports := r.Build(map[int]error{1: c.err})
+			reports := r.Build(map[int]error{1: c.err}, nil)
 			if len(reports) != 1 || len(reports[0].Certificates) != 1 {
 				t.Fatalf("report holds certificates that were not processed: %+v", reports)
 			}
@@ -294,7 +294,7 @@ certificates:
 			}
 		})
 	}
-	if reports := r.Build(map[int]error{}); len(reports) != 0 {
+	if reports := r.Build(map[int]error{}, nil); len(reports) != 0 {
 		t.Errorf("a pass that processed nothing reported %+v", reports)
 	}
 }

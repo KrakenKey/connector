@@ -15,11 +15,16 @@ const (
 	// FeatureKeyStoreValidateCapabilities means the connector uses the
 	// capabilities a key store returns from ValidateCapabilities.
 	FeatureKeyStoreValidateCapabilities = "keystore_validate_capabilities"
+	// FeatureImplicitTarget means the connector adds the ImplicitTarget a
+	// key store reports from ValidateCapabilities, sends
+	// TargetValidateRequest.KeyStoreDeploymentID and reads
+	// TargetValidation.DeploymentID.
+	FeatureImplicitTarget = "implicit_target"
 )
 
 // CoreFeatures are the features the host side of this SDK supports. The
 // connector built with it sends them in Describe requests.
-var CoreFeatures = []string{FeatureRollbackMaterial, FeatureKeyStoreValidateCapabilities}
+var CoreFeatures = []string{FeatureRollbackMaterial, FeatureKeyStoreValidateCapabilities, FeatureImplicitTarget}
 
 type coreFeaturesKey struct{}
 

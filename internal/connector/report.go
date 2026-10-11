@@ -55,9 +55,12 @@ func (r *Reporter) now() time.Time {
 
 // Send builds the reports and sends them. Failures are logged, never
 // returned: reporting must not fail a pass. results holds every
-// certificate the pass processed, with its error or nil.
-func (r *Reporter) Send(ctx context.Context, results map[int]error) {
-	reports := r.Build(results)
+// certificate the pass processed, with its error or nil. certs holds the
+// certificates as the pass deployed them, with any target their key store
+// added (see BuildJob); a certificate missing there is reported with the
+// targets from the config.
+func (r *Reporter) Send(ctx context.Context, results map[int]error, certs map[int]config.Certificate) {
+	reports := r.Build(results, certs)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ReportTimeout)
 	defer cancel()
 	var rejected []int
@@ -81,13 +84,16 @@ func (r *Reporter) Send(ctx context.Context, results map[int]error) {
 
 // Build returns the reports for the certificates in results, in config
 // order, split so that none has more than api.MaxReportCertificates
-// certificates.
-func (r *Reporter) Build(results map[int]error) []api.Report {
+// certificates. certs is as for Send and may be nil.
+func (r *Reporter) Build(results map[int]error, effective map[int]config.Certificate) []api.Report {
 	var certs []api.ReportCertificate
 	for _, cert := range r.Config.Certificates {
 		certErr, processed := results[cert.ID]
 		if !processed {
 			continue
+		}
+		if e, ok := effective[cert.ID]; ok {
+			cert = e
 		}
 		certs = append(certs, r.certificate(cert, certErr))
 	}
