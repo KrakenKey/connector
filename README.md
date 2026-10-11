@@ -957,16 +957,20 @@ you choose. To build the image from source instead, run
 `docker build -t krakenkey-connector .` and use `krakenkey-connector` as the
 image name.
 
-To enroll the container's connector, run `enroll` once with the same config
-and data volume:
+To enroll the container's connector, put the token in a file owned by the
+image's user (uid 10001), then run `enroll` once with the same config and data
+volume:
 
 ```sh
+sudo install -m 0600 -o 10001 /dev/null /etc/krakenkey-connector/enrollment-token
+sudoedit /etc/krakenkey-connector/enrollment-token   # paste the kkce_... token
 docker run --rm \
   -e KK_ENROLLMENT_TOKEN_FILE=/run/secrets/kk_enrollment_token \
   -v /etc/krakenkey-connector/enrollment-token:/run/secrets/kk_enrollment_token:ro \
   -v /etc/krakenkey-connector/config.yaml:/etc/krakenkey-connector/config.yaml:ro \
   -v krakenkey-connector-data:/var/lib/krakenkey-connector \
   ghcr.io/krakenkey/connector:v${VERSION} enroll --config /etc/krakenkey-connector/config.yaml
+sudo rm /etc/krakenkey-connector/enrollment-token   # it works only once
 ```
 
 and then start it as above without the API key.
