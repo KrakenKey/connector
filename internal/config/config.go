@@ -70,6 +70,8 @@ type KrakenKey struct {
 type PluginSpec struct {
 	// Version selects <data_dir>/plugins/<name>/<version>/krakenkey-connector-plugin-<name>,
 	// or, when that does not exist, the same layout under plugin_dir.
+	// Without Version and Path, the plugin is the only version of it in
+	// plugin_dir (the bundled plugins), never one under data_dir.
 	Version string `yaml:"version"`
 	// Path overrides the binary location.
 	Path string `yaml:"path"`
@@ -290,9 +292,6 @@ func (c *Config) Validate() error {
 			add("plugins.%s: name must be lowercase letters, digits and dashes", name)
 		case slices.Contains(BuiltinKeyStores, name) || slices.Contains(BuiltinTargets, name):
 			add("plugins.%s: %q is a built-in plugin and cannot be declared", name, name)
-		}
-		if spec.Version == "" && spec.Path == "" {
-			add("plugins.%s: set version or path", name)
 		}
 		if strings.ContainsAny(spec.Version, `/\`) || spec.Version == ".." || spec.Version == "." {
 			add("plugins.%s: version %q is not a version", name, spec.Version)

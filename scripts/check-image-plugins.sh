@@ -3,7 +3,8 @@
 #   - plugins.lock matches the binaries in the image,
 #   - those binaries are the ones GoReleaser built (dist/),
 #   - `validate --offline` finds every plugin in the system plugin directory
-#     and starts it as the image's user,
+#     and starts it as the image's user, with and without plugin versions in
+#     the config,
 #   - that user cannot change the plugin directory.
 #
 # Usage: scripts/check-image-plugins.sh IMAGE VERSION [DIST_DIR]
@@ -68,6 +69,25 @@ for p in "${plugins[@]}"; do
 done
 [ "$(grep -c ', matches plugins.lock$' <<<"$out")" -eq "${#plugins[@]}" ] ||
   fail "validate did not match every plugin against plugins.lock"
+
+echo "== validate --offline with the plugins declared without a version"
+{
+  echo "plugins:"
+  for p in "${plugins[@]}"; do echo "  $p: {}"; done
+  sed -n '/^certificates:/,$p' "$work/config.yaml"
+} >"$work/bundled.yaml"
+chmod 0644 "$work/bundled.yaml"
+out=$(docker run --rm -v "$work/bundled.yaml:/etc/krakenkey-connector/config.yaml:ro" "$image" \
+  validate --offline --config /etc/krakenkey-connector/config.yaml) || {
+  echo "$out"
+  fail "validate --offline failed without plugin versions"
+}
+echo "$out"
+for p in "${plugins[@]}"; do
+  bin=krakenkey-connector-plugin-$p
+  grep -qF "  $p $version (bundled, version not set): $plugin_dir/$p/$version/$bin (system plugin dir)" <<<"$out" ||
+    fail "validate did not use the bundled $p"
+done
 
 echo "== the image's user cannot change the plugins"
 docker run --rm --entrypoint sh "$image" -c "

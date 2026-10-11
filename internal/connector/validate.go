@@ -67,6 +67,9 @@ func Validate(ctx context.Context, cfg *config.Config, r Resolver, client CertGe
 				bad("%v", err)
 				continue
 			}
+			if loc.Bundled {
+				fmt.Fprintf(w, " %s (bundled, version not set)", loc.Version)
+			}
 			fmt.Fprintf(w, ": %s (%s)\n", loc.Path, pluginSource(loc.Source))
 			if len(loc.PinnedBy) == 0 {
 				fmt.Fprintf(w, "    sha256 %s, not pinned (set sha256 to pin it)\n", loc.SHA256)

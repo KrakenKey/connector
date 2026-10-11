@@ -8,6 +8,16 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+### Added
+
+- A plugin declared without `version` (and without `path`) uses the bundled
+  plugin: the only version of it in the system plugin directory, checked
+  against `plugins.lock`. Configs for the container image no longer need a
+  plugin version change on every upgrade. With no version or several
+  versions there, the connector refuses with an error that says so, and it
+  never takes an unpinned plugin from `<data_dir>/plugins`. `validate`
+  shows the version it used. An explicit `version` works as before.
+
 ## [v0.1.0] - 2026-10-10
 
 First release: the connector, its plugin protocol and Go SDK, and three

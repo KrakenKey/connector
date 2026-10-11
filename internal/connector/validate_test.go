@@ -36,6 +36,8 @@ func TestValidateShowsPlugins(t *testing.T) {
 			"aws-acm":        {Version: "0.1.0", SHA256: sum},
 			"custom":         {Path: "/opt/custom/plugin"},
 			"broken":         {Version: "0.2.0"},
+			"azure-appgw":    {},
+			"unbundled":      {},
 		},
 		Certificates: []config.Certificate{{
 			ID: 7, Names: []string{"api.example.com"},
@@ -55,8 +57,13 @@ func TestValidateShowsPlugins(t *testing.T) {
 			"aws-acm": {Path: "/var/lib/krakenkey-connector/plugins/aws-acm/0.1.0/krakenkey-connector-plugin-aws-acm",
 				Source: pluginhost.SourceDataDir, SHA256: sum, PinnedBy: []string{pluginhost.PinConfig}},
 			"custom": {Path: "/opt/custom/plugin", Source: pluginhost.SourcePath, SHA256: sum},
+			"azure-appgw": {Path: "/usr/lib/krakenkey-connector/plugins/azure-appgw/0.3.0/krakenkey-connector-plugin-azure-appgw",
+				Source: pluginhost.SourcePluginDir, Version: "0.3.0", Bundled: true, SHA256: sum, PinnedBy: []string{pluginhost.LockFile}},
 		},
-		errs: map[string]error{"broken": errors.New("plugin broken: /usr/lib/krakenkey-connector/plugins/plugins.lock does not exist")},
+		errs: map[string]error{
+			"broken":    errors.New("plugin broken: /usr/lib/krakenkey-connector/plugins/plugins.lock does not exist"),
+			"unbundled": errors.New("plugin unbundled: no version is set and the system plugin directory has none installed"),
+		},
 	}
 
 	var out bytes.Buffer
@@ -70,12 +77,15 @@ func TestValidateShowsPlugins(t *testing.T) {
 			"    sha256 " + sum + ", matches plugins.lock\n",
 		"  broken 0.2.0\n    PROBLEM: plugin broken: /usr/lib/krakenkey-connector/plugins/plugins.lock does not exist\n",
 		"  custom: /opt/custom/plugin (path from the config)\n    sha256 " + sum + ", not pinned (set sha256 to pin it)\n",
+		"  azure-appgw 0.3.0 (bundled, version not set): /usr/lib/krakenkey-connector/plugins/azure-appgw/0.3.0/krakenkey-connector-plugin-azure-appgw (system plugin dir)\n" +
+			"    sha256 " + sum + ", matches plugins.lock\n",
+		"  unbundled\n    PROBLEM: plugin unbundled: no version is set",
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report does not contain %q", want)
 		}
 	}
-	if n != 1 {
+	if n != 2 {
 		t.Errorf("problems = %d\n%s", n, report)
 	}
 }
