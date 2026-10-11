@@ -6,16 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 
 	"github.com/krakenkey/connector/pkg/plugin"
 )
 
-// Permission hints for 403 answers. Azure's own message names the exact
-// action that was denied; these say where to grant it.
+// Permission hints for 403 answers. The denied action Azure names is added
+// to the error; these say where to grant it.
 const (
 	readPermission  = "the connector's Azure identity needs Microsoft.Network/applicationGateways/read on the gateway"
 	writePermission = "the connector's Azure identity needs Microsoft.Network/applicationGateways/write on the gateway, " +
@@ -31,11 +34,17 @@ const (
 	opUpdate
 )
 
-// armError describes an ARM error response in one line.
+// armError describes an ARM error response in one line. It keeps the
+// status, the error code and the actions Azure says were denied, but not
+// Azure's message: for a denied request it names the caller's object and
+// application ids, its tenant and the resource's subscription, which must
+// not end up in logs or status reports.
 type armError struct {
-	Status  int
-	Code    string
-	Message string
+	Status int
+	Code   string
+	// Denied lists the actions the message says the caller may not
+	// perform, such as Microsoft.Network/applicationGateways/write.
+	Denied []string
 }
 
 func (e armError) String() string {
@@ -48,8 +57,8 @@ func (e armError) String() string {
 	if e.Code != "" {
 		s = strings.TrimSpace(s + " " + e.Code)
 	}
-	if e.Message != "" {
-		s += ": " + oneLine(e.Message)
+	if len(e.Denied) > 0 {
+		s += ", denied action " + strings.Join(e.Denied, " and ")
 	}
 	return s
 }
@@ -64,10 +73,64 @@ func responseError(err error) (armError, bool) {
 	ae := armError{Status: re.StatusCode, Code: re.ErrorCode}
 	if re.RawResponse != nil {
 		if body, rerr := runtime.Payload(re.RawResponse); rerr == nil {
-			ae.Code, ae.Message = errorBody(body, ae.Code)
+			var msg string
+			ae.Code, msg = errorBody(body, ae.Code)
+			ae.Denied = deniedActions(msg)
 		}
 	}
 	return ae, true
+}
+
+// deniedRE finds the actions in ARM authorization failures: "does not have
+// authorization to perform action 'X'" and, for linked resources, "does not
+// have permission to perform action 'X'".
+var deniedRE = regexp.MustCompile(`does not have (?:authorization|permission) to perform action '([A-Za-z0-9./_-]+)'`)
+
+func deniedActions(msg string) []string {
+	var out []string
+	for _, m := range deniedRE.FindAllStringSubmatch(msg, -1) {
+		if !slices.Contains(out, m[1]) {
+			out = append(out, m[1])
+		}
+	}
+	return out
+}
+
+var (
+	aadCodeRE = regexp.MustCompile(`AADSTS[0-9]+`)
+	guidRE    = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+	issuerRE  = regexp.MustCompile(`https://sts\.windows\.net/[^\s/]+/?`)
+)
+
+// scrub removes what identifies the caller, its tenant or subscription
+// from error text that comes from the Azure SDK: GUIDs and token issuer
+// URLs. The same helper lives in the azure-keyvault plugin; plugin modules
+// share only the core module.
+func scrub(s string) string {
+	s = issuerRE.ReplaceAllString(s, "<issuer>")
+	return guidRE.ReplaceAllString(s, "<id>")
+}
+
+// credentialError describes a failure to get a token: the HTTP status and
+// the Microsoft Entra error code (AADSTS...), nothing else from the answer.
+// ok is false for other errors.
+func credentialError(err error) (msg string, transient, ok bool) {
+	var authErr *azidentity.AuthenticationFailedError
+	if !errors.As(err, &authErr) {
+		return "", false, false
+	}
+	resp := authErr.RawResponse
+	if resp == nil {
+		return "getting an Azure token failed", true, true
+	}
+	detail := fmt.Sprintf("HTTP %d", resp.StatusCode)
+	if code := aadCodeRE.FindString(err.Error()); code != "" {
+		detail += ", " + code
+	}
+	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
+		return "getting an Azure token failed (" + detail + ")", true, true
+	}
+	return "Azure rejected the credential (" + detail + ")", false, true
 }
 
 // errorBody reads the ARM error envelope ({"error":{"code","message"}}),
@@ -107,12 +170,19 @@ func classify(op opKind, cfg Config, err error) error {
 	where := fmt.Sprintf("%s application gateway %s/%s", what, cfg.ResourceGroup, cfg.Gateway)
 
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return fmt.Errorf("%w: %s: timed out: %v", plugin.ErrUnavailable, where, err)
+		return fmt.Errorf("%w: %s: timed out: %s", plugin.ErrUnavailable, where, scrub(err.Error()))
+	}
+	if msg, transient, ok := credentialError(err); ok {
+		kind := plugin.ErrPermanent
+		if transient {
+			kind = plugin.ErrUnavailable
+		}
+		return fmt.Errorf("%w: %s: %s", kind, where, msg)
 	}
 	ae, ok := responseError(err)
 	if !ok {
 		// Network errors, credential errors and the like.
-		return fmt.Errorf("%w: %s: %s", plugin.ErrUnavailable, where, oneLine(err.Error()))
+		return fmt.Errorf("%w: %s: %s", plugin.ErrUnavailable, where, scrub(oneLine(err.Error())))
 	}
 	switch {
 	case ae.Status == http.StatusForbidden:

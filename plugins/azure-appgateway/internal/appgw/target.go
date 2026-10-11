@@ -446,7 +446,10 @@ func describe(err error) string {
 	if ae, ok := responseError(err); ok {
 		return ae.String()
 	}
-	return oneLine(err.Error())
+	if msg, _, ok := credentialError(err); ok {
+		return msg
+	}
+	return scrub(oneLine(err.Error()))
 }
 
 func retryAfter(resp *http.Response) time.Duration {
@@ -605,7 +608,7 @@ func (t *Target) credential() (azcore.TokenCredential, error) {
 		t.cred, t.credErr = azidentity.NewDefaultAzureCredential(nil)
 	})
 	if t.credErr != nil {
-		return nil, fmt.Errorf("%w: no usable Azure credential: %v", plugin.ErrPermanent, t.credErr)
+		return nil, fmt.Errorf("%w: no usable Azure credential: %s", plugin.ErrPermanent, scrub(t.credErr.Error()))
 	}
 	return t.cred, nil
 }

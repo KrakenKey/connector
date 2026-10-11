@@ -101,6 +101,14 @@ protocol and the KrakenKey API the connector uses.
   but then.exec failed afterwards" (it said "files rolled back"), since
   not every target has files.
 
+### Changed
+
+- `azure-appgateway`: errors keep the HTTP status, Azure's error code and
+  the denied action, but no longer Azure's message, which names the
+  caller's application and object ids, its tenant and the subscription.
+  Token errors keep the HTTP status and the `AADSTS` code; ids and token
+  issuer URLs are removed from other Azure SDK error text.
+
 ## [v0.1.0] - 2026-10-10
 
 First release: the connector, its plugin protocol and Go SDK, and three
