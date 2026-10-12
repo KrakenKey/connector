@@ -1,0 +1,983 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.48.1.52935",
+      "templateHash": "10644526634339758298"
+    },
+    "info": {
+      "title": "KrakenKey connector",
+      "description": "Runs the KrakenKey connector on an Ubuntu VM that renews certificates into Azure Key Vault and, optionally, an Application Gateway."
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Location for all resources."
+      }
+    },
+    "vmName": {
+      "type": "string",
+      "defaultValue": "krakenkey-connector",
+      "minLength": 1,
+      "maxLength": 52,
+      "metadata": {
+        "description": "Name of the virtual machine. Also used as the prefix of the other resources' names."
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_B2ats_v2",
+      "allowedValues": [
+        "Standard_B2ats_v2",
+        "Standard_B2als_v2",
+        "Standard_B1s",
+        "Standard_B1ms",
+        "Standard_B2s"
+      ],
+      "metadata": {
+        "description": "Size of the virtual machine. The connector needs very little: the smallest sizes are enough."
+      }
+    },
+    "osDiskType": {
+      "type": "string",
+      "defaultValue": "StandardSSD_LRS",
+      "allowedValues": [
+        "StandardSSD_LRS",
+        "Standard_LRS",
+        "Premium_LRS"
+      ],
+      "metadata": {
+        "description": "Type of the OS disk."
+      }
+    },
+    "adminUsername": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the administrator account on the VM. Sign-in is by SSH key only."
+      }
+    },
+    "adminSshPublicKey": {
+      "type": "string",
+      "metadata": {
+        "description": "SSH public key for the administrator account."
+      }
+    },
+    "enrollmentToken": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Enrollment token for the connector (kkce_...), from the KrakenKey dashboard. It works once and expires after 24 hours."
+      }
+    },
+    "apiUrl": {
+      "type": "string",
+      "defaultValue": "https://api.krakenkey.io",
+      "metadata": {
+        "description": "KrakenKey API URL."
+      }
+    },
+    "certificates": {
+      "type": "array",
+      "metadata": {
+        "description": "The certificates to manage. Each item: id (KrakenKey certificate id), names (the certificate's DNS names, comma separated, exactly as in KrakenKey), keyVaultCertificateName (the Key Vault certificate to keep the key and certificate in), and when an Application Gateway is used, appGatewaySslCertificate (the name of the gateway's SSL certificate entry; empty to leave the certificate off the gateway) and verifyHost (a name to check the gateway with after each deployment; empty for no check)."
+      }
+    },
+    "keyType": {
+      "type": "string",
+      "defaultValue": "rsa-2048",
+      "allowedValues": [
+        "rsa-2048",
+        "rsa-3072",
+        "rsa-4096",
+        "ecdsa-p256",
+        "ecdsa-p384"
+      ],
+      "metadata": {
+        "description": "Key type for new keys. Application Gateway needs an RSA key."
+      }
+    },
+    "keyVaultId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource id of the Key Vault the connector keeps keys and certificates in."
+      }
+    },
+    "keyVaultUseRbac": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "The Key Vault uses Azure RBAC. Set to false for a vault that uses access policies."
+      }
+    },
+    "keyExportable": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Let Key Vault release the private key (exportable). Application Gateway needs it."
+      }
+    },
+    "allowKeyVaultRollback": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Also let the connector import certificates and read certificate secrets in the vault, so it can put a previous certificate back after a rollback. This lets the VM read every secret in the vault."
+      }
+    },
+    "appGatewayId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource id of an Application Gateway v2 to deploy certificates to, or an empty string for none."
+      }
+    },
+    "appGatewaySubnetIds": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Resource ids of the subnets the gateway is in."
+      }
+    },
+    "appGatewayPublicIpIds": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Resource ids of the gateway's public IP addresses."
+      }
+    },
+    "appGatewayFirewallPolicyId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource id of the gateway's own WAF policy, or an empty string."
+      }
+    },
+    "appGatewayFirewallPolicyIds": {
+      "type": "array",
+      "defaultValue": [],
+      "metadata": {
+        "description": "Resource ids of the WAF policies of the gateway's listeners."
+      }
+    },
+    "appGatewayIdentityId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource id of the gateway's user-assigned managed identity."
+      }
+    },
+    "grantAppGatewayVaultAccess": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Give the gateway's identity read access to the vault's secrets (Key Vault Secrets User, or a secret Get access policy), which it needs to load certificates from the vault."
+      }
+    },
+    "virtualNetworkNewOrExisting": {
+      "type": "string",
+      "defaultValue": "new",
+      "allowedValues": [
+        "new",
+        "existing"
+      ],
+      "metadata": {
+        "description": "Create a new virtual network, or use an existing one."
+      }
+    },
+    "virtualNetworkName": {
+      "type": "string",
+      "defaultValue": "[format('{0}-vnet', parameters('vmName'))]",
+      "metadata": {
+        "description": "Name of the virtual network."
+      }
+    },
+    "virtualNetworkResourceGroup": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().name]",
+      "metadata": {
+        "description": "Resource group of an existing virtual network."
+      }
+    },
+    "virtualNetworkAddressPrefixes": {
+      "type": "array",
+      "defaultValue": [
+        "10.0.0.0/24"
+      ],
+      "metadata": {
+        "description": "Address prefixes of a new virtual network."
+      }
+    },
+    "subnetName": {
+      "type": "string",
+      "defaultValue": "connector",
+      "metadata": {
+        "description": "Name of the subnet for the VM."
+      }
+    },
+    "subnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.0.0.0/27",
+      "metadata": {
+        "description": "Address prefix of the subnet, in a new virtual network."
+      }
+    },
+    "outboundAccess": {
+      "type": "string",
+      "defaultValue": "natGateway",
+      "allowedValues": [
+        "natGateway",
+        "defaultOutboundAccess"
+      ],
+      "metadata": {
+        "description": "How the VM reaches the internet in a new virtual network: a NAT gateway (recommended), or Azure's default outbound access, which is free but being retired for new networks. An existing network must already provide outbound access."
+      }
+    }
+  },
+  "variables": {
+    "copy": [
+      {
+        "name": "connectorCertificates",
+        "count": "[length(parameters('certificates'))]",
+        "input": "[union(createObject('id', int(parameters('certificates')[copyIndex('connectorCertificates')].id), 'names', filter(map(split(string(parameters('certificates')[copyIndex('connectorCertificates')].names), ','), lambda('name', trim(lambdaVariables('name')))), lambda('name', not(empty(lambdaVariables('name'))))), 'key_store', createObject('plugin', 'azure-keyvault', 'key_type', parameters('keyType'), 'vault', variables('keyVaultName'), 'certificate_name', parameters('certificates')[copyIndex('connectorCertificates')].keyVaultCertificateName, 'exportable', parameters('keyExportable'))), if(and(variables('useAppGateway'), not(empty(coalesce(tryGet(parameters('certificates')[copyIndex('connectorCertificates')], 'appGatewaySslCertificate'), '')))), createObject('targets', createArray(union(createObject('label', 'app-gateway', 'plugin', 'azure-appgateway', 'subscription_id', variables('appGatewaySubscription'), 'resource_group', variables('appGatewayResourceGroup'), 'gateway', variables('appGatewayName'), 'ssl_certificate', parameters('certificates')[copyIndex('connectorCertificates')].appGatewaySslCertificate), if(empty(coalesce(tryGet(parameters('certificates')[copyIndex('connectorCertificates')], 'verifyHost'), '')), createObject(), createObject('verify', createObject('host', parameters('certificates')[copyIndex('connectorCertificates')].verifyHost)))))), createObject()))]"
+      }
+    ],
+    "$fxv#0": "#cloud-config\n# Written by deploy/azure/main.bicep. main.bicep fills in the base64 values:\n# 0 is bootstrap.sh, 1 the enrollment token, 2 the connector config as JSON.\n# Only root can read the files. The token is not part of any command line,\n# so cloud-init does not log it, and bootstrap.sh deletes it after enrolling.\nwrite_files:\n  - path: /var/lib/krakenkey-azure/bootstrap.sh\n    owner: root:root\n    permissions: '0700'\n    encoding: b64\n    content: {0}\n  - path: /var/lib/krakenkey-azure/enrollment-token\n    owner: root:root\n    permissions: '0600'\n    encoding: b64\n    content: {1}\n  - path: /var/lib/krakenkey-azure/config.json\n    owner: root:root\n    permissions: '0600'\n    encoding: b64\n    content: {2}\nruncmd:\n  - [/var/lib/krakenkey-azure/bootstrap.sh]\n",
+    "$fxv#1": "#!/bin/bash\n# Sets up the KrakenKey connector on a VM created by the Azure template\n# (deploy/azure). cloud-init runs it once, as root, on the first boot. It:\n#\n#   1. adds the signed apt repository at packages.krakenkey.io, after\n#      checking the signing key's fingerprint, and installs the connector;\n#   2. writes /etc/krakenkey-connector/config.yaml from the template's\n#      settings, and tells the Azure plugins to use the VM's managed identity;\n#   3. lets unattended-upgrades upgrade the connector from that repository;\n#   4. checks the config, enrolls the connector as its service user with\n#      the one-time enrollment token, and deletes the token;\n#   5. waits for the connector's Azure role assignments to work (they are\n#      created after the VM, and take a few minutes to apply), then enables\n#      and starts the service.\n#\n# Output goes to /var/log/cloud-init-output.log. The enrollment token is\n# never printed or put on a command line.\nset -euo pipefail\numask 077\n\nSTATE_DIR=/var/lib/krakenkey-azure\nTOKEN_STAGED=\"$STATE_DIR/enrollment-token\"\nCONFIG_JSON=\"$STATE_DIR/config.json\"\nETC_DIR=/etc/krakenkey-connector\nCONFIG=\"$ETC_DIR/config.yaml\"\nTOKEN_FILE=\"$ETC_DIR/enrollment-token\"\nENV_FILE=/etc/default/krakenkey-connector\nDATA_DIR=/var/lib/krakenkey-connector\nSERVICE_USER=krakenkey-connector\nKEYRING_URL=https://packages.krakenkey.io/keys/krakenkey-archive-keyring.deb\n# The repository's signing key, as published in the connector README.\nKEY_FINGERPRINT=386E25582384DD74692A4EE9F7BA53A4E94FA5DA\n# How long to wait for the role assignments to work, and how often to check.\nVALIDATE_TIMEOUT=1800\nVALIDATE_DELAY=30\n\nexport DEBIAN_FRONTEND=noninteractive\nAPT=(apt-get -q -y -o DPkg::Lock::Timeout=600)\n\nlog() { echo \"krakenkey-bootstrap: $*\"; }\n\nwork=\"\"\ncleanup() {\n\trm -f \"$TOKEN_STAGED\" \"$TOKEN_FILE\"\n\tif [ -n \"$work\" ]; then rm -rf \"$work\"; fi\n}\ntrap cleanup EXIT\n\n# retry runs a command up to 10 times with growing delays, for network\n# hiccups during the first boot.\nretry() {\n\tlocal n=1\n\tuntil \"$@\"; do\n\t\tif [ \"$n\" -ge 10 ]; then return 1; fi\n\t\tsleep $((n * 6))\n\t\tn=$((n + 1))\n\tdone\n}\n\n# as_connector runs the connector as its service user, with the service's\n# environment file loaded the way systemd loads it for the service.\nas_connector() {\n\t# shellcheck disable=SC2016 # $0 and $@ are for the inner shell.\n\trunuser -u \"$SERVICE_USER\" -- sh -c 'set -a; . \"$0\"; exec krakenkey-connector \"$@\"' \"$ENV_FILE\" \"$@\"\n}\n\nchmod 0700 \"$STATE_DIR\"\n\nif [ -e \"$STATE_DIR/done\" ]; then\n\tlog \"already set up; nothing to do\"\n\texit 0\nfi\n\n# 1. Repository and package.\nwork=$(mktemp -d)\nlog \"adding the packages.krakenkey.io apt repository\"\nretry curl -fsSL --proto '=https' --tlsv1.2 -o \"$work/keyring.deb\" \"$KEYRING_URL\"\ndpkg-deb -x \"$work/keyring.deb\" \"$work/keyring\"\nfingerprint=$(gpg --batch --no-default-keyring --with-colons --show-keys \\\n\t\"$work/keyring/usr/share/keyrings/krakenkey.gpg\" 2>/dev/null | awk -F: '$1 == \"fpr\" { print $10; exit }')\nif [ \"$fingerprint\" != \"$KEY_FINGERPRINT\" ]; then\n\tlog \"the keyring package has signing key '$fingerprint', expected $KEY_FINGERPRINT; stopping\"\n\texit 1\nfi\nretry \"${APT[@]}\" install \"$work/keyring.deb\"\nretry \"${APT[@]}\" update\nlog \"installing krakenkey-connector\"\nretry \"${APT[@]}\" install krakenkey-connector\nkrakenkey-connector version\n\n# 2. Config and environment.\nlog \"writing $CONFIG\"\npython3 - \"$CONFIG_JSON\" >\"$work/config.yaml\" <<'PY'\nimport json\nimport sys\n\nimport yaml\n\nwith open(sys.argv[1], encoding=\"utf-8\") as f:\n    config = json.load(f)\nprint(\"# Written by the KrakenKey connector Azure template on the first boot.\")\nprint(\"# Edit it as described in https://github.com/KrakenKey/connector#configuration,\")\nprint(\"# check it with:\")\nprint(\"#   sudo -u krakenkey-connector sh -c 'set -a; . /etc/default/krakenkey-connector; exec krakenkey-connector validate'\")\nprint(\"# then run: sudo systemctl restart krakenkey-connector\")\nprint()\nyaml.safe_dump(config, sys.stdout, sort_keys=False, default_flow_style=False)\nPY\ninstall -m 0640 -o root -g \"$SERVICE_USER\" \"$work/config.yaml\" \"$CONFIG\"\n\n# The Azure plugins use the VM's system-assigned managed identity.\nif ! grep -q '^AZURE_TOKEN_CREDENTIALS=' \"$ENV_FILE\"; then\n\tprintf '\\n# Set by the Azure template: use the VM'\"'\"'s managed identity.\\nAZURE_TOKEN_CREDENTIALS=ManagedIdentityCredential\\n' >>\"$ENV_FILE\"\nfi\n\n# 3. Unattended upgrades. Ubuntu's unattended-upgrades only takes Ubuntu's\n# own security updates by default; this adds the KrakenKey repository. The\n# connector's config files are edited here, so dpkg is told to keep them\n# on upgrades instead of asking (unattended-upgrades skips packages that\n# would ask). The package restarts the service after an upgrade.\nlog \"enabling unattended upgrades for krakenkey-connector\"\ncat >/etc/apt/apt.conf.d/52krakenkey-connector <<'APTCONF'\n// Written by the KrakenKey connector Azure template.\n// Upgrade the connector from packages.krakenkey.io automatically.\nUnattended-Upgrade::Origins-Pattern {\n\t\"origin=KrakenKey,label=KrakenKey,suite=stable\";\n};\nAPT::Periodic::Update-Package-Lists \"1\";\nAPT::Periodic::Unattended-Upgrade \"1\";\n// Keep edited config files (such as /etc/krakenkey-connector/config.yaml)\n// on upgrades instead of prompting.\nDpkg::Options {\n\t\"--force-confdef\";\n\t\"--force-confold\";\n};\nAPTCONF\nchmod 0644 /etc/apt/apt.conf.d/52krakenkey-connector\n\n# 4. Check the config, then enroll.\nlog \"checking the config\"\noffline_status=0\noffline_output=$(as_connector validate --offline 2>&1) || offline_status=$?\necho \"$offline_output\"\nif grep -q '^Config .*: INVALID' <<<\"$offline_output\"; then\n\tlog \"the config is invalid; not enrolling. Fix $CONFIG, then enroll by hand with a new token (see deploy/azure/README.md)\"\n\texit 1\nfi\nif [ \"$offline_status\" -ne 0 ]; then\n\tlog \"validate --offline reported problems; the role assignments may not be in effect yet, continuing\"\nfi\n\nif [ -e \"$DATA_DIR/identity\" ]; then\n\tlog \"the connector is already enrolled\"\nelse\n\tlog \"enrolling the connector\"\n\tinstall -m 0640 -o root -g \"$SERVICE_USER\" \"$TOKEN_STAGED\" \"$TOKEN_FILE\"\n\trm -f \"$TOKEN_STAGED\"\n\tenroll_status=0\n\trunuser -u \"$SERVICE_USER\" -- env KK_ENROLLMENT_TOKEN_FILE=\"$TOKEN_FILE\" \\\n\t\tkrakenkey-connector enroll || enroll_status=$?\n\trm -f \"$TOKEN_FILE\"\n\tif [ \"$enroll_status\" -ne 0 ]; then\n\t\tlog \"enrollment failed (exit code $enroll_status); create a new enrollment token and enroll by hand (see deploy/azure/README.md)\"\n\t\texit 1\n\tfi\nfi\nrm -f \"$TOKEN_STAGED\" \"$TOKEN_FILE\"\n\n# 5. Wait for the role assignments, then start the service.\nlog \"waiting for the connector's Azure permissions (up to $((VALIDATE_TIMEOUT / 60)) minutes)\"\nvalidated=0\ndeadline=$((SECONDS + VALIDATE_TIMEOUT))\nwhile :; do\n\tstatus=0\n\toutput=$(as_connector validate 2>&1) || status=$?\n\tif [ \"$status\" -eq 0 ]; then\n\t\techo \"$output\"\n\t\tvalidated=1\n\t\tbreak\n\tfi\n\tif [ \"$SECONDS\" -ge \"$deadline\" ]; then\n\t\techo \"$output\"\n\t\tbreak\n\tfi\n\tsleep \"$VALIDATE_DELAY\"\ndone\nif [ \"$validated\" -eq 1 ]; then\n\tlog \"validate passed\"\nelse\n\tlog \"validate still reports problems (above); starting the service anyway, it retries on its own\"\nfi\n\nsystemctl enable --now krakenkey-connector.service\ntouch \"$STATE_DIR/done\"\nlog \"done: the connector is running (journalctl -u krakenkey-connector)\"\n",
+    "partnerAttributionId": "00000000-0000-0000-0000-000000000000",
+    "newNetwork": "[equals(parameters('virtualNetworkNewOrExisting'), 'new')]",
+    "useNatGateway": "[and(variables('newNetwork'), equals(parameters('outboundAccess'), 'natGateway'))]",
+    "useAppGateway": "[not(empty(parameters('appGatewayId')))]",
+    "keyVaultParts": "[split(parameters('keyVaultId'), '/')]",
+    "keyVaultSubscription": "[toLower(variables('keyVaultParts')[2])]",
+    "keyVaultResourceGroup": "[variables('keyVaultParts')[4]]",
+    "keyVaultName": "[last(variables('keyVaultParts'))]",
+    "appGatewayParts": "[split(parameters('appGatewayId'), '/')]",
+    "appGatewaySubscription": "[if(variables('useAppGateway'), toLower(variables('appGatewayParts')[2]), variables('keyVaultSubscription'))]",
+    "appGatewayResourceGroup": "[if(variables('useAppGateway'), variables('appGatewayParts')[4], variables('keyVaultResourceGroup'))]",
+    "appGatewayName": "[if(variables('useAppGateway'), last(variables('appGatewayParts')), '')]",
+    "appGatewayLinkedIds": "[if(variables('useAppGateway'), map(union(parameters('appGatewaySubnetIds'), parameters('appGatewayPublicIpIds'), parameters('appGatewayFirewallPolicyIds'), if(empty(parameters('appGatewayFirewallPolicyId')), createArray(), createArray(parameters('appGatewayFirewallPolicyId'))), if(empty(parameters('appGatewayIdentityId')), createArray(), createArray(parameters('appGatewayIdentityId')))), lambda('id', toLower(lambdaVariables('id')))), createArray())]",
+    "linkedSubscriptions": "[map(variables('appGatewayLinkedIds'), lambda('id', split(lambdaVariables('id'), '/')[2]))]",
+    "roleSubscriptions": "[union(if(parameters('keyVaultUseRbac'), createArray(variables('keyVaultSubscription')), createArray()), if(variables('useAppGateway'), createArray(variables('appGatewaySubscription')), createArray()), variables('linkedSubscriptions'))]",
+    "keyVaultRoleId": "[format('/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}', variables('keyVaultSubscription'), guid(format('/subscriptions/{0}', variables('keyVaultSubscription')), 'krakenkey-connector-keyvault'))]",
+    "keyVaultRollbackRoleId": "[format('/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}', variables('keyVaultSubscription'), guid(format('/subscriptions/{0}', variables('keyVaultSubscription')), 'krakenkey-connector-keyvault-rollback'))]",
+    "appGatewayRoleId": "[format('/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}', variables('appGatewaySubscription'), guid(format('/subscriptions/{0}', variables('appGatewaySubscription')), 'krakenkey-connector-appgateway'))]",
+    "connectorConfig": {
+      "krakenkey": {
+        "api_url": "[parameters('apiUrl')]"
+      },
+      "check_interval": "6h",
+      "data_dir": "/var/lib/krakenkey-connector",
+      "plugins": "[union(createObject('azure-keyvault', createObject()), if(variables('useAppGateway'), createObject('azure-appgateway', createObject('call_timeout', '15m')), createObject()))]",
+      "certificates": "[variables('connectorCertificates')]"
+    },
+    "cloudInit": "[format(variables('$fxv#0'), base64(variables('$fxv#1')), base64(parameters('enrollmentToken')), base64(string(variables('connectorConfig'))))]",
+    "subnetId": "[if(variables('newNetwork'), resourceId('Microsoft.Network/virtualNetworks/subnets', parameters('virtualNetworkName'), parameters('subnetName')), resourceId(parameters('virtualNetworkResourceGroup'), 'Microsoft.Network/virtualNetworks/subnets', parameters('virtualNetworkName'), parameters('subnetName')))]",
+    "deploymentSuffix": "[uniqueString(resourceGroup().id, parameters('vmName'))]"
+  },
+  "resources": [
+    {
+      "condition": "[variables('useNatGateway')]",
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2025-05-01",
+      "name": "[format('{0}-nat-ip', parameters('vmName'))]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "publicIPAddressVersion": "IPv4"
+      }
+    },
+    {
+      "condition": "[variables('useNatGateway')]",
+      "type": "Microsoft.Network/natGateways",
+      "apiVersion": "2025-05-01",
+      "name": "[format('{0}-nat', parameters('vmName'))]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "idleTimeoutInMinutes": 4,
+        "publicIpAddresses": [
+          {
+            "id": "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-nat-ip', parameters('vmName')))]"
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-nat-ip', parameters('vmName')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2025-05-01",
+      "name": "[format('{0}-nsg', parameters('vmName'))]",
+      "location": "[parameters('location')]",
+      "properties": {}
+    },
+    {
+      "condition": "[variables('newNetwork')]",
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2025-05-01",
+      "name": "[parameters('virtualNetworkName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": "[parameters('virtualNetworkAddressPrefixes')]"
+        },
+        "subnets": [
+          {
+            "name": "[parameters('subnetName')]",
+            "properties": "[union(createObject('addressPrefix', parameters('subnetAddressPrefix'), 'networkSecurityGroup', createObject('id', resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nsg', parameters('vmName')))), 'defaultOutboundAccess', not(variables('useNatGateway'))), if(variables('useNatGateway'), createObject('natGateway', createObject('id', resourceId('Microsoft.Network/natGateways', format('{0}-nat', parameters('vmName'))))), createObject()))]"
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/natGateways', format('{0}-nat', parameters('vmName')))]",
+        "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nsg', parameters('vmName')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2025-05-01",
+      "name": "[format('{0}-nic', parameters('vmName'))]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[variables('subnetId')]"
+              }
+            }
+          }
+        ],
+        "networkSecurityGroup": {
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nsg', parameters('vmName')))]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nsg', parameters('vmName')))]",
+        "[resourceId('Microsoft.Network/virtualNetworks', parameters('virtualNetworkName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2025-04-01",
+      "name": "[parameters('vmName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "Canonical",
+            "offer": "ubuntu-24_04-lts",
+            "sku": "server",
+            "version": "latest"
+          },
+          "osDisk": {
+            "name": "[format('{0}-osdisk', parameters('vmName'))]",
+            "createOption": "FromImage",
+            "deleteOption": "Delete",
+            "managedDisk": {
+              "storageAccountType": "[parameters('osDiskType')]"
+            }
+          }
+        },
+        "osProfile": {
+          "computerName": "[parameters('vmName')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "customData": "[base64(variables('cloudInit'))]",
+          "linuxConfiguration": {
+            "disablePasswordAuthentication": true,
+            "ssh": {
+              "publicKeys": [
+                {
+                  "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                  "keyData": "[parameters('adminSshPublicKey')]"
+                }
+              ]
+            },
+            "provisionVMAgent": true
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-nic', parameters('vmName')))]",
+              "properties": {
+                "deleteOption": "Delete"
+              }
+            }
+          ]
+        },
+        "securityProfile": {
+          "securityType": "TrustedLaunch",
+          "uefiSettings": {
+            "secureBootEnabled": true,
+            "vTpmEnabled": true
+          }
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-nic', parameters('vmName')))]"
+      ]
+    },
+    {
+      "condition": "[not(equals(variables('partnerAttributionId'), '00000000-0000-0000-0000-000000000000'))]",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "[format('pid-{0}', variables('partnerAttributionId'))]",
+      "properties": {
+        "mode": "Incremental",
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "resources": []
+        }
+      }
+    },
+    {
+      "copy": {
+        "name": "roles",
+        "count": "[length(variables('roleSubscriptions'))]"
+      },
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "[format('kk-roles-{0}', uniqueString(variables('roleSubscriptions')[copyIndex()], variables('deploymentSuffix')))]",
+      "subscriptionId": "[variables('roleSubscriptions')[copyIndex()]]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "keyVaultRoles": {
+            "value": "[and(parameters('keyVaultUseRbac'), equals(variables('roleSubscriptions')[copyIndex()], variables('keyVaultSubscription')))]"
+          },
+          "appGatewayRole": {
+            "value": "[and(variables('useAppGateway'), equals(variables('roleSubscriptions')[copyIndex()], variables('appGatewaySubscription')))]"
+          },
+          "linkedResourcesRole": {
+            "value": "[contains(variables('linkedSubscriptions'), variables('roleSubscriptions')[copyIndex()])]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.48.1.52935",
+              "templateHash": "8186258164976497959"
+            }
+          },
+          "parameters": {
+            "keyVaultRoles": {
+              "type": "bool",
+              "metadata": {
+                "description": "Create the Key Vault roles in this subscription."
+              }
+            },
+            "appGatewayRole": {
+              "type": "bool",
+              "metadata": {
+                "description": "Create the Application Gateway role in this subscription."
+              }
+            },
+            "linkedResourcesRole": {
+              "type": "bool",
+              "metadata": {
+                "description": "Create the Application Gateway linked resources role in this subscription."
+              }
+            }
+          },
+          "variables": {
+            "scopes": [
+              "[subscription().id]"
+            ],
+            "suffix": "[format(' ({0})', subscription().subscriptionId)]"
+          },
+          "resources": [
+            {
+              "condition": "[parameters('keyVaultRoles')]",
+              "type": "Microsoft.Authorization/roleDefinitions",
+              "apiVersion": "2022-04-01",
+              "name": "[guid(subscription().id, 'krakenkey-connector-keyvault')]",
+              "properties": {
+                "roleName": "[format('KrakenKey connector Key Vault{0}', variables('suffix'))]",
+                "description": "Create, merge and read Key Vault certificates for the KrakenKey connector.",
+                "type": "CustomRole",
+                "assignableScopes": "[variables('scopes')]",
+                "permissions": [
+                  {
+                    "dataActions": [
+                      "Microsoft.KeyVault/vaults/certificates/read",
+                      "Microsoft.KeyVault/vaults/certificates/create/action",
+                      "Microsoft.KeyVault/vaults/certificates/update/action"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "condition": "[parameters('keyVaultRoles')]",
+              "type": "Microsoft.Authorization/roleDefinitions",
+              "apiVersion": "2022-04-01",
+              "name": "[guid(subscription().id, 'krakenkey-connector-keyvault-rollback')]",
+              "properties": {
+                "roleName": "[format('KrakenKey connector Key Vault rollback{0}', variables('suffix'))]",
+                "description": "Import Key Vault certificates and read their secrets, so the KrakenKey connector can put a certificate back after a rollback.",
+                "type": "CustomRole",
+                "assignableScopes": "[variables('scopes')]",
+                "permissions": [
+                  {
+                    "dataActions": [
+                      "Microsoft.KeyVault/vaults/certificates/import/action",
+                      "Microsoft.KeyVault/vaults/secrets/getSecret/action"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "condition": "[parameters('appGatewayRole')]",
+              "type": "Microsoft.Authorization/roleDefinitions",
+              "apiVersion": "2022-04-01",
+              "name": "[guid(subscription().id, 'krakenkey-connector-appgateway')]",
+              "properties": {
+                "roleName": "[format('KrakenKey Application Gateway certificate writer{0}', variables('suffix'))]",
+                "description": "Read and update Application Gateways.",
+                "type": "CustomRole",
+                "assignableScopes": "[variables('scopes')]",
+                "permissions": [
+                  {
+                    "actions": [
+                      "Microsoft.Network/applicationGateways/read",
+                      "Microsoft.Network/applicationGateways/write"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "condition": "[parameters('linkedResourcesRole')]",
+              "type": "Microsoft.Authorization/roleDefinitions",
+              "apiVersion": "2022-04-01",
+              "name": "[guid(subscription().id, 'krakenkey-connector-appgateway-linked')]",
+              "properties": {
+                "roleName": "[format('KrakenKey Application Gateway linked resources{0}', variables('suffix'))]",
+                "description": "Let an Application Gateway update keep its subnet, public IP, WAF policy and identity.",
+                "type": "CustomRole",
+                "assignableScopes": "[variables('scopes')]",
+                "permissions": [
+                  {
+                    "actions": [
+                      "Microsoft.Network/virtualNetworks/subnets/read",
+                      "Microsoft.Network/virtualNetworks/subnets/join/action",
+                      "Microsoft.Network/publicIPAddresses/read",
+                      "Microsoft.Network/publicIPAddresses/join/action",
+                      "Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies/read",
+                      "Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies/join/action",
+                      "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "[format('kk-keyvault-{0}', variables('deploymentSuffix'))]",
+      "subscriptionId": "[variables('keyVaultSubscription')]",
+      "resourceGroup": "[variables('keyVaultResourceGroup')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "vaultName": {
+            "value": "[variables('keyVaultName')]"
+          },
+          "principalId": {
+            "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', parameters('vmName')), '2025-04-01', 'full').identity.principalId]"
+          },
+          "useRbac": {
+            "value": "[parameters('keyVaultUseRbac')]"
+          },
+          "allowRollback": {
+            "value": "[parameters('allowKeyVaultRollback')]"
+          },
+          "keyVaultRoleId": {
+            "value": "[variables('keyVaultRoleId')]"
+          },
+          "keyVaultRollbackRoleId": {
+            "value": "[variables('keyVaultRollbackRoleId')]"
+          },
+          "appGatewayIdentityId": "[if(and(variables('useAppGateway'), parameters('grantAppGatewayVaultAccess')), createObject('value', parameters('appGatewayIdentityId')), createObject('value', ''))]"
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.48.1.52935",
+              "templateHash": "11465360345245358169"
+            }
+          },
+          "parameters": {
+            "vaultName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the Key Vault."
+              }
+            },
+            "principalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Object id of the connector's managed identity."
+              }
+            },
+            "useRbac": {
+              "type": "bool",
+              "metadata": {
+                "description": "The vault uses Azure RBAC rather than access policies."
+              }
+            },
+            "allowRollback": {
+              "type": "bool",
+              "metadata": {
+                "description": "Also allow importing certificates and reading their secrets, which a rollback needs."
+              }
+            },
+            "keyVaultRoleId": {
+              "type": "string",
+              "metadata": {
+                "description": "Id of the custom role with the key store permissions."
+              }
+            },
+            "keyVaultRollbackRoleId": {
+              "type": "string",
+              "metadata": {
+                "description": "Id of the custom role with the rollback permissions."
+              }
+            },
+            "appGatewayIdentityId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource id of the Application Gateway's user-assigned identity to give read access to the vault's secrets, or an empty string."
+              }
+            }
+          },
+          "variables": {
+            "secretsUserRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')]",
+            "grantGateway": "[not(empty(parameters('appGatewayIdentityId')))]",
+            "connectorPolicy": {
+              "tenantId": "[tenant().tenantId]",
+              "objectId": "[parameters('principalId')]",
+              "permissions": {
+                "certificates": "[concat(createArray('get', 'list', 'create', 'update'), if(parameters('allowRollback'), createArray('import'), createArray()))]",
+                "secrets": "[if(parameters('allowRollback'), createArray('get'), createArray())]"
+              }
+            }
+          },
+          "resources": [
+            {
+              "condition": "[parameters('useRbac')]",
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.KeyVault/vaults', parameters('vaultName'))]",
+              "name": "[guid(resourceId('Microsoft.KeyVault/vaults', parameters('vaultName')), parameters('principalId'), parameters('keyVaultRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[parameters('keyVaultRoleId')]",
+                "principalId": "[parameters('principalId')]",
+                "principalType": "ServicePrincipal",
+                "description": "KrakenKey connector: Key Vault key store."
+              }
+            },
+            {
+              "condition": "[and(parameters('useRbac'), parameters('allowRollback'))]",
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.KeyVault/vaults', parameters('vaultName'))]",
+              "name": "[guid(resourceId('Microsoft.KeyVault/vaults', parameters('vaultName')), parameters('principalId'), parameters('keyVaultRollbackRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[parameters('keyVaultRollbackRoleId')]",
+                "principalId": "[parameters('principalId')]",
+                "principalType": "ServicePrincipal",
+                "description": "KrakenKey connector: Key Vault rollback."
+              }
+            },
+            {
+              "condition": "[and(parameters('useRbac'), variables('grantGateway'))]",
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.KeyVault/vaults', parameters('vaultName'))]",
+              "name": "[guid(resourceId('Microsoft.KeyVault/vaults', parameters('vaultName')), toLower(parameters('appGatewayIdentityId')), variables('secretsUserRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[variables('secretsUserRoleId')]",
+                "principalId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', split(parameters('appGatewayIdentityId'), '/')[2], split(parameters('appGatewayIdentityId'), '/')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', last(split(parameters('appGatewayIdentityId'), '/'))), '2024-11-30').principalId]",
+                "principalType": "ServicePrincipal",
+                "description": "Application Gateway: read certificates from the vault."
+              }
+            },
+            {
+              "condition": "[not(parameters('useRbac'))]",
+              "type": "Microsoft.KeyVault/vaults/accessPolicies",
+              "apiVersion": "2025-05-01",
+              "name": "[format('{0}/{1}', parameters('vaultName'), 'add')]",
+              "properties": {
+                "accessPolicies": "[concat(createArray(variables('connectorPolicy')), if(variables('grantGateway'), createArray(createObject('tenantId', tenant().tenantId, 'objectId', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', split(parameters('appGatewayIdentityId'), '/')[2], split(parameters('appGatewayIdentityId'), '/')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', last(split(parameters('appGatewayIdentityId'), '/'))), '2024-11-30').principalId, 'permissions', createObject('secrets', createArray('get')))), createArray()))]"
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "roles",
+        "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]"
+      ]
+    },
+    {
+      "condition": "[variables('useAppGateway')]",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "[format('kk-appgw-{0}', variables('deploymentSuffix'))]",
+      "subscriptionId": "[variables('appGatewaySubscription')]",
+      "resourceGroup": "[variables('appGatewayResourceGroup')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "gatewayName": {
+            "value": "[variables('appGatewayName')]"
+          },
+          "principalId": {
+            "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', parameters('vmName')), '2025-04-01', 'full').identity.principalId]"
+          },
+          "roleId": {
+            "value": "[variables('appGatewayRoleId')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.48.1.52935",
+              "templateHash": "18418704412344171366"
+            }
+          },
+          "parameters": {
+            "gatewayName": {
+              "type": "string",
+              "metadata": {
+                "description": "Name of the Application Gateway."
+              }
+            },
+            "principalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Object id of the connector's managed identity."
+              }
+            },
+            "roleId": {
+              "type": "string",
+              "metadata": {
+                "description": "Id of the custom Application Gateway role."
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Network/applicationGateways', parameters('gatewayName'))]",
+              "name": "[guid(resourceId('Microsoft.Network/applicationGateways', parameters('gatewayName')), parameters('principalId'), parameters('roleId'))]",
+              "properties": {
+                "roleDefinitionId": "[parameters('roleId')]",
+                "principalId": "[parameters('principalId')]",
+                "principalType": "ServicePrincipal",
+                "description": "KrakenKey connector: update the gateway's SSL certificates."
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "roles",
+        "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]"
+      ]
+    },
+    {
+      "copy": {
+        "name": "linkedAccess",
+        "count": "[length(variables('appGatewayLinkedIds'))]"
+      },
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "[format('kk-appgw-linked-{0}-{1}', copyIndex(), variables('deploymentSuffix'))]",
+      "subscriptionId": "[split(variables('appGatewayLinkedIds')[copyIndex()], '/')[2]]",
+      "resourceGroup": "[split(variables('appGatewayLinkedIds')[copyIndex()], '/')[4]]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "resourceId": {
+            "value": "[variables('appGatewayLinkedIds')[copyIndex()]]"
+          },
+          "principalId": {
+            "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', parameters('vmName')), '2025-04-01', 'full').identity.principalId]"
+          },
+          "roleId": {
+            "value": "[format('/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}', split(variables('appGatewayLinkedIds')[copyIndex()], '/')[2], guid(format('/subscriptions/{0}', split(variables('appGatewayLinkedIds')[copyIndex()], '/')[2]), 'krakenkey-connector-appgateway-linked'))]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.48.1.52935",
+              "templateHash": "6129081070496508374"
+            }
+          },
+          "parameters": {
+            "resourceId": {
+              "type": "string",
+              "metadata": {
+                "description": "Resource id of the linked resource."
+              }
+            },
+            "principalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Object id of the connector's managed identity."
+              }
+            },
+            "roleId": {
+              "type": "string",
+              "metadata": {
+                "description": "Id of the custom linked resources role."
+              }
+            }
+          },
+          "variables": {
+            "parts": "[split(parameters('resourceId'), '/')]",
+            "provider": "[toLower(variables('parts')[6])]",
+            "type": "[toLower(variables('parts')[7])]",
+            "isSubnet": "[and(and(equals(variables('provider'), 'microsoft.network'), equals(variables('type'), 'virtualnetworks')), greater(length(variables('parts')), 10))]",
+            "isPublicIp": "[and(equals(variables('provider'), 'microsoft.network'), equals(variables('type'), 'publicipaddresses'))]",
+            "isWafPolicy": "[and(equals(variables('provider'), 'microsoft.network'), equals(variables('type'), 'applicationgatewaywebapplicationfirewallpolicies'))]",
+            "isIdentity": "[and(equals(variables('provider'), 'microsoft.managedidentity'), equals(variables('type'), 'userassignedidentities'))]",
+            "assignmentDescription": "KrakenKey connector: keep this resource linked when it updates the Application Gateway."
+          },
+          "resources": [
+            {
+              "condition": "[variables('isSubnet')]",
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('parts')[8], last(variables('parts')))]",
+              "name": "[guid(parameters('resourceId'), parameters('principalId'), parameters('roleId'))]",
+              "properties": {
+                "roleDefinitionId": "[parameters('roleId')]",
+                "principalId": "[parameters('principalId')]",
+                "principalType": "ServicePrincipal",
+                "description": "[variables('assignmentDescription')]"
+              }
+            },
+            {
+              "condition": "[variables('isPublicIp')]",
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Network/publicIPAddresses', variables('parts')[8])]",
+              "name": "[guid(parameters('resourceId'), parameters('principalId'), parameters('roleId'))]",
+              "properties": {
+                "roleDefinitionId": "[parameters('roleId')]",
+                "principalId": "[parameters('principalId')]",
+                "principalType": "ServicePrincipal",
+                "description": "[variables('assignmentDescription')]"
+              }
+            },
+            {
+              "condition": "[variables('isWafPolicy')]",
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies', variables('parts')[8])]",
+              "name": "[guid(parameters('resourceId'), parameters('principalId'), parameters('roleId'))]",
+              "properties": {
+                "roleDefinitionId": "[parameters('roleId')]",
+                "principalId": "[parameters('principalId')]",
+                "principalType": "ServicePrincipal",
+                "description": "[variables('assignmentDescription')]"
+              }
+            },
+            {
+              "condition": "[variables('isIdentity')]",
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('parts')[8])]",
+              "name": "[guid(parameters('resourceId'), parameters('principalId'), parameters('roleId'))]",
+              "properties": {
+                "roleDefinitionId": "[parameters('roleId')]",
+                "principalId": "[parameters('principalId')]",
+                "principalType": "ServicePrincipal",
+                "description": "[variables('assignmentDescription')]"
+              }
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "roles",
+        "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "vmName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the VM."
+      },
+      "value": "[parameters('vmName')]"
+    },
+    "principalId": {
+      "type": "string",
+      "metadata": {
+        "description": "Object id of the VM's managed identity, which the connector uses for Azure."
+      },
+      "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', parameters('vmName')), '2025-04-01', 'full').identity.principalId]"
+    }
+  }
+}

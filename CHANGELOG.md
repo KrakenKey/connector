@@ -8,6 +8,19 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+### Added
+
+- An Azure template in `deploy/azure`, with a "Deploy to Azure" button and a
+  portal wizard. It creates a small Ubuntu 24.04 VM without a public IP
+  address and with a system-assigned managed identity, gives that identity
+  least-privilege custom roles on the chosen Key Vault and, optionally,
+  Application Gateway and the resources the gateway links to, and on the
+  first boot installs the connector from packages.krakenkey.io, writes its
+  config, enrolls it with a one-time token and starts the service.
+  Unattended upgrades keep the connector up to date. The same files form
+  the package for a Microsoft Marketplace solution template, checked in CI
+  with the ARM template test toolkit.
+
 ## [v0.3.0] - 2026-10-11
 
 A read-only summary of the config for the KrakenKey dashboard.
