@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.48.1.52935",
-      "templateHash": "10644526634339758298"
+      "templateHash": "3357221239838595690"
     },
     "info": {
       "title": "KrakenKey connector",
@@ -37,10 +37,12 @@
         "Standard_B2als_v2",
         "Standard_B1s",
         "Standard_B1ms",
-        "Standard_B2s"
+        "Standard_B2s",
+        "Standard_D2als_v6",
+        "Standard_D2als_v7"
       ],
       "metadata": {
-        "description": "Size of the virtual machine. The connector needs very little: the smallest sizes are enough."
+        "description": "Size of the virtual machine. The connector needs very little: the smallest sizes are enough. The D2als sizes are for subscriptions without B-series quota or capacity."
       }
     },
     "osDiskType": {

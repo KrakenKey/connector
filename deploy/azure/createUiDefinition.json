@@ -31,11 +31,12 @@
         "name": "vmSize",
         "type": "Microsoft.Compute.SizeSelector",
         "label": "Size",
-        "toolTip": "The connector needs very little CPU and memory, so the smallest sizes are enough.",
+        "toolTip": "The connector needs very little CPU and memory, so the smallest sizes are enough. If your subscription has no B-series quota or capacity in the region, use a D2als size.",
         "recommendedSizes": [
           "Standard_B2ats_v2",
           "Standard_B1s",
-          "Standard_B2als_v2"
+          "Standard_B2als_v2",
+          "Standard_D2als_v6"
         ],
         "constraints": {
           "allowedSizes": [
@@ -43,7 +44,9 @@
             "Standard_B2als_v2",
             "Standard_B1s",
             "Standard_B1ms",
-            "Standard_B2s"
+            "Standard_B2s",
+            "Standard_D2als_v6",
+            "Standard_D2als_v7"
           ]
         },
         "options": {

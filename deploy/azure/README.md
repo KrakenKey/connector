@@ -66,7 +66,7 @@ identity (see [Permissions](#permissions)).
 
 | Tab | Asks for |
 |---|---|
-| Basics | Subscription, resource group, region, VM name, VM size (`Standard_B2ats_v2`, `Standard_B2als_v2`, `Standard_B1s`, `Standard_B1ms` or `Standard_B2s`), administrator username and SSH public key. |
+| Basics | Subscription, resource group, region, VM name, VM size (`Standard_B2ats_v2`, `Standard_B2als_v2`, `Standard_B1s`, `Standard_B1ms`, `Standard_B2s`, `Standard_D2als_v6` or `Standard_D2als_v7`; new subscriptions often have no B-series quota, so the D2als sizes are there as a fallback), administrator username and SSH public key. |
 | KrakenKey | The enrollment token, and the API URL (`https://api.krakenkey.io`). |
 | Key Vault | The vault (any resource group or subscription), whether keys are exportable (default yes; Application Gateway needs it), and whether to allow rollbacks in Key Vault (default no; see [Permissions](#permissions)). |
 | Application Gateway | Whether to deploy to a gateway, which one, and whether to give the gateway's identity read access to the vault's secrets (if it does not have it already). |

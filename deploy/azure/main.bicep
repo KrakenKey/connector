@@ -26,13 +26,15 @@ param location string = resourceGroup().location
 @maxLength(52)
 param vmName string = 'krakenkey-connector'
 
-@description('Size of the virtual machine. The connector needs very little: the smallest sizes are enough.')
+@description('Size of the virtual machine. The connector needs very little: the smallest sizes are enough. The D2als sizes are for subscriptions without B-series quota or capacity.')
 @allowed([
   'Standard_B2ats_v2'
   'Standard_B2als_v2'
   'Standard_B1s'
   'Standard_B1ms'
   'Standard_B2s'
+  'Standard_D2als_v6'
+  'Standard_D2als_v7'
 ])
 param vmSize string = 'Standard_B2ats_v2'
 
