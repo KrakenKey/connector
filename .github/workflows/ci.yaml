@@ -226,6 +226,25 @@ jobs:
           scripts/check-packages.sh debian:12 dist/krakenkey-connector_*_linux_arm64.deb linux/arm64
           scripts/check-packages.sh rockylinux:9 dist/krakenkey-connector_*_linux_arm64.rpm linux/arm64
 
+  # The Azure template in deploy/azure: mainTemplate.json must be what
+  # main.bicep compiles to, the package must pass the ARM template test
+  # toolkit that Partner Center runs, and the cloud-config it builds must
+  # pass cloud-init's schema check. Nothing is deployed.
+  azure-template:
+    name: Azure template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: mainTemplate.json matches main.bicep
+        run: deploy/azure/build.sh --check
+
+      - name: Test the template
+        run: deploy/azure/test.sh
+
+      - name: Build the Marketplace package
+        run: deploy/azure/package.sh
+
   proto:
     name: Generated code is current
     runs-on: ubuntu-latest

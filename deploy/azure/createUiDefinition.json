@@ -1,0 +1,632 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/0.1.2-preview/CreateUIDefinition.MultiVm.json#",
+  "handler": "Microsoft.Azure.CreateUIDef",
+  "version": "0.1.2-preview",
+  "parameters": {
+    "config": {
+      "isWizard": true,
+      "basics": {
+        "description": "Runs the [KrakenKey connector](https://github.com/KrakenKey/connector) on a small Ubuntu VM in your subscription. The connector renews your KrakenKey certificates with keys that Azure Key Vault creates and keeps, and can put each renewal on an Application Gateway. The VM has no public IP address and accepts no connections; it only connects out to KrakenKey and Azure. You pay Azure for the VM and its disk and network.",
+        "location": {
+          "label": "Region",
+          "toolTip": "Region for the VM and its network resources. The Key Vault and Application Gateway can be in any region."
+        }
+      }
+    },
+    "basics": [
+      {
+        "name": "vmName",
+        "type": "Microsoft.Common.TextBox",
+        "label": "Virtual machine name",
+        "defaultValue": "krakenkey-connector",
+        "toolTip": "Name of the VM. Its disk, network interface and network resources are named after it.",
+        "constraints": {
+          "required": true,
+          "regex": "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,50}[a-zA-Z0-9])?$",
+          "validationMessage": "1 to 52 letters, digits and hyphens, starting and ending with a letter or digit."
+        },
+        "visible": true
+      },
+      {
+        "name": "vmSize",
+        "type": "Microsoft.Compute.SizeSelector",
+        "label": "Size",
+        "toolTip": "The connector needs very little CPU and memory, so the smallest sizes are enough. If your subscription has no B-series quota or capacity in the region, use a D2als size.",
+        "recommendedSizes": [
+          "Standard_B2ats_v2",
+          "Standard_B1s",
+          "Standard_B2als_v2",
+          "Standard_D2als_v6"
+        ],
+        "constraints": {
+          "allowedSizes": [
+            "Standard_B2ats_v2",
+            "Standard_B2als_v2",
+            "Standard_B1s",
+            "Standard_B1ms",
+            "Standard_B2s",
+            "Standard_D2als_v6",
+            "Standard_D2als_v7"
+          ]
+        },
+        "options": {
+          "hideDiskTypeFilter": true
+        },
+        "osPlatform": "Linux",
+        "imageReference": {
+          "publisher": "Canonical",
+          "offer": "ubuntu-24_04-lts",
+          "sku": "server"
+        },
+        "count": 1,
+        "visible": true
+      },
+      {
+        "name": "adminUsername",
+        "type": "Microsoft.Compute.UserNameTextBox",
+        "label": "Administrator username",
+        "toolTip": "Administrator account on the VM. You can sign in only with the SSH key below, from inside the virtual network (for example through Azure Bastion).",
+        "osPlatform": "Linux",
+        "constraints": {
+          "required": true,
+          "regex": "^[a-z_][a-z0-9_-]{0,31}$",
+          "validationMessage": "1 to 32 lowercase letters, digits, underscores and hyphens, starting with a letter or underscore."
+        },
+        "visible": true
+      },
+      {
+        "name": "sshKey",
+        "type": "Microsoft.Compute.CredentialsCombo",
+        "label": {
+          "authenticationType": "Authentication type",
+          "password": "Password",
+          "confirmPassword": "Confirm password",
+          "sshPublicKey": "SSH public key"
+        },
+        "toolTip": {
+          "authenticationType": "Sign-in is by SSH key only.",
+          "password": "Not used.",
+          "sshPublicKey": "SSH public key for the administrator account."
+        },
+        "constraints": {
+          "required": true
+        },
+        "options": {
+          "hideConfirmation": false,
+          "hidePassword": true
+        },
+        "osPlatform": "Linux",
+        "visible": true
+      }
+    ],
+    "steps": [
+      {
+        "name": "krakenkey",
+        "label": "KrakenKey",
+        "elements": [
+          {
+            "name": "intro",
+            "type": "Microsoft.Common.InfoBox",
+            "visible": true,
+            "options": {
+              "icon": "Info",
+              "text": "In the KrakenKey dashboard, create a connector with the scopes certs:read and certs:renew, limited to the certificates this VM will manage, and copy its enrollment token. The token is shown once, works once and expires after 24 hours, so deploy soon after creating it. The VM uses it on its first boot to enroll and then deletes it.",
+              "uri": "https://github.com/KrakenKey/connector#enrollment"
+            }
+          },
+          {
+            "name": "enrollmentToken",
+            "type": "Microsoft.Common.PasswordBox",
+            "label": {
+              "password": "Enrollment token",
+              "confirmPassword": "Confirm enrollment token"
+            },
+            "toolTip": "The connector's enrollment token from the KrakenKey dashboard. It starts with kkce_.",
+            "constraints": {
+              "required": true,
+              "regex": "^kkce_[A-Za-z0-9_-]{20,}$",
+              "validationMessage": "Paste the enrollment token from the KrakenKey dashboard. It starts with kkce_."
+            },
+            "options": {
+              "hideConfirmation": false
+            },
+            "visible": true
+          },
+          {
+            "name": "apiUrl",
+            "type": "Microsoft.Common.TextBox",
+            "label": "KrakenKey API URL",
+            "defaultValue": "https://api.krakenkey.io",
+            "toolTip": "Leave as it is unless KrakenKey told you to use another API.",
+            "constraints": {
+              "required": true,
+              "regex": "^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$",
+              "validationMessage": "An https:// URL."
+            },
+            "visible": true
+          }
+        ]
+      },
+      {
+        "name": "keyVault",
+        "label": "Key Vault",
+        "elements": [
+          {
+            "name": "intro",
+            "type": "Microsoft.Common.TextBlock",
+            "visible": true,
+            "options": {
+              "text": "The connector keeps each certificate's key in this Key Vault: the vault creates the key and the request, and the key stays there. Each renewal becomes a new version of the Key Vault certificate, so services that read it without a version (App Service, Front Door, Container Apps and others) pick it up on their own.",
+              "link": {
+                "label": "How the Key Vault plugin works",
+                "uri": "https://github.com/KrakenKey/connector/blob/main/plugins/azure-keyvault/README.md"
+              }
+            }
+          },
+          {
+            "name": "vault",
+            "type": "Microsoft.Solutions.ResourceSelector",
+            "label": "Key Vault",
+            "toolTip": "The vault to keep keys and certificates in. It can be in another resource group or subscription.",
+            "resourceType": "Microsoft.KeyVault/vaults",
+            "options": {
+              "filter": {
+                "subscription": "all",
+                "location": "all"
+              }
+            },
+            "constraints": {
+              "required": true
+            },
+            "visible": true
+          },
+          {
+            "name": "vaultApi",
+            "type": "Microsoft.Solutions.ArmApiControl",
+            "request": {
+              "method": "GET",
+              "path": "[concat(steps('keyVault').vault.id, '?api-version=2024-11-01')]"
+            }
+          },
+          {
+            "name": "permissionModel",
+            "type": "Microsoft.Common.InfoBox",
+            "visible": "[not(empty(steps('keyVault').vault))]",
+            "options": {
+              "icon": "Info",
+              "text": "[if(equals(steps('keyVault').vaultApi.properties.enableRbacAuthorization, true), 'This vault uses Azure RBAC. The deployment creates custom roles with only the permissions the connector needs and assigns them to the VM on this vault. That needs Owner or User Access Administrator on the subscriptions involved.', 'This vault uses access policies. The deployment adds an access policy for the VM with certificate permissions Get, List, Create and Update. That needs permission to change the vault.')]"
+            }
+          },
+          {
+            "name": "exportable",
+            "type": "Microsoft.Common.OptionsGroup",
+            "label": "Exportable keys",
+            "defaultValue": "Yes",
+            "toolTip": "Exportable keys can be read from the certificate's secret by anyone allowed to read secrets in the vault. Application Gateway and App Service need them; with No, the key never leaves Key Vault, but those services cannot use the certificate. Using an Application Gateway turns this on.",
+            "constraints": {
+              "allowedValues": [
+                {
+                  "label": "Yes",
+                  "value": true
+                },
+                {
+                  "label": "No",
+                  "value": false
+                }
+              ],
+              "required": true
+            },
+            "visible": true
+          },
+          {
+            "name": "rollback",
+            "type": "Microsoft.Common.OptionsGroup",
+            "label": "Allow rollbacks in Key Vault",
+            "defaultValue": "No",
+            "toolTip": "Also lets the connector import certificates and read certificate secrets, so it can put the previous certificate back as the latest version after a failed deployment. This lets the VM read every secret in the vault. Needs exportable keys.",
+            "constraints": {
+              "allowedValues": [
+                {
+                  "label": "Yes",
+                  "value": true
+                },
+                {
+                  "label": "No",
+                  "value": false
+                }
+              ],
+              "required": true
+            },
+            "visible": true
+          }
+        ]
+      },
+      {
+        "name": "appGateway",
+        "label": "Application Gateway",
+        "elements": [
+          {
+            "name": "enable",
+            "type": "Microsoft.Common.OptionsGroup",
+            "label": "Deploy to an Application Gateway",
+            "defaultValue": "No",
+            "toolTip": "Point SSL certificate entries on an Application Gateway v2 at each renewed certificate's Key Vault version, then check the gateway serves it.",
+            "constraints": {
+              "allowedValues": [
+                {
+                  "label": "Yes",
+                  "value": true
+                },
+                {
+                  "label": "No",
+                  "value": false
+                }
+              ],
+              "required": true
+            },
+            "visible": true
+          },
+          {
+            "name": "requirements",
+            "type": "Microsoft.Common.InfoBox",
+            "visible": "[steps('appGateway').enable]",
+            "options": {
+              "icon": "Info",
+              "text": "The gateway must be a v2 SKU (Standard_v2 or WAF_v2) with a user-assigned managed identity, and already have the SSL certificate entries its HTTPS listeners use. The VM gets custom roles to update the gateway and to keep its subnet, public IP addresses, WAF policies and identity linked. Keys must be RSA.",
+              "uri": "https://github.com/KrakenKey/connector/blob/main/plugins/azure-appgateway/README.md"
+            }
+          },
+          {
+            "name": "gateway",
+            "type": "Microsoft.Solutions.ResourceSelector",
+            "label": "Application Gateway",
+            "toolTip": "The gateway to deploy certificates to. It can be in another resource group or subscription.",
+            "resourceType": "Microsoft.Network/applicationGateways",
+            "options": {
+              "filter": {
+                "subscription": "all",
+                "location": "all"
+              }
+            },
+            "constraints": {
+              "required": true
+            },
+            "visible": "[steps('appGateway').enable]"
+          },
+          {
+            "name": "gatewayApi",
+            "type": "Microsoft.Solutions.ArmApiControl",
+            "request": {
+              "method": "GET",
+              "path": "[concat(steps('appGateway').gateway.id, '?api-version=2024-07-01')]"
+            }
+          },
+          {
+            "name": "noIdentity",
+            "type": "Microsoft.Common.InfoBox",
+            "visible": "[and(steps('appGateway').enable, not(empty(steps('appGateway').gateway)), empty(steps('appGateway').gatewayApi.identity.userAssignedIdentities))]",
+            "options": {
+              "icon": "Warning",
+              "text": "This gateway has no user-assigned managed identity, so it cannot read certificates from Key Vault. Add one to the gateway first."
+            }
+          },
+          {
+            "name": "sslCertificates",
+            "type": "Microsoft.Common.TextBlock",
+            "visible": "[and(steps('appGateway').enable, not(empty(steps('appGateway').gateway)))]",
+            "options": {
+              "text": "[concat('SSL certificate entries on this gateway: ', string(map(steps('appGateway').gatewayApi.properties.sslCertificates, (entry) => entry.name)), '. Name the entry for each certificate on the Certificates tab.')]"
+            }
+          },
+          {
+            "name": "grantVault",
+            "type": "Microsoft.Common.OptionsGroup",
+            "label": "Let the gateway read the vault",
+            "defaultValue": "No",
+            "toolTip": "Give the gateway's user-assigned identity read access to the vault's secrets (Key Vault Secrets User, or a secret Get access policy). It needs that to load certificates from the vault. Choose No if it already has it.",
+            "constraints": {
+              "allowedValues": [
+                {
+                  "label": "Yes",
+                  "value": true
+                },
+                {
+                  "label": "No",
+                  "value": false
+                }
+              ],
+              "required": true
+            },
+            "visible": "[steps('appGateway').enable]"
+          }
+        ]
+      },
+      {
+        "name": "certificates",
+        "label": "Certificates",
+        "elements": [
+          {
+            "name": "intro",
+            "type": "Microsoft.Common.TextBlock",
+            "visible": true,
+            "options": {
+              "text": "The KrakenKey certificates this connector manages. Use each certificate's id and exactly its names from KrakenKey (comma separated). Each one gets its own Key Vault certificate, created on the first renewal. On its first pass the connector renews every certificate once, so that Key Vault holds the key.",
+              "link": {
+                "label": "Configuration reference",
+                "uri": "https://github.com/KrakenKey/connector#configuration"
+              }
+            }
+          },
+          {
+            "name": "keyType",
+            "type": "Microsoft.Common.DropDown",
+            "label": "Key type",
+            "defaultValue": "RSA 2048",
+            "toolTip": "Key type for new keys. RSA 2048 works with the most services. Application Gateway needs RSA.",
+            "constraints": {
+              "allowedValues": [
+                {
+                  "label": "RSA 2048",
+                  "value": "rsa-2048"
+                },
+                {
+                  "label": "RSA 3072",
+                  "value": "rsa-3072"
+                },
+                {
+                  "label": "RSA 4096",
+                  "value": "rsa-4096"
+                },
+                {
+                  "label": "ECDSA P-256",
+                  "value": "ecdsa-p256"
+                },
+                {
+                  "label": "ECDSA P-384",
+                  "value": "ecdsa-p384"
+                }
+              ],
+              "required": true
+            },
+            "visible": true
+          },
+          {
+            "name": "keyTypeGateway",
+            "type": "Microsoft.Common.InfoBox",
+            "visible": "[and(steps('appGateway').enable, startsWith(steps('certificates').keyType, 'ecdsa'))]",
+            "options": {
+              "icon": "Error",
+              "text": "Application Gateway needs an RSA key. Choose an RSA key type."
+            }
+          },
+          {
+            "name": "list",
+            "type": "Microsoft.Common.EditableGrid",
+            "ariaLabel": "Enter the certificates the connector manages",
+            "label": "Certificates",
+            "constraints": {
+              "width": "Full",
+              "rows": {
+                "count": {
+                  "min": 1,
+                  "max": 50
+                }
+              },
+              "columns": [
+                {
+                  "id": "id",
+                  "header": "KrakenKey certificate id",
+                  "width": "2fr",
+                  "element": {
+                    "type": "Microsoft.Common.TextBox",
+                    "placeholder": "1043",
+                    "toolTip": "The certificate's numeric id in KrakenKey.",
+                    "constraints": {
+                      "required": true,
+                      "validations": [
+                        {
+                          "regex": "^[1-9][0-9]{0,9}$",
+                          "message": "The certificate's numeric id from KrakenKey."
+                        },
+                        {
+                          "isValid": "[or(not(steps('appGateway').enable), startsWith(steps('certificates').keyType, 'rsa'))]",
+                          "message": "Application Gateway needs an RSA key. Choose an RSA key type above."
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "id": "names",
+                  "header": "Names (comma separated)",
+                  "width": "4fr",
+                  "element": {
+                    "type": "Microsoft.Common.TextBox",
+                    "placeholder": "www.example.com, example.com",
+                    "toolTip": "The certificate's DNS names, comma separated, exactly as in KrakenKey.",
+                    "constraints": {
+                      "required": true,
+                      "validations": [
+                        {
+                          "regex": "^ *(\\*\\.)?[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])? *(, *(\\*\\.)?[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])? *)*$",
+                          "message": "DNS names separated by commas, exactly as on the certificate in KrakenKey."
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "id": "keyVaultCertificateName",
+                  "header": "Key Vault certificate name",
+                  "width": "3fr",
+                  "element": {
+                    "type": "Microsoft.Common.TextBox",
+                    "placeholder": "www-example-com",
+                    "toolTip": "The Key Vault certificate that holds this certificate and its key. Created on the first renewal.",
+                    "constraints": {
+                      "required": true,
+                      "validations": [
+                        {
+                          "regex": "^[A-Za-z0-9-]{1,127}$",
+                          "message": "1 to 127 letters, digits and hyphens. Use a name no other certificate in the vault uses."
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "id": "appGatewaySslCertificate",
+                  "header": "Gateway SSL certificate entry (optional)",
+                  "width": "3fr",
+                  "element": {
+                    "type": "Microsoft.Common.TextBox",
+                    "placeholder": "www-example-com",
+                    "toolTip": "The SSL certificate entry on the gateway that this certificate goes to. Empty to keep it in Key Vault only.",
+                    "constraints": {
+                      "required": false,
+                      "validations": [
+                        {
+                          "regex": "^([A-Za-z0-9_.-]{1,80})?$",
+                          "message": "The name of an SSL certificate entry on the gateway, or empty."
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "id": "verifyHost",
+                  "header": "Gateway check host (optional)",
+                  "width": "3fr",
+                  "element": {
+                    "type": "Microsoft.Common.TextBox",
+                    "placeholder": "www.example.com",
+                    "toolTip": "A name to check the gateway at, on port 443, after each update. Empty for no check.",
+                    "constraints": {
+                      "required": false,
+                      "validations": [
+                        {
+                          "regex": "^([A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)?$",
+                          "message": "One of the certificate's names (not a wildcard) that the VM can reach the gateway at on port 443, or empty for no check."
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "name": "gatewayColumns",
+            "type": "Microsoft.Common.TextBlock",
+            "visible": "[steps('appGateway').enable]",
+            "options": {
+              "text": "Gateway SSL certificate entry: the entry on the gateway that the certificate's HTTPS listeners use; leave it empty to keep the certificate in Key Vault only. Gateway check host: after each update, the connector connects to this name on port 443 and checks that the gateway serves the new certificate; leave it empty when the VM cannot reach the gateway's listener."
+            }
+          }
+        ]
+      },
+      {
+        "name": "networking",
+        "label": "Networking",
+        "elements": [
+          {
+            "name": "vnet",
+            "type": "Microsoft.Network.VirtualNetworkCombo",
+            "label": {
+              "virtualNetwork": "Virtual network",
+              "subnets": "Subnet"
+            },
+            "toolTip": {
+              "virtualNetwork": "Virtual network for the VM. The VM gets no public IP address.",
+              "subnets": "Subnet for the VM's network interface."
+            },
+            "defaultValue": {
+              "name": "krakenkey-connector-vnet",
+              "addressPrefixSize": "/24"
+            },
+            "constraints": {
+              "minAddressPrefixSize": "/29"
+            },
+            "options": {
+              "hideExisting": false
+            },
+            "subnets": {
+              "subnet1": {
+                "label": "Subnet",
+                "defaultValue": {
+                  "name": "connector",
+                  "addressPrefixSize": "/27"
+                },
+                "constraints": {
+                  "minAddressPrefixSize": "/29",
+                  "minAddressCount": 1,
+                  "requireContiguousAddresses": false
+                }
+              }
+            },
+            "visible": true
+          },
+          {
+            "name": "outbound",
+            "type": "Microsoft.Common.OptionsGroup",
+            "label": "Outbound internet access",
+            "defaultValue": "NAT gateway (recommended)",
+            "toolTip": "The VM needs to reach packages.krakenkey.io, the KrakenKey API, Azure and Ubuntu's update servers. A NAT gateway gives it a fixed outbound address and costs extra. Azure's default outbound access is free, but Microsoft recommends against it and no longer turns it on by default for new networks.",
+            "constraints": {
+              "allowedValues": [
+                {
+                  "label": "NAT gateway (recommended)",
+                  "value": "natGateway"
+                },
+                {
+                  "label": "Default outbound access",
+                  "value": "defaultOutboundAccess"
+                }
+              ],
+              "required": true
+            },
+            "visible": "[equals(steps('networking').vnet.newOrExisting, 'new')]"
+          },
+          {
+            "name": "existingOutbound",
+            "type": "Microsoft.Common.InfoBox",
+            "visible": "[equals(steps('networking').vnet.newOrExisting, 'existing')]",
+            "options": {
+              "icon": "Info",
+              "text": "The subnet must already give the VM outbound HTTPS access (a NAT gateway, a firewall, or default outbound access) to packages.krakenkey.io, the KrakenKey API, Azure and Ubuntu's update servers."
+            }
+          }
+        ]
+      }
+    ],
+    "outputs": {
+      "location": "[location()]",
+      "vmName": "[basics('vmName')]",
+      "vmSize": "[basics('vmSize')]",
+      "adminUsername": "[basics('adminUsername')]",
+      "adminSshPublicKey": "[basics('sshKey').sshPublicKey]",
+      "enrollmentToken": "[steps('krakenkey').enrollmentToken]",
+      "apiUrl": "[steps('krakenkey').apiUrl]",
+      "certificates": "[steps('certificates').list]",
+      "keyType": "[steps('certificates').keyType]",
+      "keyVaultId": "[steps('keyVault').vault.id]",
+      "keyVaultUseRbac": "[equals(steps('keyVault').vaultApi.properties.enableRbacAuthorization, true)]",
+      "keyExportable": "[or(steps('keyVault').exportable, steps('appGateway').enable)]",
+      "allowKeyVaultRollback": "[and(steps('keyVault').rollback, or(steps('keyVault').exportable, steps('appGateway').enable))]",
+      "appGatewayId": "[if(steps('appGateway').enable, steps('appGateway').gateway.id, '')]",
+      "appGatewaySubnetIds": "[if(steps('appGateway').enable, map(coalesce(steps('appGateway').gatewayApi.properties.gatewayIPConfigurations, parse('[]')), (config) => config.properties.subnet.id), parse('[]'))]",
+      "appGatewayPublicIpIds": "[if(steps('appGateway').enable, map(filter(coalesce(steps('appGateway').gatewayApi.properties.frontendIPConfigurations, parse('[]')), (config) => not(empty(config.properties.publicIPAddress))), (config) => config.properties.publicIPAddress.id), parse('[]'))]",
+      "appGatewayFirewallPolicyIds": "[if(steps('appGateway').enable, map(filter(coalesce(steps('appGateway').gatewayApi.properties.httpListeners, parse('[]')), (listener) => not(empty(listener.properties.firewallPolicy))), (listener) => listener.properties.firewallPolicy.id), parse('[]'))]",
+      "appGatewayFirewallPolicyId": "[if(and(steps('appGateway').enable, not(empty(steps('appGateway').gatewayApi.properties.firewallPolicy))), steps('appGateway').gatewayApi.properties.firewallPolicy.id, '')]",
+      "appGatewayIdentityId": "[if(steps('appGateway').enable, first(skip(split(string(first(coalesce(steps('appGateway').gatewayApi.identity.userAssignedIdentities, parse('{\"\":0}')))), '\"'), 1)), '')]",
+      "grantAppGatewayVaultAccess": "[and(steps('appGateway').enable, steps('appGateway').grantVault)]",
+      "virtualNetworkNewOrExisting": "[steps('networking').vnet.newOrExisting]",
+      "virtualNetworkName": "[steps('networking').vnet.name]",
+      "virtualNetworkResourceGroup": "[steps('networking').vnet.resourceGroup]",
+      "virtualNetworkAddressPrefixes": "[steps('networking').vnet.addressPrefixes]",
+      "subnetName": "[steps('networking').vnet.subnets.subnet1.name]",
+      "subnetAddressPrefix": "[steps('networking').vnet.subnets.subnet1.addressPrefix]",
+      "outboundAccess": "[if(equals(steps('networking').vnet.newOrExisting, 'new'), steps('networking').outbound, 'defaultOutboundAccess')]"
+    }
+  }
+}

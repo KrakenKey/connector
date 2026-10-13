@@ -235,6 +235,19 @@ cosign verify ghcr.io/krakenkey/connector:v${VERSION} \
 
 See [Docker](#docker) for how to run it.
 
+### Azure VM
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FKrakenKey%2Fconnector%2Fmain%2Fdeploy%2Fazure%2FmainTemplate.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2FKrakenKey%2Fconnector%2Fmain%2Fdeploy%2Fazure%2FcreateUiDefinition.json)
+
+A template that runs the connector on a small Ubuntu VM in your Azure
+subscription, with Key Vault as the key store and, optionally, an
+Application Gateway as a target. The VM has no public IP address, installs
+the connector from the apt repository above, upgrades it on its own, and uses
+a managed identity with least-privilege roles on the vault and the gateway.
+The portal wizard asks for an enrollment token, the vault, the gateway and
+the certificates. You pay Azure for the VM. See
+[deploy/azure](deploy/azure/README.md).
+
 ## Quick start
 
 With the Linux packages, follow [Running as a service](#running-as-a-service)

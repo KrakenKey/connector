@@ -1,0 +1,23 @@
+#cloud-config
+# Written by deploy/azure/main.bicep. main.bicep fills in the base64 values:
+# 0 is bootstrap.sh, 1 the enrollment token, 2 the connector config as JSON.
+# Only root can read the files. The token is not part of any command line,
+# so cloud-init does not log it, and bootstrap.sh deletes it after enrolling.
+write_files:
+  - path: /var/lib/krakenkey-azure/bootstrap.sh
+    owner: root:root
+    permissions: '0700'
+    encoding: b64
+    content: {0}
+  - path: /var/lib/krakenkey-azure/enrollment-token
+    owner: root:root
+    permissions: '0600'
+    encoding: b64
+    content: {1}
+  - path: /var/lib/krakenkey-azure/config.json
+    owner: root:root
+    permissions: '0600'
+    encoding: b64
+    content: {2}
+runcmd:
+  - [/var/lib/krakenkey-azure/bootstrap.sh]
