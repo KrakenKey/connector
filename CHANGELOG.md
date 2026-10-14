@@ -8,6 +8,23 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+### Fixed
+
+- A renewal that fails in KrakenKey while the current certificate is still
+  valid now ends the wait at once. Newer KrakenKey APIs keep such a
+  certificate `issued` with its current PEM, `renewalFailedAt` and the
+  reason, instead of moving it to `failed`; the connector waited for a new
+  leaf until its 15-minute issuance timeout. It now stops at the first check
+  that shows `renewalFailedAt` at or after the renewal request (by the API's
+  `Date` header, allowing two minutes of clock difference), logs and audits
+  `renewal failed in KrakenKey: <reason>; KrakenKey kept the current
+  certificate`, and leaves the targets on the current certificate. The pass
+  exits 1 and the targets are reported `pending`, as for other failures on
+  KrakenKey's side. The new key is kept, so a retry from the dashboard or
+  the API (which renews with the connector's CSR) is deployed by the next
+  pass; the connector's next renewal of its own releases it. APIs that don't
+  send `renewalFailedAt` behave as before.
+
 ### Added
 
 - An Azure template in `deploy/azure`, with a "Deploy to Azure" button and a

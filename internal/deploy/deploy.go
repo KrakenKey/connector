@@ -64,7 +64,7 @@ import (
 type API interface {
 	GetCert(ctx context.Context, id int) (*api.Cert, error)
 	RenewCert(ctx context.Context, id int, csrPEM string) (*api.CertResponse, error)
-	WaitForIssuance(ctx context.Context, id int, previousCrt string) (*api.Cert, error)
+	WaitForIssuance(ctx context.Context, id int, previousCrt string, requestedAt time.Time) (*api.Cert, error)
 	GetCertChain(ctx context.Context, id int) (*api.Chain, error)
 }
 
@@ -503,7 +503,9 @@ func (r *run) renew(ctx context.Context, cert *api.Cert, oldSerial, reason strin
 		_ = r.save()
 	}
 
-	if _, err := r.e.API.RenewCert(ctx, job.Cert.ID, csr.PEM); err != nil {
+	requestedAt := r.e.now()
+	resp, err := r.e.API.RenewCert(ctx, job.Cert.ID, csr.PEM)
+	if err != nil {
 		if api.IsClientError(err) {
 			dropPending("unused key; KrakenKey refused the renewal")
 		} else {
@@ -514,12 +516,27 @@ func (r *run) renew(ctx context.Context, cert *api.Cert, oldSerial, reason strin
 	_ = r.e.audit(r.entry(audit.StepRenew, audit.ResultOK))
 	r.log.Info("renewal requested; waiting for issuance")
 
-	issued, err := r.e.API.WaitForIssuance(ctx, job.Cert.ID, cert.CrtPem)
+	if !resp.ServerTime.IsZero() {
+		requestedAt = resp.ServerTime
+	}
+
+	issued, err := r.e.API.WaitForIssuance(ctx, job.Cert.ID, cert.CrtPem, requestedAt)
 	if err != nil {
 		var failed *api.IssuanceFailedError
-		if errors.As(err, &failed) || api.IsClientError(err) {
+		var renewalFailed *api.RenewalFailedError
+		switch {
+		case errors.As(err, &renewalFailed):
+			// KrakenKey kept the current certificate and stored this
+			// connector's CSR. A retry from the dashboard or the API
+			// renews with that CSR, so keep the pending key: the pass
+			// after such a retry adopts the certificate. The next renewal
+			// this connector starts (KrakenKey's renewAfter waits about a
+			// day after a failure) releases it.
+			r.log.Warn("renewal failed in KrakenKey; the current certificate stays deployed, and the new key is kept in case the renewal is retried from KrakenKey",
+				"reason", renewalFailed.Reason, "failed_at", renewalFailed.FailedAt, "key_ref", csr.KeyRef)
+		case errors.As(err, &failed) || api.IsClientError(err):
 			dropPending("unused key from a failed renewal")
-		} else {
+		default:
 			r.log.Warn("stopped waiting for issuance; the next pass picks up the certificate if it is issued", "error", err)
 		}
 		return fail(audit.StepIssued, err)
