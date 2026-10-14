@@ -136,7 +136,7 @@ func TestWaitForIssuanceStopsOnClientErrors(t *testing.T) {
 			w.WriteHeader(code)
 			_, _ = w.Write([]byte(`{"statusCode":` + strconv.Itoa(code) + `,"message":"no"}`))
 		})
-		if _, err := c.WaitForIssuance(context.Background(), 1, ""); err == nil || !IsClientError(err) {
+		if _, err := c.WaitForIssuance(context.Background(), 1, "", time.Time{}); err == nil || !IsClientError(err) {
 			t.Errorf("%d: err = %v", code, err)
 		}
 		if calls.Load() != 1 || len(rec.sleeps) != 0 {
@@ -148,7 +148,7 @@ func TestWaitForIssuanceStopsOnClientErrors(t *testing.T) {
 		w.Header().Set("Retry-After", "86400")
 		w.WriteHeader(http.StatusTooManyRequests)
 	})
-	_, err := c.WaitForIssuance(context.Background(), 1, "")
+	_, err := c.WaitForIssuance(context.Background(), 1, "", time.Time{})
 	var rl *RateLimitError
 	if !errors.As(err, &rl) {
 		t.Errorf("429: err = %v", err)
@@ -197,7 +197,7 @@ func TestUnauthorizedStopsAllCalls(t *testing.T) {
 	if !errors.As(err, &authErr) {
 		t.Fatalf("second call err = %v", err)
 	}
-	_, err = c.WaitForIssuance(context.Background(), 1, "")
+	_, err = c.WaitForIssuance(context.Background(), 1, "", time.Time{})
 	if !errors.As(err, &authErr) {
 		t.Fatalf("wait err = %v", err)
 	}
@@ -329,7 +329,7 @@ func TestWaitForIssuance(t *testing.T) {
 		}
 	})
 	c.PollInterval = 3 * time.Second
-	cert, err := c.WaitForIssuance(context.Background(), 1, "OLD")
+	cert, err := c.WaitForIssuance(context.Background(), 1, "OLD", time.Time{})
 	if err != nil {
 		t.Fatalf("WaitForIssuance: %v", err)
 	}
@@ -350,10 +350,89 @@ func TestWaitForIssuanceFailed(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"id":1,"status":"failed","failureReason":"CNAME for _acme-challenge.example.com missing"}`))
 	})
-	_, err := c.WaitForIssuance(context.Background(), 1, "OLD")
+	_, err := c.WaitForIssuance(context.Background(), 1, "OLD", time.Time{})
 	var f *IssuanceFailedError
 	if !errors.As(err, &f) || !strings.Contains(err.Error(), "CNAME") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestWaitForIssuanceRenewalFailed(t *testing.T) {
+	requested := time.Date(2026, 10, 14, 6, 0, 0, 0, time.UTC)
+	var calls atomic.Int32
+	c, rec := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(`{"id":1,"status":"renewing","crtPem":"OLD"}`))
+			return
+		}
+		// KrakenKey kept the current certificate after the renewal failed.
+		_, _ = w.Write([]byte(`{"id":1,"status":"issued","crtPem":"OLD","expiresAt":"2026-11-20T10:00:00.000Z",
+			"failureReason":"CAA record for example.com prevents issuance","renewalFailedAt":"2026-10-14T06:00:03.000Z"}`))
+	})
+	_, err := c.WaitForIssuance(context.Background(), 1, "OLD", requested)
+	var rf *RenewalFailedError
+	if !errors.As(err, &rf) {
+		t.Fatalf("err = %v, want a RenewalFailedError", err)
+	}
+	if rf.Reason != "CAA record for example.com prevents issuance" || !rf.FailedAt.Equal(requested.Add(3*time.Second)) {
+		t.Errorf("error = %+v", rf)
+	}
+	want := "renewal failed in KrakenKey: CAA record for example.com prevents issuance; KrakenKey kept the current certificate (expires 2026-11-20T10:00:00Z)"
+	if err.Error() != want {
+		t.Errorf("message = %q, want %q", err.Error(), want)
+	}
+	if IsClientError(err) {
+		t.Error("a failed renewal is not a client error")
+	}
+	if len(rec.sleeps) != 1 {
+		t.Errorf("sleeps = %v, want to stop at the first check that shows the failure", rec.sleeps)
+	}
+}
+
+// A renewalFailedAt from before the request (less the allowed skew)
+// belongs to an earlier renewal, and the wait goes on as before.
+func TestWaitForIssuanceIgnoresEarlierRenewalFailure(t *testing.T) {
+	requested := time.Date(2026, 10, 14, 6, 0, 0, 0, time.UTC)
+	var calls atomic.Int32
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			_, _ = w.Write([]byte(`{"id":1,"status":"issued","crtPem":"OLD","failureReason":"x","renewalFailedAt":"2026-10-13T06:00:00.000Z"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":1,"status":"issued","crtPem":"NEW"}`))
+	})
+	cert, err := c.WaitForIssuance(context.Background(), 1, "OLD", requested)
+	if err != nil || cert.CrtPem != "NEW" {
+		t.Fatalf("cert = %+v, err = %v, want the new certificate", cert, err)
+	}
+}
+
+// A failure recorded slightly before the request time, as a clock that is
+// a little ahead would show it, still counts.
+func TestWaitForIssuanceRenewalFailedWithinSkew(t *testing.T) {
+	requested := time.Date(2026, 10, 14, 6, 0, 0, 0, time.UTC)
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":1,"status":"issued","crtPem":"OLD","renewalFailedAt":"2026-10-14T05:59:30.000Z"}`))
+	})
+	_, err := c.WaitForIssuance(context.Background(), 1, "OLD", requested)
+	var rf *RenewalFailedError
+	if !errors.As(err, &rf) {
+		t.Fatalf("err = %v, want a RenewalFailedError", err)
+	}
+}
+
+func TestRenewCertServerTime(t *testing.T) {
+	date := time.Date(2026, 10, 14, 6, 0, 0, 0, time.UTC)
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Date", date.Format(http.TimeFormat))
+		_, _ = w.Write([]byte(`{"id":1,"status":"renewing"}`))
+	})
+	r, err := c.RenewCert(context.Background(), 1, "CSR")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.ServerTime.Equal(date) {
+		t.Errorf("ServerTime = %v, want %v", r.ServerTime, date)
 	}
 }
 
@@ -364,7 +443,7 @@ func TestWaitForIssuanceTimeout(t *testing.T) {
 	c.sleep = sleepCtx
 	c.PollInterval = 10 * time.Millisecond
 	c.IssuanceTimeout = 50 * time.Millisecond
-	_, err := c.WaitForIssuance(context.Background(), 1, "")
+	_, err := c.WaitForIssuance(context.Background(), 1, "", time.Time{})
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("err = %v", err)
 	}

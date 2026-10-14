@@ -231,7 +231,7 @@ func (f failingAPI) GetCert(context.Context, int) (*api.Cert, error) { return ni
 func (f failingAPI) RenewCert(context.Context, int, string) (*api.CertResponse, error) {
 	return nil, f.err
 }
-func (f failingAPI) WaitForIssuance(context.Context, int, string) (*api.Cert, error) {
+func (f failingAPI) WaitForIssuance(context.Context, int, string, time.Time) (*api.Cert, error) {
 	return nil, f.err
 }
 func (f failingAPI) GetCertChain(context.Context, int) (*api.Chain, error) { return nil, f.err }

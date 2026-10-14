@@ -39,6 +39,11 @@ type fakeAPI struct {
 	issueNames []string
 	issueKey   crypto.PublicKey
 	failIssue  string
+	// failRenewal makes the next renewal fail while the current
+	// certificate is still valid: KrakenKey keeps it issued with
+	// renewalFailedAt set, and stores the CSR for a later retry.
+	failRenewal  string
+	storedCSRKey crypto.PublicKey
 	// hang makes WaitForIssuance give up although the certificate is
 	// issued, like a timeout or a cancelled pass.
 	hang bool
@@ -66,6 +71,7 @@ func (f *fakeAPI) issue(pub crypto.PublicKey, n []string) {
 	leaf, leafPEM := f.ca.Issue(f.t, pub, n, 0)
 	renewAfter := time.Now().Add(60 * 24 * time.Hour)
 	f.cert.CrtPem, f.cert.Status, f.cert.ExpiresAt, f.cert.RenewAfter = leafPEM, api.StatusIssued, &leaf.NotAfter, &renewAfter
+	f.cert.RenewalFailedAt, f.cert.FailureReason = nil, ""
 }
 
 func (f *fakeAPI) RenewCert(_ context.Context, _ int, csrPEM string) (*api.CertResponse, error) {
@@ -76,9 +82,17 @@ func (f *fakeAPI) RenewCert(_ context.Context, _ int, csrPEM string) (*api.CertR
 	if err != nil {
 		return nil, err
 	}
+	f.storedCSRKey = req.PublicKey
 	if f.failIssue != "" {
 		f.cert.Status, f.cert.FailureReason = api.StatusFailed, f.failIssue
 		return &api.CertResponse{ID: 1043, Status: api.StatusRenewing}, nil
+	}
+	if f.failRenewal != "" {
+		now := time.Now()
+		retry := now.Add(20 * time.Hour)
+		f.cert.FailureReason, f.cert.RenewalFailedAt, f.cert.RenewAfter = f.failRenewal, &now, &retry
+		f.failRenewal = ""
+		return &api.CertResponse{ID: 1043, Status: api.StatusRenewing, ServerTime: now}, nil
 	}
 	n, pub := certutil.CSRNames(req), req.PublicKey
 	if f.issueNames != nil {
@@ -100,7 +114,15 @@ func (f *fakeAPI) serverRenew() {
 	f.issue(leaf.PublicKey, certutil.CertNames(leaf))
 }
 
-func (f *fakeAPI) WaitForIssuance(_ context.Context, _ int, previous string) (*api.Cert, error) {
+// retryFromDashboard is a retry of a failed renewal in KrakenKey: it renews
+// with the CSR stored by the last renewal request.
+func (f *fakeAPI) retryFromDashboard() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issue(f.storedCSRKey, names)
+}
+
+func (f *fakeAPI) WaitForIssuance(_ context.Context, _ int, previous string, requestedAt time.Time) (*api.Cert, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.hang {
@@ -108,6 +130,12 @@ func (f *fakeAPI) WaitForIssuance(_ context.Context, _ int, previous string) (*a
 	}
 	if f.cert.Status == api.StatusFailed {
 		return nil, &api.IssuanceFailedError{Reason: f.cert.FailureReason}
+	}
+	if f.cert.RenewalFailedAt != nil && f.cert.CrtPem == previous {
+		if requestedAt.IsZero() || f.cert.RenewalFailedAt.Before(requestedAt.Add(-time.Minute)) {
+			f.t.Errorf("WaitForIssuance got requestedAt %v, want the renew response's time", requestedAt)
+		}
+		return nil, &api.RenewalFailedError{Reason: f.cert.FailureReason, FailedAt: *f.cert.RenewalFailedAt, ExpiresAt: f.cert.ExpiresAt}
 	}
 	if f.cert.CrtPem == previous {
 		return nil, errors.New("not reissued")
@@ -564,6 +592,86 @@ func assertNothingDeployed(t *testing.T, e *env) {
 	}
 	if st := e.state(t); st != nil && (st.Serial != "" || st.Pending != nil) {
 		t.Errorf("state records a rejected certificate: %+v", st)
+	}
+}
+
+// A renewal that fails in KrakenKey while the current certificate is still
+// valid ends at once, keeps the deployed certificate, and keeps the new key:
+// a retry in KrakenKey renews with the connector's CSR, and the next pass
+// adopts that certificate instead of renewing again.
+func TestFailedRenewalKeepsPendingKeyForRetry(t *testing.T) {
+	e := setup(t, "a")
+	if err := e.process(t, false); err != nil {
+		t.Fatal(err)
+	}
+	deployed := e.api.serial()
+	oldKey := e.state(t).KeyRef
+
+	e.api.failRenewal = "CAA record for example.com prevents issuance"
+	err := e.process(t, true)
+	var rf *api.RenewalFailedError
+	if !errors.As(err, &rf) || !strings.Contains(err.Error(), "CAA record") {
+		t.Fatalf("err = %v, want a RenewalFailedError with the reason", err)
+	}
+	if IsBlocked(err) {
+		t.Error("a renewal that failed in KrakenKey is reported as blocked on the connector's side")
+	}
+	st := e.state(t)
+	if st.Pending == nil {
+		t.Fatal("pending key dropped after a failed renewal")
+	}
+	pendingKey := st.Pending.KeyRef
+	if slices.Contains(e.ks.Released, pendingKey) {
+		t.Fatal("pending key released although a retry in KrakenKey would use its CSR")
+	}
+	if st.Serial != deployed || e.targets["a"].live != deployed {
+		t.Errorf("serial %s, live %s, want the current certificate %s kept", st.Serial, e.targets["a"].live, deployed)
+	}
+	if !e.audit.has(audit.StepIssued, audit.ResultFailed, "CAA record") {
+		t.Error("failed renewal not audited")
+	}
+
+	// The renewal is retried in KrakenKey with the stored CSR.
+	e.api.retryFromDashboard()
+	if err := e.process(t, false); err != nil {
+		t.Fatalf("adopting pass: %v", err)
+	}
+	if e.api.renews != 2 {
+		t.Errorf("renews = %d, want 2 (the retried certificate is adopted, not renewed again)", e.api.renews)
+	}
+	st = e.state(t)
+	if st.KeyRef != pendingKey || st.Pending != nil || st.Serial != e.api.serial() {
+		t.Errorf("state = %+v", st)
+	}
+	if e.targets["a"].live != e.api.serial() {
+		t.Error("retried certificate not deployed")
+	}
+	if !slices.Contains(e.ks.Released, oldKey) {
+		t.Error("old key not released after the retried certificate was deployed")
+	}
+}
+
+// Without a retry, the connector's next renewal releases the key the failed
+// renewal left pending.
+func TestFailedRenewalPendingKeyReleasedByNextRenewal(t *testing.T) {
+	e := setup(t, "a")
+	if err := e.process(t, false); err != nil {
+		t.Fatal(err)
+	}
+	e.api.failRenewal = "CAA record for example.com prevents issuance"
+	if err := e.process(t, true); err == nil {
+		t.Fatal("expected the renewal to fail")
+	}
+	pendingKey := e.state(t).Pending.KeyRef
+
+	if err := e.process(t, true); err != nil {
+		t.Fatalf("next renewal: %v", err)
+	}
+	if !slices.Contains(e.ks.Released, pendingKey) {
+		t.Error("key from the failed renewal not released by the next renewal")
+	}
+	if st := e.state(t); st.Pending != nil || st.Serial != e.api.serial() {
+		t.Errorf("state = %+v", st)
 	}
 }
 

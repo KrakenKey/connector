@@ -30,6 +30,15 @@ plugins, places such as key vaults and cloud load balancers.
   up on the next pass instead of being requested again, and a deployment
   interrupted between activation and verification is finished or rolled
   back to the recorded previous certificate on the next run.
+- **A failed renewal changes nothing deployed.** If the renewal fails in
+  KrakenKey while the current certificate is still valid, KrakenKey keeps
+  that certificate (it stays `issued`, with `renewalFailedAt` and the
+  reason). The connector stops waiting as soon as it sees this, logs the
+  reason and leaves every target on the current certificate. It keeps the
+  new key: a retry from the dashboard or the API renews with the CSR the
+  connector sent, and the next pass deploys that certificate. KrakenKey's
+  `renewAfter` then waits about a day before the connector renews again on
+  its own, with a new key.
 - **Old keys are kept until they are no longer needed.** The previous key is
   deleted only after every target serves the new certificate, so a rollback
   always has something to go back to. Targets that cannot keep the previous
@@ -596,8 +605,8 @@ When something on the connector's side keeps a certificate from being
 renewed or deployed (a key store error, a config problem, an issued
 certificate that fails the connector's checks), every target of that
 certificate is reported as `failed`, so KrakenKey alerts. When the problem
-is on KrakenKey's side, such as an issuance that failed because of a
-missing DNS record, the targets stay `pending` with the error: KrakenKey
+is on KrakenKey's side, such as an issuance or renewal that failed because
+of a missing DNS record, the targets stay `pending` with the error: KrakenKey
 alerts on those itself.
 
 The report comes from the connector's state files. It carries no key

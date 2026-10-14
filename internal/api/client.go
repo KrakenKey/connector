@@ -94,14 +94,21 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 // unauthenticated one (the connector enrollment and token routes) it is
 // returned as an *APIError and not remembered.
 func (c *Client) send(ctx context.Context, method, path string, body, out any, auth bool) error {
+	_, err := c.sendDated(ctx, method, path, body, out, auth)
+	return err
+}
+
+// sendDated is send that also returns the Date header of a 2xx response:
+// the API's clock when it answered (zero when absent or unreadable).
+func (c *Client) sendDated(ctx context.Context, method, path string, body, out any, auth bool) (time.Time, error) {
 	if prev := c.authFailed.Load(); prev != nil && auth {
-		return prev
+		return time.Time{}, prev
 	}
 	var data []byte
 	if body != nil {
 		var err error
 		if data, err = json.Marshal(body); err != nil {
-			return fmt.Errorf("encode request: %w", err)
+			return time.Time{}, fmt.Errorf("encode request: %w", err)
 		}
 	}
 
@@ -112,12 +119,12 @@ func (c *Client) send(ctx context.Context, method, path string, body, out any, a
 		}
 		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 		if err != nil {
-			return fmt.Errorf("build request: %w", err)
+			return time.Time{}, fmt.Errorf("build request: %w", err)
 		}
 		if auth {
 			key, err := c.keys.APIKey(ctx)
 			if err != nil {
-				return err
+				return time.Time{}, err
 			}
 			req.Header.Set("Authorization", "Bearer "+key)
 		}
@@ -129,21 +136,22 @@ func (c *Client) send(ctx context.Context, method, path string, body, out any, a
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			return fmt.Errorf("%s %s: %w", method, path, err)
+			return time.Time{}, fmt.Errorf("%s %s: %w", method, path, err)
 		}
 		respData, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		_ = resp.Body.Close()
 		if err != nil {
-			return fmt.Errorf("%s %s: read response: %w", method, path, err)
+			return time.Time{}, fmt.Errorf("%s %s: read response: %w", method, path, err)
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			date, _ := http.ParseTime(resp.Header.Get("Date"))
 			if out != nil && len(respData) > 0 {
 				if err := json.Unmarshal(respData, out); err != nil {
-					return fmt.Errorf("%s %s: decode response: %w", method, path, err)
+					return date, fmt.Errorf("%s %s: decode response: %w", method, path, err)
 				}
 			}
-			return nil
+			return date, nil
 		}
 
 		apiErr := &APIError{}
@@ -156,29 +164,29 @@ func (c *Client) send(ctx context.Context, method, path string, body, out any, a
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			msg, _ := json.Marshal(fmt.Sprintf("unexpected redirect to %q; check krakenkey.api_url", resp.Header.Get("Location")))
 			apiErr.RawMessage = msg
-			return apiErr
+			return time.Time{}, apiErr
 		}
 
 		switch {
 		case resp.StatusCode == http.StatusUnauthorized && !auth:
-			return apiErr
+			return time.Time{}, apiErr
 		case resp.StatusCode == http.StatusUnauthorized:
 			authErr := &AuthError{Message: apiErr.Message()}
 			c.authFailed.Store(authErr)
-			return authErr
+			return time.Time{}, authErr
 		case resp.StatusCode == http.StatusNotFound:
-			return &NotFoundError{Message: apiErr.Message()}
+			return time.Time{}, &NotFoundError{Message: apiErr.Message()}
 		case resp.StatusCode == http.StatusTooManyRequests:
 			wait := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 			if attempt >= c.MaxRateLimitRetries || wait > c.MaxRateLimitWait {
-				return &RateLimitError{Message: apiErr.Message(), RetryAfter: wait}
+				return time.Time{}, &RateLimitError{Message: apiErr.Message(), RetryAfter: wait}
 			}
 			if err := c.sleep(ctx, wait); err != nil {
-				return err
+				return time.Time{}, err
 			}
 			continue
 		}
-		return apiErr
+		return time.Time{}, apiErr
 	}
 }
 
@@ -226,12 +234,16 @@ func (c *Client) GetCert(ctx context.Context, id int) (*Cert, error) {
 
 // RenewCert asks KrakenKey to renew a certificate with a new CSR. The CSR
 // must cover the same names as the certificate; its key may be new.
+// CertResponse.ServerTime is the API's time of the answer, for
+// WaitForIssuance.
 func (c *Client) RenewCert(ctx context.Context, id int, csrPEM string) (*CertResponse, error) {
 	body := map[string]string{"csrPem": csrPEM}
 	var r CertResponse
-	if err := c.do(ctx, http.MethodPost, "/certs/tls/"+strconv.Itoa(id)+"/renew", body, &r); err != nil {
+	date, err := c.sendDated(ctx, http.MethodPost, "/certs/tls/"+strconv.Itoa(id)+"/renew", body, &r, true)
+	if err != nil {
 		return nil, err
 	}
+	r.ServerTime = date
 	return &r, nil
 }
 
@@ -244,11 +256,25 @@ func (c *Client) GetCertChain(ctx context.Context, id int) (*Chain, error) {
 	return &ch, nil
 }
 
+// renewalFailureSkew is how far renewalFailedAt may lie before the time a
+// renewal was requested and still count as that renewal's failure. It
+// covers the Date header's one-second resolution and clock differences
+// between the API servers, the proxy in front of them and this host.
+const renewalFailureSkew = 2 * time.Minute
+
 // WaitForIssuance polls a certificate until it is issued with a leaf other
 // than previousCrt, or fails, or IssuanceTimeout passes. Transient errors
 // (network, 5xx) are retried at PollInterval. Client errors (401, 403, 404
 // and other 4xx) and rate limits the client did not wait out stop at once.
-func (c *Client) WaitForIssuance(ctx context.Context, id int, previousCrt string) (*Cert, error) {
+//
+// requestedAt is when the renewal was requested, by the API's clock when
+// known (CertResponse.ServerTime). A certificate that is issued with
+// previousCrt and a renewalFailedAt from then on means the renewal failed
+// and KrakenKey kept the current certificate; that returns a
+// *RenewalFailedError at once. A renewalFailedAt from before requestedAt
+// belongs to an earlier renewal and is ignored. APIs that don't send
+// renewalFailedAt end a failed renewal as failed instead.
+func (c *Client) WaitForIssuance(ctx context.Context, id int, previousCrt string, requestedAt time.Time) (*Cert, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.IssuanceTimeout)
 	defer cancel()
 
@@ -268,6 +294,9 @@ func (c *Client) WaitForIssuance(ctx context.Context, id int, previousCrt string
 			return nil, &IssuanceFailedError{Reason: cert.FailureReason}
 		case cert.Status == StatusIssued && cert.CrtPem != "" && cert.CrtPem != previousCrt:
 			return cert, nil
+		case cert.Status == StatusIssued && cert.RenewalFailedAt != nil &&
+			(requestedAt.IsZero() || !cert.RenewalFailedAt.Before(requestedAt.Add(-renewalFailureSkew))):
+			return nil, &RenewalFailedError{Reason: cert.FailureReason, FailedAt: *cert.RenewalFailedAt, ExpiresAt: cert.ExpiresAt}
 		case cert.Status == StatusRevoked || cert.Status == StatusRevoking:
 			return nil, fmt.Errorf("certificate %d is %s", id, cert.Status)
 		}

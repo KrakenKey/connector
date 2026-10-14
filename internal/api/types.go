@@ -40,6 +40,11 @@ type Cert struct {
 	ManagedBy     *string    `json:"managedBy"`
 	AutoRenew     bool       `json:"autoRenew"`
 	FailureReason string     `json:"failureReason,omitempty"`
+	// RenewalFailedAt is set when the last renewal failed while the
+	// current certificate was still valid: the status stays issued with
+	// the current PEM, and FailureReason says why. KrakenKey clears it
+	// when a renewal is requested again. Older APIs never send it.
+	RenewalFailedAt *time.Time `json:"renewalFailedAt"`
 	// RequestedNames are the names of an awaiting_csr certificate; the
 	// first CSR must cover exactly these.
 	RequestedNames []string `json:"requestedNames"`
@@ -82,6 +87,8 @@ func parseLeaf(pemData string) (*x509.Certificate, error) {
 type CertResponse struct {
 	ID     int    `json:"id"`
 	Status string `json:"status"`
+	// ServerTime is the response's Date header, zero when it had none.
+	ServerTime time.Time `json:"-"`
 }
 
 // Chain is returned by GET /certs/tls/:id/chain.
@@ -164,4 +171,25 @@ func (e *IssuanceFailedError) Error() string {
 		return "certificate issuance failed"
 	}
 	return "certificate issuance failed: " + e.Reason
+}
+
+// RenewalFailedError means the renewal failed while the current
+// certificate was still valid, so KrakenKey kept it: the certificate is
+// issued with its old PEM and renewalFailedAt set.
+type RenewalFailedError struct {
+	Reason    string
+	FailedAt  time.Time
+	ExpiresAt *time.Time
+}
+
+func (e *RenewalFailedError) Error() string {
+	msg := "renewal failed in KrakenKey"
+	if e.Reason != "" {
+		msg += ": " + e.Reason
+	}
+	msg += "; KrakenKey kept the current certificate"
+	if e.ExpiresAt != nil {
+		msg += " (expires " + e.ExpiresAt.UTC().Format(time.RFC3339) + ")"
+	}
+	return msg
 }
