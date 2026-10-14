@@ -193,7 +193,7 @@ tag it ran for. Verifying needs [cosign](https://docs.sigstore.dev/cosign/system
 v3 or later.
 
 ```sh
-VERSION=0.3.0   # the release, without the leading v
+VERSION=0.3.1   # the release, without the leading v
 OS=linux        # linux or darwin
 ARCH=amd64      # amd64 or arm64
 ARCHIVE="krakenkey-connector_${VERSION}_${OS}_${ARCH}.tar.gz"
@@ -853,7 +853,7 @@ cannot be undone without something to go back to.
 
 ```yaml
 plugins:
-  azure-keyvault: { version: 0.3.0, sha256: "<hex>", call_timeout: 5m }
+  azure-keyvault: { version: 0.3.1, sha256: "<hex>", call_timeout: 5m }
   aws-acm: {}   # the bundled version, see below
 ```
 
@@ -884,13 +884,13 @@ taken from `<data_dir>/plugins`, where a plugin always needs `version` and
 `sha256`. `validate` shows the version it used:
 
 ```text
-  azure-keyvault 0.3.0 (bundled, version not set): /usr/lib/krakenkey-connector/plugins/azure-keyvault/0.3.0/krakenkey-connector-plugin-azure-keyvault (system plugin dir)
+  azure-keyvault 0.3.1 (bundled, version not set): /usr/lib/krakenkey-connector/plugins/azure-keyvault/0.3.1/krakenkey-connector-plugin-azure-keyvault (system plugin dir)
 ```
 
 `plugins.lock` lists one binary per line in `sha256sum` format:
 
 ```text
-<sha256>  azure-keyvault/0.3.0/krakenkey-connector-plugin-azure-keyvault
+<sha256>  azure-keyvault/0.3.1/krakenkey-connector-plugin-azure-keyvault
 ```
 
 It may list plugins that are not installed. If it is missing, has a line the
@@ -917,7 +917,7 @@ which checksum it matched:
 
 ```text
 Plugins
-  azure-keyvault 0.3.0: /usr/lib/krakenkey-connector/plugins/azure-keyvault/0.3.0/krakenkey-connector-plugin-azure-keyvault (system plugin dir)
+  azure-keyvault 0.3.1: /usr/lib/krakenkey-connector/plugins/azure-keyvault/0.3.1/krakenkey-connector-plugin-azure-keyvault (system plugin dir)
     sha256 6125080b70a3914640985d62df1862b3e29cb536fed660a0c919569eb01da51d, matches plugins.lock
 ```
 
@@ -943,7 +943,7 @@ file owned by the connector's user with mode `0600`.
 
 These plugins are maintained in this repository, each its own Go module
 under [`plugins/`](plugins). They are released with the connector and carry
-its version: release `v0.3.0` ships version `0.3.0` of each.
+its version: release `v0.3.1` ships version `0.3.1` of each.
 
 | Plugin | Kind | What it does |
 |--------|------|--------------|
@@ -985,7 +985,7 @@ verify it like the connector's archive (see
 data directory with its checksum in the config:
 
 ```sh
-VERSION=0.3.0
+VERSION=0.3.1
 OS=linux
 ARCH=amd64
 PLUGIN=azure-keyvault
@@ -1012,12 +1012,12 @@ Then put the checksum in the config:
 
 ```yaml
 plugins:
-  azure-keyvault: { version: 0.3.0, sha256: "<sha256 printed above>" }
+  azure-keyvault: { version: 0.3.1, sha256: "<sha256 printed above>" }
 ```
 
 To keep plugins out of the connector user's reach, install them as root
 under the system plugin directory instead (for example
-`/usr/lib/krakenkey-connector/plugins/azure-keyvault/0.3.0/`) and write its
+`/usr/lib/krakenkey-connector/plugins/azure-keyvault/0.3.1/`) and write its
 `plugins.lock` with `sha256sum */*/krakenkey-connector-plugin-* > plugins.lock`
 run in that directory, or install them anywhere root owns and set `path` and
 `sha256`.

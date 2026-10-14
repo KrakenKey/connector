@@ -88,8 +88,8 @@ Unknown keys are rejected.
 
 ```yaml
 plugins:
-  azure-keyvault: { version: 0.3.0, sha256: "<hex>" }
-  azure-appgateway: { version: 0.3.0, sha256: "<hex>", call_timeout: 15m }
+  azure-keyvault: { version: 0.3.1, sha256: "<hex>" }
+  azure-appgateway: { version: 0.3.1, sha256: "<hex>", call_timeout: 15m }
 
 certificates:
   - id: 1043

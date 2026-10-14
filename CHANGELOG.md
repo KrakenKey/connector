@@ -8,6 +8,8 @@ protocol and the KrakenKey API the connector uses.
 
 ## [Unreleased]
 
+## [v0.3.1] - 2026-10-14
+
 ### Fixed
 
 - A renewal that fails in KrakenKey while the current certificate is still
@@ -313,7 +315,8 @@ together under one version.
   The README lists the cloud SDK variables that decide where plugins send
   keys and tokens.
 
-[Unreleased]: https://github.com/KrakenKey/connector/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/KrakenKey/connector/compare/v0.3.1...HEAD
+[v0.3.1]: https://github.com/KrakenKey/connector/compare/v0.3.0...v0.3.1
 [v0.3.0]: https://github.com/KrakenKey/connector/compare/v0.2.0...v0.3.0
 [v0.2.0]: https://github.com/KrakenKey/connector/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/KrakenKey/connector/releases/tag/v0.1.0
